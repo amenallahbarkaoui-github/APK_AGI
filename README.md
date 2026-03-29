@@ -602,12 +602,21 @@ APK AGI builds upon the excellent work of the open-source community. The followi
 
 ## ⚠️ Disclaimer
 
-APK AGI is intended for **authorized security testing, research, and educational purposes only**. Users are responsible for ensuring they have proper authorization before analyzing or modifying any APK. The authors are not responsible for any misuse of this tool.
+> **This tool is provided strictly for authorized security testing, white-team engagements, and educational research. Any illegal or unauthorized use is strictly prohibited.**
 
-Always:
-- Obtain written permission before testing applications you don't own
-- Follow responsible disclosure practices for any vulnerabilities found
-- Comply with all applicable laws and regulations
+APK AGI is designed to assist **security professionals, penetration testers, and researchers** in performing authorized assessments of Android applications. It must **only** be used on applications you own or have explicit written permission to test.
+
+**By using this tool, you agree that:**
+- You will **not** use it for any illegal, unauthorized, or malicious activity
+- You bear **full responsibility** for how you use this software
+- The author(s) accept **no liability** for any misuse, damage, or legal consequences arising from unauthorized use
+- You will comply with all applicable local, national, and international laws
+
+**Intended use cases:**
+- White-team / red-team authorized security assessments
+- Bug bounty programs with explicit scope authorization
+- Academic and educational security research
+- Testing your own applications during development
 
 ---
 
