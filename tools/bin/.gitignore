@@ -1,0 +1,4 @@
+# Downloaded tool binaries — don't commit these
+*.jar
+jadx/
+dex2jar/
