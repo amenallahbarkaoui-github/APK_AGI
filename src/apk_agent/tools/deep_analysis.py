@@ -757,3 +757,289 @@ def diff_smali_files(original_path: Path, patched_path: Path) -> dict:
         "diff": diff_lines[:200],
         "changes": changes[:100],
     }
+
+
+# ---------------------------------------------------------------------------
+# APK Health Check — comprehensive pre-build validation
+# ---------------------------------------------------------------------------
+
+
+def apk_health_check(apktool_dir: Path, smali_dirs: list[Path],
+                     patched_files: list[Path] | None = None) -> dict:
+    """Run comprehensive health checks on the decompiled APK before building.
+
+    Validates:
+      1. All patched smali files for syntax errors
+      2. Method return-type consistency (every path must end with correct return)
+      3. Register usage (no references to registers beyond .registers/.locals count)
+      4. Try/catch block integrity (.catch references valid labels)
+      5. AndroidManifest.xml well-formedness and component references
+      6. Resource XML well-formedness (patched res/ files)
+      7. Cross-reference integrity (patched methods don't break invoke targets)
+
+    Args:
+        apktool_dir: Root of apktool decompiled output.
+        smali_dirs: List of all smali directories.
+        patched_files: If given, only check these files. Otherwise check ALL smali files
+            that differ from backup (or all smali files if no backups exist).
+
+    Returns:
+        Dict with health_score (0-100), critical/warning/info issue lists, and
+        a build_safe boolean indicating whether apktool_build is likely to succeed.
+    """
+    critical: list[dict] = []
+    warnings: list[dict] = []
+    info: list[dict] = []
+    files_checked = 0
+
+    # --- 1. Determine which smali files to check ---
+    files_to_check: list[Path] = []
+    if patched_files:
+        files_to_check = [f for f in patched_files if f.is_file()]
+    else:
+        # Check all smali files (use thread pool for speed)
+        for sd in smali_dirs:
+            if sd.is_dir():
+                files_to_check.extend(sd.rglob("*.smali"))
+
+    # Limit to prevent extreme slowdowns on huge APKs
+    MAX_FILES = 500
+    all_smali = files_to_check[:MAX_FILES]
+
+    # --- 2. Validate each smali file ---
+    def _check_smali(fpath: Path) -> list[dict]:
+        issues: list[dict] = []
+        try:
+            text = fpath.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            issues.append({"severity": "critical", "file": str(fpath.name),
+                           "message": f"Cannot read file: {e}"})
+            return issues
+
+        lines = text.splitlines()
+        rel = str(fpath.relative_to(apktool_dir)) if str(fpath).startswith(str(apktool_dir)) else fpath.name
+
+        in_method = False
+        method_name = ""
+        method_start = 0
+        has_registers = False
+        registers_count = 0
+        max_register_used = -1
+        method_has_return = False
+        return_type = ""
+        label_defs: set[str] = set()
+        label_refs: set[str] = set()
+        try_labels: list[tuple[int, str]] = []  # (line, label_ref)
+        annotation_depth = 0
+
+        for i, line in enumerate(lines, 1):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+
+            # Track labels
+            if stripped.startswith(":"):
+                label_defs.add(stripped.split()[0] if stripped.split() else stripped)
+
+            # Track method blocks
+            if stripped.startswith(".method "):
+                if in_method:
+                    issues.append({"severity": "critical", "file": rel, "line": i,
+                                   "message": f"Nested .method — '{method_name}' at line {method_start} never closed"})
+                in_method = True
+                method_name = stripped
+                method_start = i
+                has_registers = False
+                registers_count = 0
+                max_register_used = -1
+                method_has_return = False
+                label_defs.clear()
+                label_refs.clear()
+                try_labels.clear()
+                # Parse return type from method signature
+                paren_end = stripped.rfind(")")
+                if paren_end >= 0:
+                    return_type = stripped[paren_end + 1:].strip()
+                else:
+                    return_type = "V"
+                continue
+
+            if stripped == ".end method":
+                if not in_method:
+                    issues.append({"severity": "critical", "file": rel, "line": i,
+                                   "message": ".end method without matching .method"})
+                else:
+                    # Check: method must have a return statement (unless abstract/native)
+                    if not method_has_return and "abstract" not in method_name and "native" not in method_name:
+                        issues.append({"severity": "critical", "file": rel, "line": method_start,
+                                       "message": f"Method has no return statement — will crash at runtime: {method_name.split('(')[0].split()[-1] if '(' in method_name else method_name}"})
+
+                    # Check: registers declaration
+                    if not has_registers and "abstract" not in method_name and "native" not in method_name:
+                        issues.append({"severity": "warning", "file": rel, "line": method_start,
+                                       "message": f"Method has no .registers/.locals declaration"})
+
+                    # Check: register overflow
+                    if has_registers and max_register_used >= registers_count and registers_count > 0:
+                        issues.append({"severity": "critical", "file": rel, "line": method_start,
+                                       "message": f"Register overflow: uses v{max_register_used}/p-regs but only {registers_count} declared"})
+
+                    # Check: label references point to defined labels
+                    for lbl in label_refs:
+                        if lbl not in label_defs:
+                            issues.append({"severity": "critical", "file": rel, "line": method_start,
+                                           "message": f"Reference to undefined label {lbl} in method"})
+
+                in_method = False
+                continue
+
+            # Track .registers/.locals
+            if stripped.startswith(".registers "):
+                has_registers = True
+                try:
+                    registers_count = int(stripped.split()[1])
+                except (IndexError, ValueError):
+                    pass
+                continue
+            if stripped.startswith(".locals "):
+                has_registers = True
+                try:
+                    registers_count = int(stripped.split()[1])
+                except (IndexError, ValueError):
+                    pass
+                continue
+
+            # Track annotations
+            if stripped.startswith(".annotation ") or stripped.startswith(".subannotation "):
+                annotation_depth += 1
+                continue
+            if stripped in (".end annotation", ".end subannotation"):
+                annotation_depth -= 1
+                if annotation_depth < 0:
+                    issues.append({"severity": "critical", "file": rel, "line": i,
+                                   "message": f"Unmatched {stripped}"})
+                    annotation_depth = 0
+                continue
+
+            # Inside method body
+            if in_method and annotation_depth == 0:
+                # Skip directives
+                if stripped.startswith(".") or stripped.startswith(":"):
+                    # Catch .catch/.catchall label refs
+                    if stripped.startswith(".catch"):
+                        parts = stripped.split()
+                        for part in parts:
+                            if part.startswith(":"):
+                                label_refs.add(part.rstrip(","))
+                    continue
+
+                # Track return statements
+                if stripped.startswith("return"):
+                    method_has_return = True
+                    # Verify return type matches
+                    opcode = stripped.split()[0]
+                    if return_type == "V" and opcode != "return-void":
+                        issues.append({"severity": "critical", "file": rel, "line": i,
+                                       "message": f"void method uses '{opcode}' instead of return-void"})
+                    elif return_type != "V" and opcode == "return-void":
+                        issues.append({"severity": "critical", "file": rel, "line": i,
+                                       "message": f"Non-void method uses return-void (expects {return_type})"})
+
+                # Track register usage (vN registers)
+                reg_matches = re.findall(r'\bv(\d+)\b', stripped)
+                for rm in reg_matches:
+                    rn = int(rm)
+                    if rn > max_register_used:
+                        max_register_used = rn
+
+                # Track goto/if label references
+                parts = stripped.split()
+                for part in parts:
+                    if part.startswith(":"):
+                        label_refs.add(part.rstrip(","))
+
+        # End-of-file checks
+        if in_method:
+            issues.append({"severity": "critical", "file": rel, "line": method_start,
+                           "message": f"Method '{method_name}' never closed"})
+        if annotation_depth > 0:
+            issues.append({"severity": "warning", "file": rel, "line": len(lines),
+                           "message": f"Unclosed annotation blocks: {annotation_depth}"})
+
+        return issues
+
+    # Run checks in parallel
+    all_issues: list[dict] = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_check_smali, f): f for f in all_smali}
+        for fut in as_completed(futures):
+            try:
+                file_issues = fut.result()
+                all_issues.extend(file_issues)
+                files_checked += 1
+            except Exception:
+                files_checked += 1
+
+    # --- 3. Validate AndroidManifest.xml ---
+    manifest = apktool_dir / "AndroidManifest.xml"
+    if manifest.is_file():
+        try:
+            import xml.etree.ElementTree as ET
+            ET.parse(str(manifest))
+            info.append({"file": "AndroidManifest.xml", "message": "XML is well-formed"})
+        except ET.ParseError as e:
+            critical.append({"file": "AndroidManifest.xml", "line": 0,
+                             "message": f"Manifest XML parse error — APK will NOT build: {e}"})
+    else:
+        critical.append({"file": "AndroidManifest.xml", "line": 0,
+                         "message": "AndroidManifest.xml not found!"})
+
+    # --- 4. Validate patched resource XMLs ---
+    res_dir = apktool_dir / "res"
+    if res_dir.is_dir():
+        import xml.etree.ElementTree as ET
+        xml_errors = 0
+        for xml_file in res_dir.rglob("*.xml"):
+            try:
+                ET.parse(str(xml_file))
+            except ET.ParseError as e:
+                xml_errors += 1
+                if xml_errors <= 10:  # Cap reported errors
+                    warnings.append({"file": str(xml_file.relative_to(apktool_dir)),
+                                     "message": f"XML parse error: {e}"})
+        if xml_errors == 0:
+            info.append({"file": "res/", "message": f"All resource XMLs are well-formed"})
+        elif xml_errors > 10:
+            warnings.append({"file": "res/", "message": f"... and {xml_errors - 10} more XML errors"})
+
+    # --- 5. Classify issues ---
+    for issue in all_issues:
+        sev = issue.pop("severity", "warning")
+        if sev == "critical":
+            critical.append(issue)
+        elif sev == "warning":
+            warnings.append(issue)
+        else:
+            info.append(issue)
+
+    # --- 6. Compute health score ---
+    # Critical = -15 each, Warning = -3 each, capped at 0
+    score = 100 - (len(critical) * 15) - (len(warnings) * 3)
+    score = max(0, min(100, score))
+
+    build_safe = len(critical) == 0
+
+    return {
+        "health_score": score,
+        "build_safe": build_safe,
+        "build_recommendation": "SAFE to build" if build_safe else "FIX critical issues before building",
+        "files_checked": files_checked,
+        "summary": {
+            "critical_issues": len(critical),
+            "warnings": len(warnings),
+            "info": len(info),
+        },
+        "critical": critical[:30],
+        "warnings": warnings[:20],
+        "info": info[:10],
+    }

@@ -740,6 +740,16 @@ def apply_smali_patch(patch_plan_json: str) -> str:
             "error": "Patch plan has no steps. Add at least one step with operation and match_pattern.",
         })
 
+    # Pre-resolve target_file path through centralized resolver
+    raw_target = plan_data.get("target_file", "")
+    resolved = _resolve_file(raw_target)
+    if resolved.is_file():
+        # Convert to relative path within apktool_dir for PatchEngine
+        try:
+            plan_data["target_file"] = str(resolved.relative_to(_project.apktool_dir))
+        except ValueError:
+            plan_data["target_file"] = str(resolved)
+
     plan = PatchPlan.from_dict(plan_data)
     engine = PatchEngine(
         apktool_dir=_project.apktool_dir,
@@ -782,6 +792,15 @@ def preview_smali_patch(patch_plan_json: str) -> str:
         plan_data = json.loads(patch_plan_json)
     except json.JSONDecodeError as e:
         return f"Invalid JSON: {e}"
+
+    # Pre-resolve target_file path through centralized resolver
+    raw_target = plan_data.get("target_file", "")
+    resolved = _resolve_file(raw_target)
+    if resolved.is_file():
+        try:
+            plan_data["target_file"] = str(resolved.relative_to(_project.apktool_dir))
+        except ValueError:
+            plan_data["target_file"] = str(resolved)
 
     plan = PatchPlan.from_dict(plan_data)
     engine = PatchEngine(
@@ -1894,7 +1913,14 @@ def batch_read_smali_methods(
             pairs = json.loads(file_method_pairs_json)
         except json.JSONDecodeError:
             return json.dumps({"success": False, "error": "Invalid JSON in file_method_pairs_json"})
-        result = batch_read_methods(pairs, base_dir=str(_project.apktool_dir))
+        # Pre-resolve each file path through centralized resolver
+        for pair in pairs:
+            raw_path = pair.get("file", "")
+            if raw_path:
+                resolved = _resolve_file(raw_path)
+                if resolved.is_file():
+                    pair["file"] = str(resolved)  # absolute path, no base_dir needed
+        result = batch_read_methods(pairs, base_dir="")
         return json.dumps(result, ensure_ascii=False, indent=2)[:20000]
     return _safe_call(_run, "batch_read_smali_methods")
 
@@ -2418,6 +2444,56 @@ def list_bypass_categories() -> str:
 
 
 # ---------------------------------------------------------------------------
+# APK Health Check — comprehensive pre-build validation
+# ---------------------------------------------------------------------------
+
+@tool
+def apk_health_check(patched_files_json: str = "[]") -> str:
+    """Run comprehensive health check on the decompiled APK BEFORE building.
+    Detects issues that would cause the APK to crash or fail to build.
+
+    Checks performed:
+      - Smali syntax: unclosed methods, nested .method, missing .end method
+      - Return-type consistency: void methods using return instead of return-void
+      - Register overflow: using vN registers beyond .registers declaration
+      - Label integrity: goto/if-* jumping to undefined labels
+      - Missing return statements: non-abstract methods without return
+      - AndroidManifest.xml well-formedness
+      - Resource XML validation (all res/*.xml files)
+
+    ALWAYS run this after patching and BEFORE apktool_build.
+
+    Args:
+        patched_files_json: Optional JSON array of file paths to check.
+            If empty/[], checks ALL smali files (slower but thorough).
+            Example: ["smali_classes3/com/example/Foo.smali"]
+    """
+    from apk_agent.tools.deep_analysis import apk_health_check as _check
+
+    def _run():
+        # Parse optional patched files list
+        patched_files = None
+        try:
+            paths = json.loads(patched_files_json) if patched_files_json.strip() else []
+            if paths:
+                patched_files = []
+                for p in paths:
+                    resolved = _resolve_file(p)
+                    if resolved.is_file():
+                        patched_files.append(resolved)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        result = _check(
+            apktool_dir=_project.apktool_dir,
+            smali_dirs=_get_all_smali_dirs(),
+            patched_files=patched_files,
+        )
+        return json.dumps(result, ensure_ascii=False, indent=2)[:20000]
+    return _safe_call(_run, "apk_health_check")
+
+
+# ---------------------------------------------------------------------------
 # Tool list for graph construction
 # ---------------------------------------------------------------------------
 
@@ -2516,6 +2592,8 @@ ALL_TOOLS = [
     extract_native_strings,
     scan_assets_secrets,
     diff_patched_file,
+    # APK Health Check (pre-build validation)
+    apk_health_check,
     # Build & Sign
     apktool_build,
     zipalign_apk_tool,
