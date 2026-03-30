@@ -58,6 +58,14 @@ def _log_file() -> Path:
     return Path("tools.log")
 
 
+def _invalidate_cache_for_file(file_path: str) -> None:
+    """Remove cache entries that might reference a modified file."""
+    norm = file_path.replace("\\", "/")
+    keys_to_remove = [k for k in _tool_cache if norm in k.replace("\\", "/")]
+    for k in keys_to_remove:
+        del _tool_cache[k]
+
+
 def _safe_call(func, tool_name: str, *args, **kwargs) -> str:
     """Wrap any tool function with progress tracking, caching, and error recovery."""
     # Check cache for expensive idempotent tools
@@ -555,15 +563,31 @@ def write_file(file_path: str, content: str) -> str:
     Use this for direct smali edits, adding new files, or modifying XML configs.
 
     Args:
-        file_path: Absolute path or path relative to the project workspace.
+        file_path: Absolute path or path relative to the apktool decompiled directory
+                   (e.g., "res/values/colors.xml" writes to apktool_dir/res/values/colors.xml).
         content: The full file content to write.
     """
     p = Path(file_path)
     if not p.is_absolute():
-        p = Path(_project.workspace_path) / file_path
+        # Use _resolve_file for consistency with read_file —
+        # "res/values/colors.xml" → apktool_dir/res/values/colors.xml
+        p = _resolve_file(file_path)
+    # Security: only allow writes under the project workspace
+    ws = Path(_project.workspace_path).resolve()
+    try:
+        resolved = p.resolve()
+        if not str(resolved).startswith(str(ws)):
+            return json.dumps({
+                "success": False,
+                "error": f"Write denied: path {p} is outside project workspace.",
+            })
+    except (OSError, ValueError):
+        pass  # resolve can fail on non-existent paths; allow creation under apktool_dir
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
+        # Invalidate search cache for this file (so searches return fresh data)
+        _invalidate_cache_for_file(str(p))
         return json.dumps({
             "success": True,
             "path": str(p),
@@ -1407,6 +1431,182 @@ def get_evidence_summary() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Working memory — scratchpad (survives context compaction)
+# ---------------------------------------------------------------------------
+
+# Module-level scratchpad shared across tool calls (injected into state via graph)
+_scratchpad: dict[str, str] = {}
+_task_plan: list[dict] = []
+
+
+@tool
+def update_scratchpad(key: str, value: str) -> str:
+    """Store a key-value pair in persistent working memory (scratchpad).
+    Use this to remember important findings, file paths, color values,
+    decisions, or intermediate results that you'll need later.
+    Scratchpad survives context compaction — your regular memory doesn't.
+
+    Args:
+        key: Short descriptive key (e.g., "ooredoo_red_color", "ssl_bypass_status").
+        value: Value to store (e.g., "#FFE11C22", "DONE — 3 files patched").
+    """
+    _scratchpad[key] = value
+    return json.dumps({
+        "success": True,
+        "stored": {key: value},
+        "total_entries": len(_scratchpad),
+    })
+
+
+@tool
+def read_scratchpad(key: Optional[str] = None) -> str:
+    """Read from persistent working memory (scratchpad).
+    If key is provided, returns that specific entry.
+    If key is None, returns all stored entries.
+
+    Args:
+        key: Optional key to look up. If omitted, returns everything.
+    """
+    if key:
+        val = _scratchpad.get(key)
+        if val is None:
+            return json.dumps({"success": False, "error": f"Key '{key}' not found in scratchpad."})
+        return json.dumps({"success": True, "key": key, "value": val})
+    return json.dumps({
+        "success": True,
+        "entries": dict(_scratchpad),
+        "total_entries": len(_scratchpad),
+    })
+
+
+@tool
+def update_task_plan(plan_json: str) -> str:
+    """Create or update the task plan for multi-objective work.
+    Call this EARLY when you receive a complex request with multiple goals.
+    Each task should be a small, independently completable objective.
+
+    Args:
+        plan_json: JSON array of task objects, e.g.:
+            [{"id": 1, "desc": "Bypass SSL pinning", "status": "pending"},
+             {"id": 2, "desc": "Change colors red to blue", "status": "pending"},
+             {"id": 3, "desc": "Build and sign APK", "status": "pending"}]
+            Status can be: "pending", "in_progress", "done"
+    """
+    try:
+        plan = json.loads(plan_json)
+        if not isinstance(plan, list):
+            return json.dumps({"success": False, "error": "plan_json must be a JSON array"})
+        _task_plan.clear()
+        _task_plan.extend(plan)
+        return json.dumps({"success": True, "tasks": len(plan), "plan": plan})
+    except json.JSONDecodeError as e:
+        return json.dumps({"success": False, "error": f"Invalid JSON: {e}"})
+
+
+@tool
+def mark_task_done(task_id: int) -> str:
+    """Mark a specific task in the task plan as completed.
+
+    Args:
+        task_id: The id of the task to mark as done.
+    """
+    for t in _task_plan:
+        if t.get("id") == task_id:
+            t["status"] = "done"
+            return json.dumps({"success": True, "marked_done": task_id, "plan": _task_plan})
+    return json.dumps({"success": False, "error": f"Task {task_id} not found"})
+
+
+def _get_scratchpad() -> dict:
+    """Return current scratchpad (for state injection in graph.py)."""
+    return dict(_scratchpad)
+
+
+def _get_task_plan() -> list[dict]:
+    """Return current task plan (for state injection in graph.py)."""
+    return list(_task_plan)
+
+
+# ---------------------------------------------------------------------------
+# Android Resource Tools — structured color/style/theme operations
+# ---------------------------------------------------------------------------
+
+@tool
+def find_app_colors(color_family: Optional[str] = None) -> str:
+    """Find all color definitions in the app's res/values*/colors.xml files.
+    Returns structured name→hex mappings. Use this INSTEAD of searching for colors
+    with smart_search/grep — it understands Android's color resource system.
+
+    Args:
+        color_family: Optional filter — "red", "blue", "green", "purple", "orange",
+                      "yellow", "cyan", "pink". Only returns colors in that hue range.
+                      Leave empty to get ALL app colors.
+    """
+    from apk_agent.tools.resource_tools import find_app_colors as _find
+
+    def _run():
+        result = _find(_project.apktool_dir, color_family=color_family)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
+    return _safe_call(_run, "find_app_colors")
+
+
+@tool
+def find_app_styles() -> str:
+    """Find all theme/style definitions that reference colors (colorPrimary, colorAccent, etc.).
+    Parses styles.xml and themes.xml. Use this to understand which colors are used
+    at the theme level — these affect the entire app's appearance.
+    """
+    from apk_agent.tools.resource_tools import find_app_styles as _find
+
+    def _run():
+        result = _find(_project.apktool_dir)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
+    return _safe_call(_run, "find_app_styles")
+
+
+@tool
+def replace_colors(color_map_json: str) -> str:
+    """Bulk replace color hex values across ALL resource XML files (colors.xml, styles.xml,
+    layouts, drawables). This is the correct way to change app colors — it handles
+    ALL resource files at once, not just colors.xml.
+
+    Args:
+        color_map_json: JSON object mapping old hex → new hex colors, e.g.:
+            {"#FFE11C22": "#FF1C22E1", "#FF0000": "#0000FF"}
+            Include '#' prefix. Both 6-digit and 8-digit (with alpha) formats supported.
+    """
+    from apk_agent.tools.resource_tools import replace_colors as _replace
+
+    def _run():
+        try:
+            cmap = json.loads(color_map_json)
+        except json.JSONDecodeError as e:
+            return json.dumps({"success": False, "error": f"Invalid JSON: {e}"})
+        if not isinstance(cmap, dict):
+            return json.dumps({"success": False, "error": "color_map_json must be a JSON object"})
+        result = _replace(_project.apktool_dir, cmap)
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    return _safe_call(_run, "replace_colors")
+
+
+@tool
+def list_drawables(color_filter: Optional[str] = None) -> str:
+    """List drawable XML files that contain hardcoded colors.
+    Optionally filter by a specific hex color to find all drawables using that color.
+
+    Args:
+        color_filter: Optional hex color to filter by (e.g., "#FF0000").
+                      Only returns drawables containing this exact color.
+    """
+    from apk_agent.tools.resource_tools import list_drawables as _list
+
+    def _run():
+        result = _list(_project.apktool_dir, color_filter=color_filter)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
+    return _safe_call(_run, "list_drawables")
+
+
+# ---------------------------------------------------------------------------
 # NEW: Deep smali analysis (professional reversing)
 # ---------------------------------------------------------------------------
 
@@ -2127,6 +2327,16 @@ ALL_TOOLS = [
     load_evidence,
     search_evidence,
     get_evidence_summary,
+    # Working memory / task planning
+    update_scratchpad,
+    read_scratchpad,
+    update_task_plan,
+    mark_task_done,
+    # Android resource tools (colors, styles, themes, drawables)
+    find_app_colors,
+    find_app_styles,
+    replace_colors,
+    list_drawables,
     # Patching
     apply_smali_patch,
     preview_smali_patch,

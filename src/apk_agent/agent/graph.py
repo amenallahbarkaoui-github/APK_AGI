@@ -20,9 +20,11 @@ The graph implements the Think → Act → Observe → Re-plan loop:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
+from collections import defaultdict
 from typing import Any, Literal
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -33,7 +35,7 @@ from langgraph.types import interrupt, Command
 
 from apk_agent.agent.prompts import SYSTEM_PROMPT
 from apk_agent.agent.state import AgentState
-from apk_agent.agent.tools_def import ALL_TOOLS, set_tool_context, _get_all_smali_dirs, _project
+from apk_agent.agent.tools_def import ALL_TOOLS, set_tool_context, _get_all_smali_dirs, _project, _get_scratchpad, _get_task_plan
 from apk_agent.compactor import Compactor, count_message_tokens
 from apk_agent.config import AppConfig
 from apk_agent.llm.provider import get_llm
@@ -43,6 +45,47 @@ logger = logging.getLogger("apk_agent.graph")
 
 # Module-level compactor instance (initialised in build_graph)
 _compactor: Compactor | None = None
+
+# ---------------------------------------------------------------------------
+# Tool call loop detector — prevents infinite repeated tool calls
+# ---------------------------------------------------------------------------
+# Maps (tool_name, args_hash) → call_count.  Reset per build_graph().
+_tool_call_tracker: dict[str, int] = defaultdict(int)
+_LOOP_WARN_THRESHOLD = 3   # inject warning after this many repetitions
+_LOOP_BLOCK_THRESHOLD = 5  # force different approach after this many
+
+
+def _hash_tool_args(args: dict) -> str:
+    """Produce a short stable hash of tool call arguments for dedup detection."""
+    raw = json.dumps(args, sort_keys=True, default=str)
+    return hashlib.md5(raw.encode()).hexdigest()[:12]
+
+
+def _check_tool_loops(tool_calls: list[dict]) -> str | None:
+    """Track tool calls and return a warning message if loops detected."""
+    warnings = []
+    for tc in tool_calls:
+        name = tc.get("name", "")
+        args_hash = _hash_tool_args(tc.get("args", {}))
+        key = f"{name}:{args_hash}"
+        _tool_call_tracker[key] += 1
+        count = _tool_call_tracker[key]
+
+        if count >= _LOOP_BLOCK_THRESHOLD:
+            warnings.append(
+                f"🚫 BLOCKED: You have called `{name}` with the same/similar arguments "
+                f"{count} times and got the same results each time. "
+                f"STOP calling this tool. Try a COMPLETELY DIFFERENT tool or approach. "
+                f"For example: if smart_search isn't finding colors, use find_app_colors() "
+                f"or read_file on res/values/colors.xml directly."
+            )
+        elif count >= _LOOP_WARN_THRESHOLD:
+            warnings.append(
+                f"⚠️ WARNING: `{name}` called {count} times with similar args. "
+                f"Results are unlikely to change. Consider a different approach."
+            )
+
+    return "\n".join(warnings) if warnings else None
 
 
 # ---------------------------------------------------------------------------
@@ -107,12 +150,29 @@ def agent_node(state: AgentState) -> dict:
         ok = sum(1 for p in patches if p.get("success"))
         summary_parts.append(f"🔧 Patches applied: {ok}/{len(patches)}")
 
+    # Scratchpad — persistent working memory that survives compaction
+    scratchpad = state.get("scratchpad") or {}
+    if scratchpad:
+        summary_parts.append("📝 Scratchpad (working memory):")
+        for k, v in list(scratchpad.items())[:30]:
+            val_str = str(v)[:200]
+            summary_parts.append(f"  • {k}: {val_str}")
+
+    # Task plan — multi-objective decomposition
+    task_plan = state.get("task_plan") or []
+    if task_plan:
+        summary_parts.append("📋 Task Plan:")
+        for t in task_plan:
+            status = t.get("status", "pending")
+            icon = "✅" if status == "done" else "🔄" if status == "in_progress" else "⬜"
+            summary_parts.append(f"  {icon} [{t.get('id', '?')}] {t.get('desc', '')}")
+
     if summary_parts:
         state_msg = "\n".join(summary_parts)
         # Insert after system prompt
         insert_idx = 1 if isinstance(messages[0], SystemMessage) else 0
         messages.insert(insert_idx, HumanMessage(
-            content=f"[DURABLE STATE — graph, scope, findings & patches]\n{state_msg}"
+            content=f"[DURABLE STATE — graph, scope, findings, patches & memory]\n{state_msg}"
         ))
 
     # --- Auto-compact check ---
@@ -162,7 +222,7 @@ def agent_node(state: AgentState) -> dict:
                 messages[i] = ToolMessage(
                     content=f"{head}\n\n... [{skipped} chars omitted] ...\n\n{tail}",
                     tool_call_id=msg.tool_call_id,
-                    name=getattr(msg, "name", None),
+                    name=getattr(msg, "name", None) or "unknown_tool",
                 )
 
     # Retry with exponential backoff for transient API errors
@@ -177,7 +237,16 @@ def agent_node(state: AgentState) -> dict:
                 "429", "rate_limit", "rate limit",
                 "503", "service unavailable", "overloaded",
                 "500", "internal server error",
+                "tool name is required",
             ])
+            # On "tool name is required" errors, re-sanitize before retry
+            if "tool name is required" in err_str:
+                logger.warning("Gemini tool-name error — re-sanitizing messages...")
+                messages = _sanitize_messages(messages)
+                # Also strip any AIMessage tool_calls that still have no name
+                for _m in messages:
+                    if isinstance(_m, AIMessage) and _m.tool_calls:
+                        _m.tool_calls = [tc for tc in _m.tool_calls if tc.get("name")]
             # 403 "API key limit" = quota exhausted, not retryable
             if not is_retryable or attempt >= max_retries:
                 raise
@@ -191,7 +260,37 @@ def agent_node(state: AgentState) -> dict:
     if _compactor is not None and _compactor.compact_count > 0:
         # Only replace messages if we actually compacted this turn
         pass
-    return {"messages": [response]}
+
+    # --- Tool call loop detection ---
+    # Check if the LLM is repeating the same tools with same args
+    result_messages = [response]
+    if isinstance(response, AIMessage) and response.tool_calls:
+        loop_warning = _check_tool_loops(response.tool_calls)
+        if loop_warning:
+            logger.warning("Loop detected: %s", loop_warning[:200])
+            # Inject a warning BEFORE the tool calls so the agent sees it next turn
+            result_messages.append(HumanMessage(
+                content=f"[SYSTEM — LOOP DETECTOR]\n{loop_warning}"
+            ))
+            # If any tool is at block threshold, strip those tool_calls entirely
+            filtered_calls = []
+            for tc in response.tool_calls:
+                args_hash = _hash_tool_args(tc.get("args", {}))
+                key = f"{tc.get('name', '')}:{args_hash}"
+                if _tool_call_tracker.get(key, 0) < _LOOP_BLOCK_THRESHOLD:
+                    filtered_calls.append(tc)
+            if not filtered_calls:
+                # All calls blocked — strip tool_calls, force agent to rethink
+                response.tool_calls = []
+                result_messages = [response, HumanMessage(
+                    content=f"[SYSTEM — LOOP DETECTOR]\n{loop_warning}\n"
+                    "All your requested tool calls were blocked because they are duplicates. "
+                    "You MUST choose a different strategy now."
+                )]
+            else:
+                response.tool_calls = filtered_calls
+
+    return {"messages": result_messages}
 
 
 def should_continue(state: AgentState) -> Literal["tools", "human_review", "__end__"]:
@@ -259,6 +358,7 @@ def human_review_node(state: AgentState) -> dict:
                             "recovery_hint": "Build the complete JSON patch plan, then call apply_smali_patch again.",
                         }),
                         tool_call_id=tc["id"],
+                        name="apply_smali_patch",
                     )
                 )
         return {"messages": reject_msgs, "human_feedback": "rejected"}
@@ -299,6 +399,7 @@ def human_review_node(state: AgentState) -> dict:
                     ToolMessage(
                         content="⏭️ Patch skipped by user.",
                         tool_call_id=tc["id"],
+                        name="apply_smali_patch",
                     )
                 )
             else:
@@ -320,6 +421,7 @@ def human_review_node(state: AgentState) -> dict:
                     ToolMessage(
                         content="⏸️ Patch paused for user modification.",
                         tool_call_id=tc["id"],
+                        name="apply_smali_patch",
                     )
                 )
         modify_messages.append(
@@ -484,6 +586,10 @@ def tools_postprocess(state: AgentState) -> dict:
         existing.extend(new_patches)
         updates["patch_results"] = existing
 
+    # Sync working memory from module-level storage into durable state
+    updates["scratchpad"] = _get_scratchpad()
+    updates["task_plan"] = _get_task_plan()
+
     return updates
 
 
@@ -508,6 +614,9 @@ def build_graph(config: AppConfig, project: Project, checkpointer=None):
     Returns (compiled_graph, checkpointer).
     """
     global _llm_with_tools, _raw_llm, _compactor
+
+    # Reset loop detector for fresh session
+    _tool_call_tracker.clear()
 
     # Set tool context
     set_tool_context(config, project)

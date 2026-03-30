@@ -275,12 +275,14 @@ class Compactor:
                 self.last_token_count - new_token_count,
             )
 
-            return new_messages
+            return _sanitize_compacted(new_messages)
 
         except Exception as e:
             logger.error("Auto-compact failed: %s", e)
             # Fallback: just trim old messages without LLM summary
-            return _fallback_trim(messages, system_msg, recent_messages, old_messages)
+            return _sanitize_compacted(
+                _fallback_trim(messages, system_msg, recent_messages, old_messages)
+            )
 
     def get_stats(self) -> dict[str, Any]:
         """Return compactor statistics."""
@@ -290,6 +292,45 @@ class Compactor:
             "token_threshold": self.token_threshold,
             "keep_recent": self.keep_recent,
         }
+
+
+def _sanitize_compacted(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """Sanitize messages after compaction to prevent API errors.
+
+    Fixes:
+    - ToolMessages with missing/empty name field (Gemini requirement)
+    - Orphaned ToolMessages whose parent AIMessage was compacted away
+    - AIMessage.tool_calls with empty names
+    """
+    # Build tool_id→name mapping from AIMessage tool_calls
+    id_to_name: dict[str, str] = {}
+    ai_tool_ids: set[str] = set()
+    for msg in messages:
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for tc in msg.tool_calls:
+                name = tc.get("name") or ""
+                tid = tc.get("id") or ""
+                if name and tid:
+                    id_to_name[tid] = name
+                if tid:
+                    ai_tool_ids.add(tid)
+                # Fix empty tool_call names
+                if not tc.get("name"):
+                    tc["name"] = id_to_name.get(tid, "unknown_tool")
+
+    # Fix ToolMessage names and remove orphans
+    cleaned: list[BaseMessage] = []
+    for msg in messages:
+        if isinstance(msg, ToolMessage):
+            if not getattr(msg, "name", None):
+                msg.name = id_to_name.get(msg.tool_call_id, "unknown_tool")
+            # Drop orphaned ToolMessages (no matching AIMessage.tool_call)
+            if msg.tool_call_id and msg.tool_call_id not in ai_tool_ids:
+                logger.debug("Dropping orphaned ToolMessage: %s", msg.tool_call_id)
+                continue
+        cleaned.append(msg)
+
+    return cleaned
 
 
 def _fallback_trim(

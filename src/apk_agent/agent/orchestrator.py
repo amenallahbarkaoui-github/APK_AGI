@@ -44,8 +44,10 @@ _MAX_CONTENT_BLOCKS = 5
 def _sanitize_messages(messages: list) -> list:
     """Fix message sequences that would cause API errors.
 
-    Handles three issues:
+    Handles four issues:
     0. Null content fields (API requires string or array, never null/None)
+    0b. Missing/empty tool names (Gemini requires non-empty name on every
+        tool_call and every ToolMessage)
     1. Content array > _MAX_CONTENT_BLOCKS elements (aimlapi.com proxy limit)
     2. Orphaned tool_use without matching tool_result (happens on session resume
        when interrupted mid-tool-execution — Anthropic API requires every
@@ -62,6 +64,28 @@ def _sanitize_messages(messages: list) -> list:
                 msg.content = '{"error": "No content returned"}'
             else:
                 msg.content = ""
+
+    # --- Pass 0b: Fix empty/missing tool names (Gemini requirement) ---
+    # Gemini API rejects requests where tool_calls or ToolMessages have
+    # empty or None names. Ensure every tool-related name is non-empty.
+    _tool_id_to_name: dict[str, str] = {}
+    # First pass: collect name mappings from AIMessage tool_calls
+    for msg in messages:
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for tc in msg.tool_calls:
+                name = tc.get("name") or ""
+                tid = tc.get("id") or ""
+                if name and tid:
+                    _tool_id_to_name[tid] = name
+    # Second pass: fix empty names
+    for msg in messages:
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for tc in msg.tool_calls:
+                if not tc.get("name"):
+                    tc["name"] = _tool_id_to_name.get(tc.get("id", ""), "unknown_tool")
+        if isinstance(msg, ToolMessage):
+            if not getattr(msg, "name", None):
+                msg.name = _tool_id_to_name.get(msg.tool_call_id, "unknown_tool")
 
     # --- Pass 1: Fix content array size ---
     pass1 = []

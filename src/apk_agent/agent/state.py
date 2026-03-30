@@ -52,3 +52,9 @@ class AgentState(TypedDict):
 
     # ---- HITL ----
     human_feedback: str  # populated when resuming from an interrupt
+
+    # ---- working memory (survives compaction via state reminder injection) ----
+    scratchpad: dict[str, Any]  # key→value pairs the agent can store for durable context
+
+    # ---- task decomposition ----
+    task_plan: list[dict[str, Any]]  # [{id, desc, status: pending|in_progress|done}, ...]

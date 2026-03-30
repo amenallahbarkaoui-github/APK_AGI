@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -20,6 +21,10 @@ from apk_agent.progress import report_progress
 
 # Shared thread pool for parallel search I/O
 _ADV_SEARCH_POOL = ThreadPoolExecutor(max_workers=8)
+
+# Smart search result cache: (query, search_type, frozenset(base_dirs)) → (timestamp, result)
+_smart_search_cache: dict[tuple, tuple[float, dict]] = {}
+_CACHE_TTL_SECONDS = 60.0
 
 
 # ---------------------------------------------------------------------------
@@ -647,6 +652,9 @@ def smart_search(
 ) -> dict:
     """Intelligent search that picks the right files and directories based on the query type.
 
+    Uses parallel file scanning (ThreadPoolExecutor) and a 60-second TTL cache
+    to avoid redundant disk rescans for identical queries.
+
     Args:
         query: The regex pattern to search for.
         base_dirs: List of directories to search (jadx_dir, apktool_dir, etc.).
@@ -661,6 +669,17 @@ def smart_search(
     Returns:
         Dict with matches grouped by file.
     """
+    # --- Cache check ---
+    cache_key = (query, search_type, frozenset(str(d) for d in (base_dirs or [])))
+    now = time.monotonic()
+    cached = _smart_search_cache.get(cache_key)
+    if cached:
+        ts, cached_result = cached
+        if now - ts < _CACHE_TTL_SECONDS:
+            cached_result = dict(cached_result)
+            cached_result["cached"] = True
+            return cached_result
+
     _type_extensions = {
         "code": [".java", ".kt", ".smali"],
         "config": [".xml", ".json", ".properties", ".yml"],
@@ -669,7 +688,6 @@ def smart_search(
     }
     exts = _type_extensions.get(search_type, _type_extensions["code"])
 
-    # Directories to skip for each type
     _type_excludes = {
         "code": {"res", "build", "original", "META-INF"},
         "config": set(),
@@ -683,8 +701,8 @@ def smart_search(
     except re.error as e:
         return {"success": False, "error": f"Invalid regex: {e}"}
 
-    all_results: list[dict] = []
-    files_searched = 0
+    # --- Collect files to scan ---
+    files_to_scan: list[tuple[Path, Path]] = []  # (fpath, base)
     skipped_dirs: list[str] = []
     skipped_by_pkg = 0
 
@@ -707,25 +725,48 @@ def smart_search(
                 try:
                     if fpath.stat().st_size > 500 * 1024:
                         continue
-                    text = fpath.read_text(encoding="utf-8", errors="replace")
-                except Exception:
+                except OSError:
                     continue
-                files_searched += 1
-                for i, line in enumerate(text.splitlines(), 1):
-                    if regex.search(line):
-                        all_results.append({
-                            "file": str(fpath),
-                            "line": i,
-                            "content": line.strip()[:300],
-                        })
-                        if len(all_results) >= max_results:
-                            break
-                if len(all_results) >= max_results:
+                files_to_scan.append((fpath, base))
+
+    # --- Parallel file scanning ---
+    def _scan_file(args: tuple[Path, Path]) -> list[dict]:
+        fpath, _base = args
+        matches = []
+        try:
+            text = fpath.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return []
+        for i, line in enumerate(text.splitlines(), 1):
+            if regex.search(line):
+                matches.append({
+                    "file": str(fpath),
+                    "line": i,
+                    "content": line.strip()[:300],
+                })
+                if len(matches) >= 10:  # cap per file
                     break
+        return matches
+
+    all_results: list[dict] = []
+    files_searched = len(files_to_scan)
+
+    # Use thread pool for parallel I/O (much faster on large codebases)
+    futures = {_ADV_SEARCH_POOL.submit(_scan_file, f): f for f in files_to_scan}
+    for future in as_completed(futures):
+        try:
+            matches = future.result(timeout=30)
+            all_results.extend(matches)
             if len(all_results) >= max_results:
+                # Cancel remaining futures
+                for f in futures:
+                    f.cancel()
                 break
-        if len(all_results) >= max_results:
-            break
+        except Exception:
+            pass
+
+    # Trim to max_results
+    all_results = all_results[:max_results]
 
     # Group by file
     grouped: dict[str, list] = {}
@@ -747,4 +788,11 @@ def smart_search(
         result["warning"] = f"Directories not found (skipped): {skipped_dirs}"
     if files_searched == 0 and not skipped_dirs:
         result["hint"] = "No files matched the search_type extensions. Try search_type='all' or check the directory path."
+    if len(all_results) >= max_results:
+        result["truncated"] = True
+        result["hint_refine"] = f"Results capped at {max_results}. Refine your query for more precise results."
+
+    # --- Cache result ---
+    _smart_search_cache[cache_key] = (now, result)
+
     return result
