@@ -33,7 +33,7 @@ from langgraph.types import interrupt, Command
 
 from apk_agent.agent.prompts import SYSTEM_PROMPT
 from apk_agent.agent.state import AgentState
-from apk_agent.agent.tools_def import ALL_TOOLS, set_tool_context
+from apk_agent.agent.tools_def import ALL_TOOLS, set_tool_context, _get_all_smali_dirs, _project
 from apk_agent.compactor import Compactor, count_message_tokens
 from apk_agent.config import AppConfig
 from apk_agent.llm.provider import get_llm
@@ -313,6 +313,49 @@ def human_review_router(state: AgentState) -> Literal["tools", "agent"]:
     return "agent"
 
 
+def _auto_build_graph_and_index():
+    """Automatically build code graph + index after decompilation.
+    Runs in the background-ish (blocking but fast). Errors are logged, not raised.
+    """
+    try:
+        from apk_agent.tools.code_graph import build_code_graph, save_graph
+        from apk_agent.tools.index_cache import build_code_index, save_index
+        from apk_agent.agent.tools_def import _code_graph, _code_index
+        import apk_agent.agent.tools_def as td
+        from apk_agent.progress import report_progress
+
+        smali_dirs = _get_all_smali_dirs()
+        if not smali_dirs:
+            return
+
+        outputs_dir = _project.outputs_dir if _project else None
+        if not outputs_dir:
+            return
+
+        # Build graph
+        logger.info("Auto-building code graph after decompilation...")
+        G = build_code_graph(smali_dirs, progress_callback=report_progress)
+        graph_path = outputs_dir / "call_graph.pickle"
+        save_graph(G, graph_path)
+        td._code_graph = G
+        logger.info(f"Code graph built: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+
+        # Build index
+        logger.info("Auto-building code index...")
+        jadx_dir = _project.jadx_dir if _project else None
+        idx = build_code_index(smali_dirs, jadx_dir=jadx_dir,
+                               progress_callback=report_progress)
+        index_path = outputs_dir / "code_index.json"
+        save_index(idx, index_path)
+        td._code_index = idx
+        logger.info(f"Code index built: {idx['stats']['total_classes']} classes, {idx['stats']['total_methods']} methods")
+
+    except ImportError as e:
+        logger.warning(f"Skipping auto graph build (missing dependency): {e}")
+    except Exception as e:
+        logger.warning(f"Auto graph/index build failed (non-critical): {e}")
+
+
 def tools_postprocess(state: AgentState) -> dict:
     """Extract findings and patch results from tool messages into durable state.
 
@@ -359,6 +402,15 @@ def tools_postprocess(state: AgentState) -> dict:
                     })
             except (json.JSONDecodeError, KeyError):
                 pass
+
+        # Auto-build code graph + index after decompilation completes
+        if tool_name == "apktool_decompile":
+            try:
+                data = json.loads(content) if content.startswith("{") else {}
+                if data.get("success", False) or "output_dir" in (content or ""):
+                    _auto_build_graph_and_index()
+            except Exception:
+                pass  # Don't block agent if graph build fails
 
     if new_findings:
         existing = list(state.get("findings") or [])

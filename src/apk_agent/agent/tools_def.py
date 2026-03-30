@@ -33,6 +33,10 @@ _CACHEABLE_TOOLS = frozenset({
     "find_string_decryption_patterns",
     "search_interceptors", "search_native_code", "search_dynamic_loaders",
     "refine_search", "smart_search",
+    "graph_callers", "graph_callees", "graph_class_info",
+    "graph_find_path", "graph_security_scan", "graph_stats",
+    "index_lookup_class", "index_lookup_method",
+    "index_lookup_string", "index_lookup_package",
 })
 
 
@@ -1313,6 +1317,304 @@ def smart_search(
 
 
 # ---------------------------------------------------------------------------
+# Code Graph tools (NetworkX-powered)
+# ---------------------------------------------------------------------------
+
+# Module-level graph + index holders (loaded once per session)
+_code_graph = None
+_code_index = None
+
+
+def _ensure_graph():
+    """Load or build the code graph. Returns the graph."""
+    global _code_graph
+    if _code_graph is not None:
+        return _code_graph
+
+    from apk_agent.tools.code_graph import load_graph, build_code_graph, save_graph
+
+    graph_path = Path(_project.outputs_dir) / "call_graph.pickle"
+    G = load_graph(graph_path)
+    if G is not None:
+        _code_graph = G
+        return G
+
+    # Need to build it
+    smali_dirs = _get_all_smali_dirs()
+    if not smali_dirs:
+        return None
+
+    from apk_agent.progress import report_progress
+    G = build_code_graph(smali_dirs, progress_callback=report_progress)
+    save_graph(G, graph_path)
+    _code_graph = G
+    return G
+
+
+def _ensure_index():
+    """Load or build the code index. Returns the index dict."""
+    global _code_index
+    if _code_index is not None:
+        return _code_index
+
+    from apk_agent.tools.index_cache import load_index, build_code_index, save_index
+
+    index_path = Path(_project.outputs_dir) / "code_index.json"
+    idx = load_index(index_path)
+    if idx is not None:
+        _code_index = idx
+        return idx
+
+    # Need to build it
+    smali_dirs = _get_all_smali_dirs()
+    if not smali_dirs:
+        return None
+
+    from apk_agent.progress import report_progress
+    idx = build_code_index(smali_dirs, jadx_dir=_project.jadx_dir,
+                           progress_callback=report_progress)
+    save_index(idx, index_path)
+    _code_index = idx
+    return idx
+
+
+@tool
+def build_graph_and_index() -> str:
+    """Build (or rebuild) the code graph and class index from decompiled smali.
+    Must have run apktool_decompile first. Building is automatic on first query,
+    but call this explicitly after decompilation for best results.
+
+    Creates:
+    - Call graph (NetworkX): class→method→calls relationships for instant tracing
+    - Code index (JSON): class/method/string lookup for instant search
+    """
+    global _code_graph, _code_index
+    from apk_agent.tools.code_graph import build_code_graph, save_graph, get_graph_stats
+    from apk_agent.tools.index_cache import build_code_index, save_index
+    from apk_agent.progress import report_progress
+
+    smali_dirs = _get_all_smali_dirs()
+    if not smali_dirs:
+        return json.dumps({"success": False, "error": "No smali directories found. Run apktool_decompile first."})
+
+    def _run():
+        global _code_graph, _code_index
+
+        # Build graph
+        G = build_code_graph(smali_dirs, progress_callback=report_progress)
+        graph_path = Path(_project.outputs_dir) / "call_graph.pickle"
+        g_stats = save_graph(G, graph_path)
+        _code_graph = G
+
+        # Build index
+        idx = build_code_index(smali_dirs, jadx_dir=_project.jadx_dir,
+                               progress_callback=report_progress)
+        index_path = Path(_project.outputs_dir) / "code_index.json"
+        i_stats = save_index(idx, index_path)
+        _code_index = idx
+
+        return json.dumps({
+            "success": True,
+            "graph": g_stats,
+            "index": i_stats,
+        }, indent=2)
+    return _safe_call(_run, "build_graph_and_index")
+
+
+@tool
+def graph_callers(method_name: str, depth: int = 3) -> str:
+    """Find all callers of a method — INSTANT, no file scanning.
+    Uses the pre-built code graph. Much faster than trace_call_chain.
+
+    Args:
+        method_name: Method name to trace (e.g., "checkServerTrusted", "isRooted").
+            Partial match supported.
+        depth: How many levels up to trace (default 3).
+    """
+    from apk_agent.tools.code_graph import query_callers
+
+    def _run():
+        G = _ensure_graph()
+        if G is None:
+            return json.dumps({"success": False, "error": "No code graph. Run build_graph_and_index first."})
+        result = query_callers(G, method_name, depth=depth)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
+    return _safe_call(_run, "graph_callers")
+
+
+@tool
+def graph_callees(method_name: str, depth: int = 2) -> str:
+    """Find all methods CALLED BY the given method — follow the forward call chain.
+    Uses the pre-built code graph. Instant results.
+
+    Args:
+        method_name: Method name to trace (e.g., "processPayment", "onCreate").
+        depth: How many levels deep to trace (default 2).
+    """
+    from apk_agent.tools.code_graph import query_callees
+
+    def _run():
+        G = _ensure_graph()
+        if G is None:
+            return json.dumps({"success": False, "error": "No code graph. Run build_graph_and_index first."})
+        result = query_callees(G, method_name, depth=depth)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
+    return _safe_call(_run, "graph_callees")
+
+
+@tool
+def graph_class_info(class_name: str) -> str:
+    """Get full info about a class from the code graph — methods, inheritance,
+    who calls it, fields. Partial match supported.
+
+    Args:
+        class_name: Class name (e.g., "SslPinningHelper", "PaymentManager").
+    """
+    from apk_agent.tools.code_graph import query_class_info
+
+    def _run():
+        G = _ensure_graph()
+        if G is None:
+            return json.dumps({"success": False, "error": "No code graph. Run build_graph_and_index first."})
+        result = query_class_info(G, class_name)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
+    return _safe_call(_run, "graph_class_info")
+
+
+@tool
+def graph_find_path(source_method: str, target_method: str) -> str:
+    """Find the shortest call path between two methods.
+    Useful for understanding data flow: how does method A reach method B?
+
+    Args:
+        source_method: Starting method name.
+        target_method: Ending method name.
+    """
+    from apk_agent.tools.code_graph import query_path
+
+    def _run():
+        G = _ensure_graph()
+        if G is None:
+            return json.dumps({"success": False, "error": "No code graph. Run build_graph_and_index first."})
+        result = query_path(G, source_method, target_method)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:10000]
+    return _safe_call(_run, "graph_find_path")
+
+
+@tool
+def graph_security_scan() -> str:
+    """Scan the code graph for security-related methods: SSL pinning, root detection,
+    crypto, anti-debug, anti-tamper, dynamic loading. Returns categorized results
+    with caller counts so you know which methods are most important.
+    """
+    from apk_agent.tools.code_graph import find_security_methods
+
+    def _run():
+        G = _ensure_graph()
+        if G is None:
+            return json.dumps({"success": False, "error": "No code graph. Run build_graph_and_index first."})
+        result = find_security_methods(G)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:20000]
+    return _safe_call(_run, "graph_security_scan")
+
+
+@tool
+def graph_stats() -> str:
+    """Get code graph statistics — total classes, methods, edges, hotspots.
+    Shows the most-called methods (hotspots) which are often security-critical.
+    """
+    from apk_agent.tools.code_graph import get_graph_stats
+
+    def _run():
+        G = _ensure_graph()
+        if G is None:
+            return json.dumps({"success": False, "error": "No code graph available."})
+        result = get_graph_stats(G)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:10000]
+    return _safe_call(_run, "graph_stats")
+
+
+# ---------------------------------------------------------------------------
+# Code Index tools (persistent class/method/string lookup)
+# ---------------------------------------------------------------------------
+
+
+@tool
+def index_lookup_class(query: str) -> str:
+    """Look up classes by name from the persistent index — instant results.
+    Partial match: "Payment" finds PaymentManager, PaymentHelper, etc.
+
+    Args:
+        query: Class name or partial match (e.g., "Payment", "Crypto", "SSL").
+    """
+    from apk_agent.tools.index_cache import lookup_class
+
+    def _run():
+        idx = _ensure_index()
+        if idx is None:
+            return json.dumps({"success": False, "error": "No code index. Run build_graph_and_index first."})
+        result = lookup_class(idx, query)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
+    return _safe_call(_run, "index_lookup_class")
+
+
+@tool
+def index_lookup_method(method_name: str) -> str:
+    """Find all classes containing a specific method — instant.
+    Use this before read_file to know exactly WHERE a method lives.
+
+    Args:
+        method_name: Method name (e.g., "checkServerTrusted", "encrypt", "isRooted").
+    """
+    from apk_agent.tools.index_cache import lookup_method
+
+    def _run():
+        idx = _ensure_index()
+        if idx is None:
+            return json.dumps({"success": False, "error": "No code index. Run build_graph_and_index first."})
+        result = lookup_method(idx, method_name)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
+    return _safe_call(_run, "index_lookup_method")
+
+
+@tool
+def index_lookup_string(query: str) -> str:
+    """Find which classes use a specific string constant.
+    Great for finding API endpoints, keys, URLs, error messages.
+
+    Args:
+        query: String to search for (e.g., "api_key", "https://", "/login").
+    """
+    from apk_agent.tools.index_cache import lookup_string
+
+    def _run():
+        idx = _ensure_index()
+        if idx is None:
+            return json.dumps({"success": False, "error": "No code index. Run build_graph_and_index first."})
+        result = lookup_string(idx, query)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
+    return _safe_call(_run, "index_lookup_string")
+
+
+@tool
+def index_lookup_package(package_name: str) -> str:
+    """List all classes in a Java package — instant.
+
+    Args:
+        package_name: Package name (e.g., "com.example.crypto", "payment").
+    """
+    from apk_agent.tools.index_cache import lookup_package
+
+    def _run():
+        idx = _ensure_index()
+        if idx is None:
+            return json.dumps({"success": False, "error": "No code index. Run build_graph_and_index first."})
+        result = lookup_package(idx, package_name)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
+    return _safe_call(_run, "index_lookup_package")
+
+
+# ---------------------------------------------------------------------------
 # Tool list for graph construction
 # ---------------------------------------------------------------------------
 
@@ -1353,6 +1655,19 @@ ALL_TOOLS = [
     refine_search,
     batch_read_smali_methods,
     smart_search,
+    # Code Graph (NetworkX) — instant call chain tracing
+    build_graph_and_index,
+    graph_callers,
+    graph_callees,
+    graph_class_info,
+    graph_find_path,
+    graph_security_scan,
+    graph_stats,
+    # Code Index — instant class/method/string lookup
+    index_lookup_class,
+    index_lookup_method,
+    index_lookup_string,
+    index_lookup_package,
     # Targeted analysis (encrypted payloads, native code, dynamic loading)
     search_interceptors,
     search_native_code,
