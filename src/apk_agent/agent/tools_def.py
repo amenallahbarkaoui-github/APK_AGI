@@ -135,6 +135,19 @@ def _resolve_dir(directory: str | None, default: str = "jadx") -> Path:
     d = directory.strip().strip("/").strip("\\")
     low = d.lower().replace("\\", "/")
 
+    # Strip "decompiled/..." prefixes so downstream handlers can match
+    for prefix in ("decompiled/jadx_src/", "decompiled/apktool/",
+                   "decompiled/sources/", "decompiled/"):
+        if low.startswith(prefix):
+            d = d[len(prefix):]
+            low = d.lower().replace("\\", "/")
+            # "decompiled/sources/X" → d is now "X" (sources/ was stripped).
+            # Prepend "sources/" back so the sources handler below catches it.
+            if prefix == "decompiled/sources/":
+                d = "sources/" + d
+                low = d.lower().replace("\\", "/")
+            break
+
     # Exact alias matching
     if low in ("jadx", "jadx_src"):
         return _project.jadx_dir
@@ -169,6 +182,18 @@ def _resolve_dir(directory: str | None, default: str = "jadx") -> Path:
             return candidate
         return candidate
 
+    # Handle "sources/..." paths — these go under jadx_dir
+    if low.startswith("sources") or low.startswith("jadx_src/") or low.startswith("jadx/"):
+        sub = d
+        if low.startswith("jadx_src/"):
+            sub = d.split("/", 1)[1] if "/" in d else d
+        elif low.startswith("jadx/"):
+            sub = d.split("/", 1)[1] if "/" in d else d
+        candidate = _project.jadx_dir / sub
+        if candidate.is_dir():
+            return candidate
+        return candidate
+
     p = Path(directory)
     if p.is_absolute():
         return p
@@ -192,7 +217,9 @@ def _resolve_file(file_path: str) -> Path:
 
     Handles common prefixes the agent may pass:
       - "smali/com/foo/Bar.smali"  → apktool_dir / smali / com/foo/Bar.smali
+      - "sources/com/foo/Bar.java" → jadx_dir / sources / com/foo/Bar.java
       - "decompiled/apktool/smali/com/foo/Bar.smali" → strip prefix
+      - "decompiled/jadx_src/sources/com/foo/Bar.java" → strip prefix
       - absolute path → returned as-is
 
     Also searches all smali_classesN/ dirs when the file is missing from smali/.
@@ -203,16 +230,25 @@ def _resolve_file(file_path: str) -> Path:
 
     fpath = file_path.replace("\\", "/")
 
-    # Strip accidental "decompiled/apktool/" prefix
-    for prefix in ("decompiled/apktool/", "decompiled\\apktool\\"):
+    # Strip accidental "decompiled/" prefixes
+    for prefix in ("decompiled/apktool/", "decompiled/jadx_src/",
+                   "decompiled/sources/", "decompiled/"):
         if fpath.startswith(prefix):
             fpath = fpath[len(prefix):]
+            # "decompiled/sources/X" → fpath is now "X"; restore "sources/" prefix
+            if prefix == "decompiled/sources/":
+                fpath = "sources/" + fpath
             break
 
     # Try directly under apktool_dir (covers smali/..., res/..., etc.)
     candidate = _project.apktool_dir / fpath
     if candidate.is_file():
         return candidate
+
+    # Try directly under jadx_dir (covers sources/..., resources/..., etc.)
+    jadx_candidate = _project.jadx_dir / fpath
+    if jadx_candidate.is_file():
+        return jadx_candidate
 
     # If path starts with "smali/", try other smali dirs (smali_classes2, etc.)
     if fpath.startswith("smali/"):
@@ -230,11 +266,21 @@ def _resolve_file(file_path: str) -> Path:
             if test.is_file():
                 return test
 
-    # Fallback: try workspace root, then just return best-guess under apktool_dir
+    # If path looks like a Java/Kotlin source without "sources/" prefix,
+    # try under jadx_dir/sources/
+    if fpath.endswith((".java", ".kt")) and not fpath.startswith("sources"):
+        jadx_src = _project.jadx_dir / "sources" / fpath
+        if jadx_src.is_file():
+            return jadx_src
+
+    # Fallback: try workspace root, then just return best-guess
     ws_candidate = Path(_project.workspace_path) / file_path
     if ws_candidate.is_file():
         return ws_candidate
 
+    # Return whichever candidate is more likely based on extension
+    if fpath.endswith((".java", ".kt")):
+        return jadx_candidate
     return candidate  # return apktool_dir-based path (will surface "not found" error)
 
 
@@ -1544,6 +1590,141 @@ def mark_task_done(task_id: int) -> str:
     return json.dumps({"success": False, "error": f"Task {task_id} not found"})
 
 
+@tool
+def edit_task_plan(action: str, task_id: int = 0, new_desc: str = "", new_status: str = "", position: int = 0) -> str:
+    """Edit the task plan dynamically — add, remove, modify, or reorder tasks.
+    Use this when you encounter problems and need to adapt your plan.
+
+    Args:
+        action: One of:
+            - "add": Add a new task (provide new_desc, optional position)
+            - "remove": Remove a task by id (provide task_id)
+            - "modify": Change a task's description and/or status (provide task_id + new_desc/new_status)
+            - "reorder": Move a task to a new position (provide task_id + position)
+            - "add_before": Insert a new task before task_id (provide task_id + new_desc)
+            - "add_after": Insert a new task after task_id (provide task_id + new_desc)
+        task_id: The id of the task to modify/remove/reorder (not needed for "add").
+        new_desc: New description for add/modify operations.
+        new_status: New status for modify: "pending", "in_progress", "done", "blocked", "skipped".
+        position: Target position for reorder (1-based), or position for add.
+    """
+    action = action.strip().lower()
+
+    if action == "add":
+        # Generate next id
+        max_id = max((t.get("id", 0) for t in _task_plan), default=0)
+        new_task = {"id": max_id + 1, "desc": new_desc or "New task", "status": "pending"}
+        if position and 1 <= position <= len(_task_plan) + 1:
+            _task_plan.insert(position - 1, new_task)
+        else:
+            _task_plan.append(new_task)
+        return json.dumps({"success": True, "action": "added", "task": new_task, "plan": _task_plan})
+
+    elif action == "remove":
+        for i, t in enumerate(_task_plan):
+            if t.get("id") == task_id:
+                removed = _task_plan.pop(i)
+                return json.dumps({"success": True, "action": "removed", "removed": removed, "plan": _task_plan})
+        return json.dumps({"success": False, "error": f"Task {task_id} not found"})
+
+    elif action == "modify":
+        for t in _task_plan:
+            if t.get("id") == task_id:
+                if new_desc:
+                    t["desc"] = new_desc
+                if new_status:
+                    t["status"] = new_status
+                return json.dumps({"success": True, "action": "modified", "task": t, "plan": _task_plan})
+        return json.dumps({"success": False, "error": f"Task {task_id} not found"})
+
+    elif action == "reorder":
+        for i, t in enumerate(_task_plan):
+            if t.get("id") == task_id:
+                task = _task_plan.pop(i)
+                pos = max(0, min(len(_task_plan), position - 1))
+                _task_plan.insert(pos, task)
+                return json.dumps({"success": True, "action": "reordered", "task": task, "plan": _task_plan})
+        return json.dumps({"success": False, "error": f"Task {task_id} not found"})
+
+    elif action in ("add_before", "add_after"):
+        for i, t in enumerate(_task_plan):
+            if t.get("id") == task_id:
+                max_id = max((t2.get("id", 0) for t2 in _task_plan), default=0)
+                new_task = {"id": max_id + 1, "desc": new_desc or "New task", "status": "pending"}
+                insert_pos = i if action == "add_before" else i + 1
+                _task_plan.insert(insert_pos, new_task)
+                return json.dumps({"success": True, "action": action, "task": new_task, "plan": _task_plan})
+        return json.dumps({"success": False, "error": f"Task {task_id} not found"})
+
+    else:
+        return json.dumps({"success": False, "error": f"Unknown action: '{action}'. Use: add, remove, modify, reorder, add_before, add_after"})
+
+
+# ---------------------------------------------------------------------------
+# Human Interaction — ask_user (interrupt-based)
+# ---------------------------------------------------------------------------
+
+@tool
+def ask_user(question: str, options: str = "") -> str:
+    """Ask the user a question and wait for their response.
+    Use this when you encounter a difficult situation and need human guidance.
+
+    WHEN TO USE:
+    - You're unsure which of multiple approaches to take for a tricky patch
+    - A patch failed and you need the user to decide: retry, skip, or try alternative
+    - You found multiple potential targets and need the user to pick one
+    - You need clarification about what the user actually wants
+    - The health check shows critical issues and you need user decision
+
+    WHEN NOT TO USE:
+    - For routine operations you can handle autonomously
+    - For approval before patching (that's automatic via human_review)
+    - When you can make a reasonable decision on your own
+
+    Args:
+        question: Clear, concise question for the user. Include context about what happened.
+        options: Optional comma-separated list of choices (e.g., "retry,skip,alternative").
+            If empty, user gives free-form response.
+    """
+    from langgraph.types import interrupt
+
+    # Build the prompt
+    prompt_parts = ["❓ **Agent Question**", "", question, ""]
+
+    if options.strip():
+        option_list = [o.strip() for o in options.split(",") if o.strip()]
+        prompt_parts.append("Options:")
+        for i, opt in enumerate(option_list, 1):
+            prompt_parts.append(f"  {i}. {opt}")
+        prompt_parts.append("")
+        prompt_parts.append(f"Reply with your choice (1-{len(option_list)}) or type your own answer:")
+    else:
+        prompt_parts.append("Type your answer:")
+
+    prompt_text = "\n".join(prompt_parts)
+
+    # Interrupt — pauses the graph, CLI collects user input, resumes
+    user_response = interrupt(prompt_text)
+
+    response_str = str(user_response).strip()
+
+    # If numbered options were provided, try to resolve by number
+    if options.strip():
+        option_list = [o.strip() for o in options.split(",") if o.strip()]
+        try:
+            idx = int(response_str) - 1
+            if 0 <= idx < len(option_list):
+                response_str = option_list[idx]
+        except ValueError:
+            pass  # User typed a free-form answer
+
+    return json.dumps({
+        "success": True,
+        "question": question,
+        "user_response": response_str,
+    }, ensure_ascii=False)
+
+
 def _get_scratchpad() -> dict:
     """Return current scratchpad (for state injection in graph.py)."""
     return dict(_scratchpad)
@@ -2567,6 +2748,9 @@ ALL_TOOLS = [
     read_scratchpad,
     update_task_plan,
     mark_task_done,
+    edit_task_plan,
+    # Human interaction (ask user for guidance)
+    ask_user,
     # Android resource tools (colors, styles, themes, drawables)
     find_app_colors,
     find_app_styles,

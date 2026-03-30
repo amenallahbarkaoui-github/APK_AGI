@@ -172,7 +172,7 @@ def agent_node(state: AgentState) -> dict:
         # Insert after system prompt
         insert_idx = 1 if isinstance(messages[0], SystemMessage) else 0
         messages.insert(insert_idx, HumanMessage(
-            content=f"[DURABLE STATE — graph, scope, findings, patches & memory]\n{state_msg}"
+            content=f"[DURABLE STATE — graph, scope, findings, patches & memory]\n{state_msg}\n\n⚡ REMINDER: Execute tools NOW. Do NOT send text-only messages announcing phases. Call tools in EVERY response. Batch independent tools in parallel."
         ))
 
     # --- Auto-compact check ---
@@ -293,23 +293,63 @@ def agent_node(state: AgentState) -> dict:
     return {"messages": result_messages}
 
 
-def should_continue(state: AgentState) -> Literal["tools", "human_review", "__end__"]:
-    """Route after agent node: tool call → tools, else → end."""
+# Track consecutive text-only (no tool calls) responses for nudge logic
+_consecutive_no_tool_count = 0
+_MAX_NUDGES = 2  # max times we'll nudge the agent to call tools before allowing __end__
+
+
+def should_continue(state: AgentState) -> Literal["tools", "human_review", "nudge", "__end__"]:
+    """Route after agent node: tool call → tools, text-only → nudge or end."""
+    global _consecutive_no_tool_count
     last_msg = state["messages"][-1]
 
     if not isinstance(last_msg, AIMessage):
+        _consecutive_no_tool_count = 0
         return "__end__"
 
     # If the LLM wants to call tools
     if last_msg.tool_calls:
+        _consecutive_no_tool_count = 0
         # Check if any tool call is a high-risk patch (apply_smali_patch)
         for tc in last_msg.tool_calls:
             if tc["name"] == "apply_smali_patch":
                 return "human_review"
         return "tools"
 
-    # No tool calls → agent is done
+    # No tool calls — check if this is an "announcing" message that
+    # should be nudged to actually call tools, or a genuine final answer
+    content = (last_msg.content or "").strip().lower() if isinstance(last_msg.content, str) else ""
+
+    # Detect announcement patterns (agent says "I'll do X" but doesn't do it)
+    is_announcing = any(phrase in content for phrase in [
+        "let me", "i'll ", "i will", "i'm going to", "phase ", "step ",
+        "first,", "next,", "now i", "starting", "let's ", "i need to",
+        "going to ", "begin by", "start by", "proceed to", "kick off",
+    ])
+
+    if is_announcing and _consecutive_no_tool_count < _MAX_NUDGES:
+        _consecutive_no_tool_count += 1
+        return "nudge"
+
+    # Genuine final answer or max nudges reached
+    _consecutive_no_tool_count = 0
     return "__end__"
+
+
+def nudge_node(state: AgentState) -> dict:
+    """Inject a system message telling the agent to call tools instead of just talking."""
+    return {
+        "messages": [
+            HumanMessage(
+                content=(
+                    "[SYSTEM] You just announced what you plan to do but didn't call any tools. "
+                    "DO NOT announce phases — call the tools NOW in your next response. "
+                    "Include tool calls for every action you mentioned. "
+                    "Batch independent tools in parallel."
+                )
+            )
+        ]
+    }
 
 
 def human_review_node(state: AgentState) -> dict:
@@ -630,6 +670,8 @@ def build_graph(config: AppConfig, project: Project, checkpointer=None):
 
     # Reset loop detector for fresh session
     _tool_call_tracker.clear()
+    global _consecutive_no_tool_count
+    _consecutive_no_tool_count = 0
 
     # Set tool context
     set_tool_context(config, project)
@@ -652,6 +694,7 @@ def build_graph(config: AppConfig, project: Project, checkpointer=None):
     graph.add_node("tools", tool_node)
     graph.add_node("tools_post", tools_postprocess)
     graph.add_node("human_review", human_review_node)
+    graph.add_node("nudge", nudge_node)
 
     graph.set_entry_point("agent")
 
@@ -661,6 +704,7 @@ def build_graph(config: AppConfig, project: Project, checkpointer=None):
         {
             "tools": "tools",
             "human_review": "human_review",
+            "nudge": "nudge",
             "__end__": END,
         },
     )
@@ -668,6 +712,9 @@ def build_graph(config: AppConfig, project: Project, checkpointer=None):
     # After tools execute → postprocess to extract findings → back to agent
     graph.add_edge("tools", "tools_post")
     graph.add_edge("tools_post", "agent")
+
+    # After nudge → back to agent to retry with tool calls
+    graph.add_edge("nudge", "agent")
 
     # After human review → route based on feedback
     graph.add_conditional_edges(

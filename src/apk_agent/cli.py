@@ -790,6 +790,10 @@ def _process_stream_event(event: dict, graph, graph_config: dict) -> None:
         elif node_name == "human_review":
             pass
 
+        elif node_name == "nudge":
+            # Agent announced intent without calling tools — auto-nudging
+            console.print("[dim]⚡ Auto-nudging agent to execute tools...[/]")
+
         elif node_name == "__interrupt__":
             # Handle LangGraph interrupt
             interrupts = node_output

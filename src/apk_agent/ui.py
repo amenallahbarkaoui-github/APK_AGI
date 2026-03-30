@@ -145,9 +145,14 @@ def enable_live_progress() -> None:
 
 def print_hitl_prompt(prompt_text: str) -> None:
     """Render a human-in-the-loop prompt."""
+    # Detect if this is a question from ask_user or a patch approval
+    if prompt_text.startswith("❓"):
+        title = "❓ Agent Needs Your Input"
+    else:
+        title = "🔒 Human Review Required"
     console.print(Panel(
         prompt_text,
-        title="🔒 Human Review Required",
+        title=title,
         border_style="magenta",
         padding=(1, 2),
     ))
