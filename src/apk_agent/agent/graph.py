@@ -335,6 +335,9 @@ def _auto_build_graph_and_index():
         # Build graph
         logger.info("Auto-building code graph after decompilation...")
         G = build_code_graph(smali_dirs, progress_callback=report_progress)
+        if G.number_of_nodes() == 0:
+            logger.error("Code graph is EMPTY — no classes/methods found in smali dirs")
+            raise RuntimeError("Code graph build produced 0 nodes — decompilation may have failed")
         graph_path = outputs_dir / "call_graph.pickle"
         save_graph(G, graph_path)
         td._code_graph = G
@@ -351,9 +354,11 @@ def _auto_build_graph_and_index():
         logger.info(f"Code index built: {idx['stats']['total_classes']} classes, {idx['stats']['total_methods']} methods")
 
     except ImportError as e:
-        logger.warning(f"Skipping auto graph build (missing dependency): {e}")
+        logger.error(f"CRITICAL: Skipping graph build (missing dependency): {e}")
+        raise  # Let caller know graph build failed
     except Exception as e:
-        logger.warning(f"Auto graph/index build failed (non-critical): {e}")
+        logger.error(f"CRITICAL: Graph/index build failed: {e}")
+        raise  # Let caller know graph build failed
 
 
 def tools_postprocess(state: AgentState) -> dict:
@@ -406,11 +411,11 @@ def tools_postprocess(state: AgentState) -> dict:
         # Auto-build code graph + index after decompilation completes
         if tool_name == "apktool_decompile":
             try:
-                data = json.loads(content) if content.startswith("{") else {}
-                if data.get("success", False) or "output_dir" in (content or ""):
-                    _auto_build_graph_and_index()
-            except Exception:
-                pass  # Don't block agent if graph build fails
+                _auto_build_graph_and_index()
+                updates["graph_ready"] = True
+            except Exception as e:
+                logger.error(f"Auto graph/index build FAILED: {e}")
+                updates["graph_ready"] = False
 
     if new_findings:
         existing = list(state.get("findings") or [])

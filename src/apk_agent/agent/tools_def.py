@@ -42,10 +42,12 @@ _CACHEABLE_TOOLS = frozenset({
 
 def set_tool_context(config, project) -> None:
     """Set the config and project for tool execution. Called once per session."""
-    global _config, _project, _tool_cache
+    global _config, _project, _tool_cache, _code_graph, _code_index
     _config = config
     _project = project
     _tool_cache.clear()  # fresh cache per session
+    _code_graph = None   # reset graph — prevent stale data across sessions
+    _code_index = None   # reset index — will be rebuilt/loaded on first use
 
 
 def _log_file() -> Path:
@@ -1456,7 +1458,7 @@ _code_index = None
 
 
 def _ensure_graph():
-    """Load or build the code graph. Returns the graph."""
+    """Load or build the code graph. Returns the graph or None."""
     global _code_graph
     if _code_graph is not None:
         return _code_graph
@@ -1466,8 +1468,12 @@ def _ensure_graph():
     graph_path = Path(_project.outputs_dir) / "call_graph.pickle"
     G = load_graph(graph_path)
     if G is not None:
-        _code_graph = G
-        return G
+        if G.number_of_nodes() == 0:
+            # Stale empty graph on disk — discard and rebuild
+            G = None
+        else:
+            _code_graph = G
+            return G
 
     # Need to build it
     smali_dirs = _get_all_smali_dirs()
@@ -1476,13 +1482,15 @@ def _ensure_graph():
 
     from apk_agent.progress import report_progress
     G = build_code_graph(smali_dirs, progress_callback=report_progress)
+    if G.number_of_nodes() == 0:
+        return None  # Don't cache empty graphs
     save_graph(G, graph_path)
     _code_graph = G
     return G
 
 
 def _ensure_index():
-    """Load or build the code index. Returns the index dict."""
+    """Load or build the code index. Returns the index dict or None."""
     global _code_index
     if _code_index is not None:
         return _code_index
@@ -1492,8 +1500,12 @@ def _ensure_index():
     index_path = Path(_project.outputs_dir) / "code_index.json"
     idx = load_index(index_path)
     if idx is not None:
-        _code_index = idx
-        return idx
+        if idx.get("stats", {}).get("total_classes", 0) == 0:
+            # Stale empty index on disk — discard and rebuild
+            idx = None
+        else:
+            _code_index = idx
+            return idx
 
     # Need to build it
     smali_dirs = _get_all_smali_dirs()
@@ -1503,6 +1515,8 @@ def _ensure_index():
     from apk_agent.progress import report_progress
     idx = build_code_index(smali_dirs, jadx_dir=_project.jadx_dir,
                            progress_callback=report_progress)
+    if idx.get("stats", {}).get("total_classes", 0) == 0:
+        return None  # Don't cache empty indexes
     save_index(idx, index_path)
     _code_index = idx
     return idx

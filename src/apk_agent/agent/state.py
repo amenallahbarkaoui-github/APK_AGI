@@ -33,6 +33,9 @@ class AgentState(TypedDict):
     target_packages: list[str]       # app's own packages (e.g. ["com.comviva.nextgen", "tn.com.tunisiana"])
     excluded_packages: list[str]     # third-party noise to ignore (e.g. ["com.google", "com.facebook", "com.madme"])
 
+    # ---- graph / index readiness ----
+    graph_ready: bool                # True after code graph + index built successfully
+
     # ---- analysis results ----
     findings: list[dict[str, Any]]
 
