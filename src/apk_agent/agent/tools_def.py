@@ -1138,6 +1138,139 @@ def analyze_native_libs() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Deep Analysis tools
+# ---------------------------------------------------------------------------
+
+@tool
+def validate_patch(file_path: str) -> str:
+    """Validate smali syntax AFTER patching — catch errors BEFORE apktool_build.
+    Checks for unclosed methods, missing .end directives, unknown opcodes, etc.
+    Run this after apply_smali_patch to avoid build failures.
+
+    Args:
+        file_path: Path to the .smali file to validate (absolute or relative).
+    """
+    from apk_agent.tools.deep_analysis import validate_smali_syntax
+
+    p = _resolve_file(file_path)
+
+    def _run():
+        result = validate_smali_syntax(p)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:10000]
+    return _safe_call(_run, "validate_patch")
+
+
+@tool
+def find_entry_points() -> str:
+    """Discover ALL app entry points in execution order:
+    ContentProviders (auto-init first) → Application.onCreate() →
+    LauncherActivity → BootReceivers → ExportedServices.
+
+    Start analysis from here — these are where security checks are initialized.
+    """
+    from apk_agent.tools.deep_analysis import find_entry_points as _find
+
+    manifest_path = _project.apktool_dir / "AndroidManifest.xml"
+
+    def _run():
+        result = _find(manifest_path, _get_all_smali_dirs())
+        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
+    return _safe_call(_run, "find_entry_points")
+
+
+@tool
+def map_hierarchy(target_class: str = "") -> str:
+    """Map the class inheritance hierarchy from smali code.
+    Find all parents/children of a class, or get an overview of
+    security-relevant hierarchies (TrustManager, Interceptor, etc.).
+
+    Args:
+        target_class: Class to trace (e.g., "MyTrustManager", "Lcom/app/Foo;").
+            If empty, returns overview of all hierarchies with security highlights.
+    """
+    from apk_agent.tools.deep_analysis import map_class_hierarchy
+
+    def _run():
+        result = map_class_hierarchy(_get_all_smali_dirs(), target_class=target_class)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
+    return _safe_call(_run, "map_hierarchy")
+
+
+@tool
+def analyze_shared_prefs() -> str:
+    """Find ALL SharedPreferences usage — preference files, stored keys, and
+    security-sensitive values (tokens, flags, license checks).
+
+    Identifies boolean flags that may be bypass targets (is_premium, is_rooted).
+    """
+    from apk_agent.tools.deep_analysis import analyze_shared_prefs as _analyze
+
+    dirs = [_project.jadx_dir]
+    for sd in _get_all_smali_dirs():
+        dirs.append(sd)
+
+    def _run():
+        result = _analyze(dirs)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
+    return _safe_call(_run, "analyze_shared_prefs")
+
+
+@tool
+def extract_native_strings(so_file: str) -> str:
+    """Extract readable strings from a compiled .so native library.
+    Finds: JNI method names, crypto library indicators, URLs/endpoints,
+    hardcoded API keys/tokens. Like Unix 'strings' but with classification.
+
+    Args:
+        so_file: Path to the .so file (e.g., "lib/arm64-v8a/libnative.so").
+    """
+    from apk_agent.tools.deep_analysis import extract_strings_from_binary
+
+    p = Path(so_file)
+    if not p.is_absolute():
+        p = _project.apktool_dir / so_file
+
+    def _run():
+        result = extract_strings_from_binary(p)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
+    return _safe_call(_run, "extract_native_strings")
+
+
+@tool
+def scan_assets_secrets() -> str:
+    """Scan assets/, res/raw/, res/xml/ for embedded secrets:
+    API keys, Firebase URLs, AWS keys, private keys, hardcoded passwords,
+    bearer tokens. WebView apps often leak keys in JavaScript assets.
+    """
+    from apk_agent.tools.deep_analysis import scan_assets_for_secrets
+
+    def _run():
+        result = scan_assets_for_secrets(_project.apktool_dir)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
+    return _safe_call(_run, "scan_assets_secrets")
+
+
+@tool
+def diff_patched_file(original_backup: str, current_file: str) -> str:
+    """Show exact changes between original and patched smali files.
+    Use after patching to verify changes are correct before building.
+
+    Args:
+        original_backup: Path to the backup/original file.
+        current_file: Path to the current (patched) file.
+    """
+    from apk_agent.tools.deep_analysis import diff_smali_files
+
+    orig = _resolve_file(original_backup)
+    curr = _resolve_file(current_file)
+
+    def _run():
+        result = diff_smali_files(orig, curr)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
+    return _safe_call(_run, "diff_patched_file")
+
+
+# ---------------------------------------------------------------------------
 # NEW: Certificate analyzer
 # ---------------------------------------------------------------------------
 

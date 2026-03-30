@@ -46,8 +46,9 @@ all available metadata about the APK:
 4. Use directory_overview to understand the app structure
 5. Report all findings in a structured format.
 
-Be thorough but fast. Focus on gathering data, not deep analysis.""",
-    max_iterations=5,
+Be thorough but fast. Focus on gathering data, not deep analysis.
+IMPORTANT: After using your tools, you MUST provide a final text summary of ALL findings. Do NOT end with only tool calls.""",
+    max_iterations=12,
 )
 
 VULN_SCAN_AGENT = SubAgentDef(
@@ -75,8 +76,9 @@ ALL security issues in the decompiled APK:
 5. Cross-reference findings between Java source and smali
 6. Report findings with severity, evidence, and file locations.
 
-Be thorough. Check EVERY category. Don't stop after finding a few issues.""",
-    max_iterations=8,
+Be thorough. Check EVERY category. Don't stop after finding a few issues.
+IMPORTANT: After using your tools, you MUST provide a final text summary of ALL findings. Do NOT end with only tool calls.""",
+    max_iterations=16,
 )
 
 CRYPTO_AGENT = SubAgentDef(
@@ -101,8 +103,9 @@ CRYPTO_AGENT = SubAgentDef(
 4. Look for SSL pinning implementations and trust manager customizations
 5. Find string encryption/decryption patterns
 6. Analyze obfuscated crypto code
-7. Report each finding with the full code context and risk assessment.""",
-    max_iterations=7,
+7. Report each finding with the full code context and risk assessment.
+IMPORTANT: After using your tools, you MUST provide a final text summary of ALL findings. Do NOT end with only tool calls.""",
+    max_iterations=16,
 )
 
 PATCHER_AGENT = SubAgentDef(
@@ -132,8 +135,9 @@ PATCHER_AGENT = SubAgentDef(
 6. After all patches, rebuild and sign the APK
 7. Report what was patched and why.
 
-Be extremely precise with smali patterns. Smali is whitespace-sensitive.""",
-    max_iterations=10,
+Be extremely precise with smali patterns. Smali is whitespace-sensitive.
+IMPORTANT: After all patches, you MUST provide a final text summary of what was patched. Do NOT end with only tool calls.""",
+    max_iterations=20,
 )
 
 REPORT_AGENT = SubAgentDef(
@@ -149,8 +153,9 @@ REPORT_AGENT = SubAgentDef(
 1. Gather findings from the consolidated results
 2. Organize by severity and category
 3. Generate a comprehensive Markdown report
-4. Include evidence, remediation advice, and risk scores.""",
-    max_iterations=3,
+4. Include evidence, remediation advice, and risk scores.
+IMPORTANT: You MUST output the full report as text. Do NOT end with only tool calls.""",
+    max_iterations=8,
 )
 
 

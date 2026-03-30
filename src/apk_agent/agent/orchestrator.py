@@ -347,6 +347,7 @@ def run_sub_agent(
         iterations = 0
         max_iter = agent_def.max_iterations
         all_ai_messages: list = []
+        all_tool_messages: list = []
 
         for event in graph.stream(input_state, config=graph_config, stream_mode="updates"):
             iterations += 1
@@ -354,13 +355,18 @@ def run_sub_agent(
                 pct = min(95, (iterations / max_iter) * 100)
                 progress.update_task(task_id, progress_pct=pct)
 
-            # Collect ALL AI messages for post-loop extraction
+            # Collect ALL AI messages and tool results for post-loop extraction
             for node_name, output in event.items():
                 if node_name == "agent":
                     messages = output.get("messages", [])
                     for msg in messages:
                         if isinstance(msg, AIMessage):
                             all_ai_messages.append(msg)
+                elif node_name == "tools":
+                    messages = output.get("messages", [])
+                    for msg in messages:
+                        if isinstance(msg, ToolMessage):
+                            all_tool_messages.append(msg)
 
             if iterations >= max_iter:
                 break
@@ -370,7 +376,6 @@ def run_sub_agent(
             content = msg.content
             # Handle content that can be a string or a list of blocks
             if isinstance(content, list):
-                # Extract text from content blocks (e.g. [{"type":"text","text":"..."}])
                 text_parts = []
                 for block in content:
                     if isinstance(block, dict) and block.get("type") == "text":
@@ -382,15 +387,60 @@ def run_sub_agent(
                 final_state = content.strip()
                 break
 
+        # -----------------------------------------------------------------
+        # Fallback: force a summary call when no text content was captured.
+        # This happens when the agent hit max_iterations while still calling
+        # tools (every AIMessage had only tool_calls with empty content).
+        # We call the LLM one more time WITHOUT tools so it MUST produce text.
+        # -----------------------------------------------------------------
+        if not final_state and all_tool_messages:
+            logger.info(
+                "Sub-agent %s produced no text after %d iterations — "
+                "forcing summary call with %d tool results",
+                agent_def.name, iterations, len(all_tool_messages),
+            )
+            tool_context_parts = []
+            for tmsg in all_tool_messages:
+                name = getattr(tmsg, "name", "tool")
+                tc = tmsg.content if isinstance(tmsg.content, str) else str(tmsg.content)
+                if len(tc) > 2500:
+                    tc = tc[:1800] + f"\n... [{len(tc) - 2300} chars omitted] ...\n" + tc[-500:]
+                tool_context_parts.append(f"### {name}\n{tc}")
+
+            summary_prompt = (
+                f"You are the {agent_def.role}.\n"
+                f"You were tasked with: {task}\n\n"
+                f"Below are ALL the results from the tools you used during analysis.\n"
+                f"Provide a thorough, structured summary of your findings.\n"
+                f"Include specific class names, file paths, code patterns, "
+                f"vulnerabilities, and actionable details.\n\n"
+                + "\n\n".join(tool_context_parts[-12:])
+            )
+            try:
+                raw_llm = get_llm(config, temperature=1.0)
+                summary_resp = raw_llm.invoke([HumanMessage(content=summary_prompt)])
+                if summary_resp.content and isinstance(summary_resp.content, str) and summary_resp.content.strip():
+                    final_state = summary_resp.content.strip()
+                elif isinstance(summary_resp.content, list):
+                    parts = []
+                    for block in summary_resp.content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            parts.append(block.get("text", ""))
+                        elif isinstance(block, str):
+                            parts.append(block)
+                    joined = "\n".join(parts).strip()
+                    if joined:
+                        final_state = joined
+            except Exception as e:
+                logger.warning("Summary call failed for %s: %s", agent_def.name, e)
+
         if progress:
             progress.complete_task(task_id, success=True)
 
-        # If no text content was found, try to build a summary from tool results
+        # Last-resort fallback: list tool usage
         if not final_state:
-            # Gather non-empty ToolMessage contents as a fallback summary
             tool_summaries = []
             for msg in all_ai_messages:
-                # AI messages with tool_calls still may have partial content
                 if msg.tool_calls:
                     for tc in msg.tool_calls:
                         tool_summaries.append(f"- Used tool: {tc.get('name', '?')}")
