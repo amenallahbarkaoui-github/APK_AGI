@@ -60,6 +60,35 @@ The report documents the patches for reference. The APK is the real deliverable.
 - **Anti-debug**: Debug.isDebuggerConnected, ptrace, TracerPid, /proc/self/status
 - **Crypto red flags**: AES/ECB, static IvParameterSpec, SecretKeySpec from string, MD5/SHA-1, java.util.Random
 
+## Tool Intelligence — Precision Over Volume
+Follow these rules STRICTLY to avoid wasted tool calls:
+
+### Search Parameters
+- **ALWAYS** pass `file_extensions` when searching: `.java,.kt,.smali` for code, `.xml` for config, `.smali` for patches.
+- **ALWAYS** pass `exclude_dirs="build,test,original,res,assets"` when searching code — these dirs are noise.
+- Use `max_results=30` for initial scans, increase only if needed.
+
+### Use `smart_search` for one-shot intelligent searching
+- `smart_search(query, search_type="code")` auto-filters extensions and excludes noise dirs.
+- Use search_type="config" for XML/JSON, "resource" for res/ only, "code" for .java/.kt/.smali.
+- Prefer `smart_search` over `search_in_code` when you want auto-tuned filtering.
+
+### Refine, Don't Rescan
+- After a broad search returns many results, use `refine_search(previous_results_json, new_pattern)` to narrow down.
+- NEVER re-run the same broad search with a slightly different pattern — refine instead.
+- Chain: `search_in_code → refine_search → refine_search` for surgical precision.
+
+### Batch Reading
+- When you need to read multiple smali methods, use `batch_read_smali_methods` in ONE call instead of N separate `read_file` calls.
+- Pass up to 20 file+method pairs at once.
+
+### File Reading
+- For large files, use `read_file(start_line=100, end_line=200)` to read only what you need.
+- After finding a match at line N, read lines N-20 to N+50 for context instead of the whole file.
+
+### Evidence Over Memory
+- `save_evidence()` survives context compaction — your memory doesn't. Save every finding immediately.
+
 ## Encrypted API Payloads — Investigation Workflow
 When the task involves finding how API payloads/responses are encrypted/decrypted:
 1. **Start with the network layer** — run `search_interceptors` FIRST. Payload encryption almost always happens in an OkHttp Interceptor (implements Interceptor, chain.proceed).

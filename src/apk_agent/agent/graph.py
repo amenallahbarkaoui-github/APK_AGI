@@ -107,6 +107,14 @@ def agent_node(state: AgentState) -> dict:
                 len(messages),
                 count_message_tokens(messages),
             )
+            # Inject auto-continue instruction so the agent doesn't stop
+            messages.append(HumanMessage(
+                content=(
+                    "[SYSTEM] Context was auto-compacted. Read the summary above carefully, "
+                    "then CONTINUE working on the original task without asking. "
+                    "Do NOT repeat already-completed tool calls. Execute the NEXT step immediately."
+                )
+            ))
 
     # Sanitize: prevent content block arrays > 5 elements (API proxy limit)
     messages = _sanitize_messages(messages)

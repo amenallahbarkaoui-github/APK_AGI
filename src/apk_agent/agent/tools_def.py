@@ -32,6 +32,7 @@ _CACHEABLE_TOOLS = frozenset({
     "aapt2_dump", "parse_manifest", "directory_overview",
     "find_string_decryption_patterns",
     "search_interceptors", "search_native_code", "search_dynamic_loaders",
+    "refine_search", "smart_search",
 })
 
 
@@ -324,7 +325,7 @@ def parse_manifest() -> str:
 
 
 @tool
-def read_file(file_path: str) -> str:
+def read_file(file_path: str, start_line: int = 0, end_line: int = 0) -> str:
     """Read the contents of a file from the decompiled project.
     Use this to examine Java source, smali code, AndroidManifest.xml, etc.
 
@@ -332,6 +333,9 @@ def read_file(file_path: str) -> str:
         file_path: Absolute path or path relative to the project workspace.
                    Partial paths like 'com/example/Foo.java' are also resolved
                    by searching under decompiled/jadx_src and decompiled/apktool.
+        start_line: 1-based start line for reading a specific range. 0 = from beginning.
+                    Use this to read large files in chunks instead of loading everything.
+        end_line: 1-based end line for reading a specific range. 0 = to default max.
     """
     from apk_agent.tools.file_ops import read_file as _read
 
@@ -353,7 +357,7 @@ def read_file(file_path: str) -> str:
                 p = c
                 break
 
-    result = _read(p)
+    result = _read(p, start_line=start_line, end_line=end_line)
     return json.dumps(result, ensure_ascii=False, indent=2)[:12000]
 
 
@@ -386,6 +390,8 @@ def search_in_code(
     pattern: str,
     directory: Optional[str] = None,
     file_extensions: Optional[str] = None,
+    exclude_dirs: Optional[str] = None,
+    max_results: int = 50,
 ) -> str:
     """Search for a text pattern (regex supported) across decompiled source files.
     Searches ONLY code files (.java, .kt, .smali) by default — no XML/JSON noise.
@@ -395,6 +401,9 @@ def search_in_code(
             For crypto, search imports: "import javax\\.crypto\\.Cipher" rather than broad "Crypto|AES".
         directory: Directory to search in. Defaults to JADX sources dir. Can be "smali" for smali code.
         file_extensions: Comma-separated extensions (e.g., ".java,.xml"). Defaults to .java,.kt,.smali.
+        exclude_dirs: Comma-separated directory names to SKIP (e.g., "build,test,res,original").
+            Use this to avoid noise from generated/resource directories.
+        max_results: Maximum number of matches to return (default 50). Lower = faster + less noise.
     """
     from apk_agent.tools.file_ops import search_in_files
 
@@ -404,26 +413,42 @@ def search_in_code(
     if file_extensions:
         exts = [e.strip() for e in file_extensions.split(",")]
 
+    excl = None
+    if exclude_dirs:
+        excl = [d.strip() for d in exclude_dirs.split(",")]
+
     def _run():
-        result = search_in_files(search_dir, pattern, file_extensions=exts)
+        result = search_in_files(search_dir, pattern, file_extensions=exts,
+                                  exclude_dirs=excl, max_results=max_results)
         return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
     return _safe_call(_run, "search_in_code")
 
 
 @tool
-def list_files(directory: Optional[str] = None, max_depth: int = 2) -> str:
+def list_files(
+    directory: Optional[str] = None,
+    max_depth: int = 2,
+    file_extensions: Optional[str] = None,
+) -> str:
     """List files and directories in the decompiled project.
     Use this to understand the project structure.
 
     Args:
         directory: Directory to list. Defaults to the JADX sources directory.
         max_depth: How deep to recurse (default 2).
+        file_extensions: Comma-separated extensions to filter (e.g., ".smali,.java").
+            If omitted, all files are shown.
     """
     from apk_agent.tools.file_ops import list_directory
 
     d = _resolve_dir(directory, default="jadx")
 
     result = list_directory(d, max_depth=max_depth)
+    # Post-filter by extension if requested
+    if file_extensions and isinstance(result, dict) and "files" in result:
+        exts = {e.strip().lower() for e in file_extensions.split(",")}
+        result["files"] = [f for f in result["files"]
+                           if any(f.lower().endswith(ext) for ext in exts)]
     return json.dumps(result, ensure_ascii=False, indent=2)[:10000]
 
 
@@ -691,6 +716,7 @@ def context_search(
     directory: Optional[str] = None,
     context_lines: int = 3,
     file_extensions: Optional[str] = None,
+    exclude_dirs: Optional[str] = None,
 ) -> str:
     """Search with surrounding context lines (like grep -C N).
     Shows N lines before and after each match for better understanding.
@@ -701,6 +727,7 @@ def context_search(
             Use "smali" or "apktool" for smali code.
         context_lines: Lines of context before/after match (default 3).
         file_extensions: Comma-separated extensions (e.g., ".java,.smali").
+        exclude_dirs: Comma-separated directory names to SKIP (e.g., "build,test,res,original").
     """
     from apk_agent.tools.advanced_search import search_with_context
 
@@ -710,9 +737,13 @@ def context_search(
     if file_extensions:
         exts = [e.strip() for e in file_extensions.split(",")]
 
+    excl = None
+    if exclude_dirs:
+        excl = [d_.strip() for d_ in exclude_dirs.split(",")]
+
     def _run():
         result = search_with_context(d, pattern, context_lines=context_lines,
-                                      file_extensions=exts)
+                                      file_extensions=exts, exclude_dirs=excl)
         return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
     return _safe_call(_run, "context_search")
 
@@ -722,6 +753,7 @@ def multi_search(
     patterns: str,
     logic: str = "AND",
     directory: Optional[str] = None,
+    exclude_dirs: Optional[str] = None,
 ) -> str:
     """Search for multiple patterns with AND/OR logic.
     AND = file must contain ALL patterns. OR = file must contain at least one.
@@ -731,6 +763,7 @@ def multi_search(
             Example: "CertificatePinner,checkServerTrusted,X509"
         logic: "AND" or "OR" (default AND).
         directory: Directory to search. Defaults to JADX sources.
+        exclude_dirs: Comma-separated directory names to SKIP (e.g., "build,test,res").
     """
     from apk_agent.tools.advanced_search import multi_pattern_search
 
@@ -738,8 +771,12 @@ def multi_search(
 
     pattern_list = [p.strip() for p in patterns.split(",")]
 
+    excl = None
+    if exclude_dirs:
+        excl = [d_.strip() for d_ in exclude_dirs.split(",")]
+
     def _run():
-        result = multi_pattern_search(d, pattern_list, logic=logic)
+        result = multi_pattern_search(d, pattern_list, logic=logic, exclude_dirs=excl)
         return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
     return _safe_call(_run, "multi_search")
 
@@ -1115,6 +1152,99 @@ def reconstruct_strings(smali_file: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Refined / intelligent search tools
+# ---------------------------------------------------------------------------
+
+
+@tool
+def refine_search(
+    previous_results_json: str,
+    refine_pattern: str,
+    context_lines: int = 2,
+) -> str:
+    """Search WITHIN previous search results — narrows down without rescanning.
+    Feed the output of search_in_code / context_search / multi_search here
+    to drill deeper without re-reading the entire codebase.
+
+    Args:
+        previous_results_json: JSON string from a prior search result.
+            Must contain a 'matches' array with objects that have 'file' keys.
+        refine_pattern: New regex pattern to search for ONLY in those files.
+        context_lines: Lines of context around each new match (default 2).
+    """
+    from apk_agent.tools.advanced_search import filter_results
+
+    def _run():
+        try:
+            prev = json.loads(previous_results_json)
+        except json.JSONDecodeError:
+            return json.dumps({"success": False, "error": "Invalid JSON in previous_results_json"})
+        result = filter_results(prev, refine_pattern, context_lines=context_lines)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
+    return _safe_call(_run, "refine_search")
+
+
+@tool
+def batch_read_smali_methods(
+    file_method_pairs_json: str,
+) -> str:
+    """Read multiple smali method bodies in ONE call instead of calling read_file many times.
+    Extracts the full body of each requested method from each file.
+
+    Args:
+        file_method_pairs_json: JSON array of objects:
+            [{"file": "smali/com/example/Foo.smali", "method": "checkCert"},
+             {"file": "smali/com/example/Bar.smali", "method": "isRooted"}]
+            Paths should be relative to the apktool dir.
+    """
+    from apk_agent.tools.advanced_search import batch_read_methods
+
+    def _run():
+        try:
+            pairs = json.loads(file_method_pairs_json)
+        except json.JSONDecodeError:
+            return json.dumps({"success": False, "error": "Invalid JSON in file_method_pairs_json"})
+        result = batch_read_methods(pairs, base_dir=str(_project.apktool_dir))
+        return json.dumps(result, ensure_ascii=False, indent=2)[:20000]
+    return _safe_call(_run, "batch_read_smali_methods")
+
+
+@tool
+def smart_search(
+    query: str,
+    search_type: str = "code",
+    directory: Optional[str] = None,
+    max_results: int = 30,
+) -> str:
+    """Intelligent search that auto-selects file extensions and excludes irrelevant dirs.
+    Use this when you want a one-shot precise search without manually tweaking parameters.
+
+    Args:
+        query: Regex pattern to search for.
+        search_type: One of:
+            - "code": .java .kt .smali (excludes res, build, original, assets)
+            - "config": .xml .json .properties .yml (excludes res/drawable, res/mipmap)
+            - "resource": .xml in res/ only
+            - "all": everything, no filtering
+        directory: Base directory. Defaults to JADX for "code", apktool for others.
+        max_results: Maximum matches (default 30).
+    """
+    from apk_agent.tools.advanced_search import smart_search as _smart
+
+    if directory:
+        d = _resolve_dir(directory, default="jadx")
+    else:
+        d = str(_project.jadx_dir) if search_type == "code" else str(_project.apktool_dir)
+
+    base_dirs = [d]
+
+    def _run():
+        result = _smart(query, base_dirs, search_type=search_type, max_results=max_results)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
+    return _safe_call(_run, "smart_search")
+
+
+# ---------------------------------------------------------------------------
 # Tool list for graph construction
 # ---------------------------------------------------------------------------
 
@@ -1151,6 +1281,10 @@ ALL_TOOLS = [
     multi_search,
     xref_search,
     directory_overview,
+    # Intelligent / refined search
+    refine_search,
+    batch_read_smali_methods,
+    smart_search,
     # Targeted analysis (encrypted payloads, native code, dynamic loading)
     search_interceptors,
     search_native_code,

@@ -12,24 +12,48 @@ from pathlib import Path
 _SEARCH_POOL = ThreadPoolExecutor(max_workers=8)
 
 
-def read_file(path: str | Path, max_lines: int = 500) -> dict:
-    """Read a text file and return its content (truncated for LLM)."""
+def read_file(path: str | Path, max_lines: int = 500, start_line: int = 0, end_line: int = 0) -> dict:
+    """Read a text file and return its content (truncated for LLM).
+    
+    Args:
+        path: File path.
+        max_lines: Max total lines to return (default 500). Ignored if start_line/end_line set.
+        start_line: 1-based start line for reading a specific range. 0 = from beginning.
+        end_line: 1-based end line for reading a specific range. 0 = to max_lines.
+    """
     path = Path(path)
     if not path.is_file():
         return {"success": False, "error": f"File not found: {path}"}
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
         lines = text.splitlines()
-        truncated = len(lines) > max_lines
+        total = len(lines)
+
+        # Range mode: specific line range
+        if start_line > 0:
+            s = max(0, start_line - 1)
+            e = end_line if end_line > 0 else s + max_lines
+            content = "\n".join(lines[s:e])
+            truncated = e < total
+            return {
+                "success": True,
+                "path": str(path),
+                "total_lines": total,
+                "showing": f"{s+1}-{min(e, total)}",
+                "truncated": truncated,
+                "content": content,
+            }
+
+        truncated = total > max_lines
         if truncated:
             content = "\n".join(lines[:max_lines])
-            content += f"\n\n... [{len(lines) - max_lines} more lines truncated] ..."
+            content += f"\n\n... [{total - max_lines} more lines truncated] ..."
         else:
             content = text
         return {
             "success": True,
             "path": str(path),
-            "total_lines": len(lines),
+            "total_lines": total,
             "truncated": truncated,
             "content": content,
         }
@@ -43,14 +67,29 @@ def search_in_files(
     file_extensions: list[str] | None = None,
     max_results: int = 50,
     case_insensitive: bool = True,
+    exclude_dirs: list[str] | None = None,
+    max_file_size_kb: int = 500,
 ) -> dict:
-    """Grep-like search across files in a directory using parallel I/O."""
+    """Grep-like search across files in a directory using parallel I/O.
+
+    Args:
+        directory: Root directory to search.
+        pattern: Regex pattern.
+        file_extensions: Extensions to include (default: code files only).
+        max_results: Cap on total matches.
+        case_insensitive: Case-insensitive matching (default True).
+        exclude_dirs: Directory names to skip (e.g. ["build", "test", "res"]).
+        max_file_size_kb: Skip files larger than this (default 500 KB). Avoids huge generated files.
+    """
     directory = Path(directory)
     if not directory.is_dir():
         return {"success": False, "error": f"Directory not found: {directory}"}
 
     if file_extensions is None:
-        file_extensions = [".java", ".kt", ".smali"]
+        file_extensions = [".java", ".smali", ".xml", ".json", ".properties"]
+
+    _exclude = set(exclude_dirs) if exclude_dirs else set()
+    _max_bytes = max_file_size_kb * 1024
 
     flags = re.IGNORECASE if case_insensitive else 0
     try:
@@ -60,10 +99,18 @@ def search_in_files(
 
     # Collect files to search
     file_list: list[Path] = []
-    for root, _dirs, files in os.walk(directory):
+    for root, dirs, files in os.walk(directory):
+        # Prune excluded directories (mutate dirs in-place for os.walk)
+        if _exclude:
+            dirs[:] = [d for d in dirs if d not in _exclude]
         for fname in files:
             if any(fname.endswith(ext) for ext in file_extensions):
-                file_list.append(Path(root) / fname)
+                fpath = Path(root) / fname
+                try:
+                    if fpath.stat().st_size <= _max_bytes:
+                        file_list.append(fpath)
+                except OSError:
+                    pass
 
     total_files = len(file_list)
     if total_files == 0:

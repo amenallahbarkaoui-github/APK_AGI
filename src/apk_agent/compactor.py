@@ -84,22 +84,62 @@ def count_message_tokens(messages: list[BaseMessage]) -> int:
 
 COMPACT_SYSTEM_PROMPT = """You are a conversation compactor for an APK reverse-engineering AI agent.
 
-Your job: Take a long conversation history and produce a **dense, structured summary** that preserves ALL important context.
+Your job: Take a long conversation history and produce a **dense, structured summary** that preserves ALL important context so the agent can seamlessly continue its work.
 
-The summary MUST include:
-1. **Project Info**: APK name, package name, target SDK, key metadata
-2. **Task**: The user's original request / goal
-3. **Analysis Done**: What tools were run, what was analyzed
-4. **Key Findings**: ALL security vulnerabilities found (severity, file, description)
-5. **Patches Applied**: Any smali patches that were created or applied
-6. **Current State**: What the agent was in the middle of doing
-7. **Pending Work**: What still needs to be done
-8. **Important File Paths**: Key files referenced in the analysis
-9. **Tool Results Summary**: Brief summary of each significant tool result
+The summary MUST include these sections — DO NOT SKIP ANY:
 
-Format the summary as structured Markdown with clear sections.
-Be thorough — the agent will use this summary to continue working without the original messages.
-Do NOT lose any vulnerability findings, file paths, or analysis results."""
+## 1. Project Info
+APK name, package name, target SDK, any metadata discovered.
+
+## 2. Original Task
+The user's EXACT original request — quote it verbatim.
+
+## 3. Current Progress
+- What phase the agent is in (Recon / Deep Analysis / Patching / Build / Report)
+- What has been completed vs still pending
+- Percentage estimate of task completion
+
+## 4. Analysis Results (PRESERVE ALL)
+For EVERY tool that was run, record:
+- Tool name + what it found (key data only, not raw output)
+- Specific file paths where findings were located
+- Line numbers of critical code sections
+
+## 5. Vulnerability Findings (FULL LIST)
+For EACH vulnerability found:
+- ID, Name, Severity, Category
+- Exact file path and line number
+- Brief description of the issue
+- CWE if available
+
+## 6. Protection Mechanisms Found
+List ALL detected protections with:
+- Type (SSL pinning, root detection, anti-tamper, etc.)
+- Class/method implementing it
+- Recommended bypass approach
+
+## 7. Patches Applied
+For each patch:
+- Target file and method
+- What was changed (before → after)
+- Success/failure status
+
+## 8. Patches Still Needed
+List remaining protections that need bypassing.
+
+## 9. Key File Paths
+Every important file path referenced — smali files, Java sources, configs.
+The agent needs these to continue without re-searching.
+
+## 10. Critical Code Snippets
+Include actual code for any method body that is a bypass target.
+The agent needs these to write patches without re-reading files.
+
+## 11. Next Steps
+Explicit list of what the agent should do next to complete the task.
+
+Be EXTREMELY thorough. The agent will use this summary as its ONLY memory of past work.
+Loss of any finding, path, or code snippet means wasted tool calls to re-discover it."""
 
 
 def build_compact_prompt(messages: list[BaseMessage]) -> str:
@@ -124,8 +164,8 @@ Produce a structured summary following the format described in your instructions
 
 # Configurable thresholds
 DEFAULT_TOKEN_THRESHOLD = 90_000  # Start compacting when conversation exceeds this many tokens
-KEEP_RECENT_MESSAGES = 20  # Keep the last N messages for immediate context
-MIN_MESSAGES_TO_COMPACT = 30  # Don't compact if fewer messages than this
+KEEP_RECENT_MESSAGES = 30  # Keep the last N messages for immediate context
+MIN_MESSAGES_TO_COMPACT = 40  # Don't compact if fewer messages than this
 
 
 class Compactor:
@@ -209,9 +249,12 @@ class Compactor:
                     f"📋 **[Auto-Compact Summary #{self.compact_count}]**\n\n"
                     f"The conversation history has been automatically summarized to save context. "
                     f"Previous messages ({len(old_messages)} messages, ~{count_message_tokens(old_messages)} tokens) "
-                    f"were condensed into this summary. Use it to continue your analysis.\n\n"
+                    f"were condensed into this summary.\n\n"
                     f"---\n\n{summary_text}\n\n---\n\n"
-                    f"Continue from where the analysis left off. The recent messages below show your last actions."
+                    f"⚡ **AUTO-CONTINUE**: The task is NOT finished. Pick up EXACTLY where the summary "
+                    f"says you left off. Check the 'Next Steps' section above and execute immediately. "
+                    f"Do NOT re-run tools whose results are already in the summary. "
+                    f"Do NOT ask the user what to do next — the original task is stated above."
                 )
             )
 

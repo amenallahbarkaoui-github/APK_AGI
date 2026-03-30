@@ -28,16 +28,25 @@ def search_with_context(
     file_extensions: list[str] | None = None,
     max_results: int = 30,
     case_insensitive: bool = True,
+    exclude_dirs: list[str] | None = None,
+    max_file_size_kb: int = 500,
 ) -> dict:
     """Search for a pattern and return matching lines with surrounding context.
     Uses parallel I/O for speed.
+
+    Args:
+        exclude_dirs: Directory names to skip (e.g. ["build", "test"]).
+        max_file_size_kb: Skip files larger than this (default 500 KB).
     """
     directory = Path(directory)
     if not directory.is_dir():
         return {"success": False, "error": f"Directory not found: {directory}"}
 
     if file_extensions is None:
-        file_extensions = [".java", ".kt", ".smali"]
+        file_extensions = [".java", ".smali", ".xml", ".kt", ".json", ".properties"]
+
+    _exclude = set(exclude_dirs) if exclude_dirs else set()
+    _max_bytes = max_file_size_kb * 1024
 
     flags = re.IGNORECASE if case_insensitive else 0
     try:
@@ -47,10 +56,17 @@ def search_with_context(
 
     # Collect files
     file_list: list[Path] = []
-    for root, _, files in os.walk(directory):
+    for root, dirs, files in os.walk(directory):
+        if _exclude:
+            dirs[:] = [d for d in dirs if d not in _exclude]
         for fname in files:
             if any(fname.endswith(ext) for ext in file_extensions):
-                file_list.append(Path(root) / fname)
+                fpath = Path(root) / fname
+                try:
+                    if fpath.stat().st_size <= _max_bytes:
+                        file_list.append(fpath)
+                except OSError:
+                    pass
 
     total_files = len(file_list)
     if total_files == 0:
@@ -113,6 +129,8 @@ def multi_pattern_search(
     logic: str = "OR",
     file_extensions: list[str] | None = None,
     max_results: int = 50,
+    exclude_dirs: list[str] | None = None,
+    max_file_size_kb: int = 500,
 ) -> dict:
     """Search for multiple patterns with AND/OR logic using parallel I/O."""
     directory = Path(directory)
@@ -120,7 +138,10 @@ def multi_pattern_search(
         return {"success": False, "error": f"Directory not found: {directory}"}
 
     if file_extensions is None:
-        file_extensions = [".java", ".kt", ".smali"]
+        file_extensions = [".java", ".smali", ".xml", ".kt"]
+
+    _exclude = set(exclude_dirs) if exclude_dirs else set()
+    _max_bytes = max_file_size_kb * 1024
 
     compiled = []
     for p in patterns:
@@ -133,10 +154,17 @@ def multi_pattern_search(
 
     # Collect files
     file_list: list[Path] = []
-    for root, _, files in os.walk(directory):
+    for root, dirs, files in os.walk(directory):
+        if _exclude:
+            dirs[:] = [d for d in dirs if d not in _exclude]
         for fname in files:
             if any(fname.endswith(ext) for ext in file_extensions):
-                file_list.append(Path(root) / fname)
+                fpath = Path(root) / fname
+                try:
+                    if fpath.stat().st_size <= _max_bytes:
+                        file_list.append(fpath)
+                except OSError:
+                    pass
 
     total_files = len(file_list)
 
@@ -345,4 +373,265 @@ def directory_stats(directory: str | Path) -> dict:
         "total_size_mb": round(total_size / (1024 * 1024), 2),
         "file_types": dict(sorted(ext_counts.items(), key=lambda x: -x[1])[:20]),
         "top_directories": sorted(top_dirs, key=lambda x: -x["file_count"])[:20],
+    }
+
+
+# ---------------------------------------------------------------------------
+# filter_results — "search in search results" to narrow down previous hits
+# ---------------------------------------------------------------------------
+
+def filter_results(
+    previous_results: list[dict],
+    refine_pattern: str,
+    case_insensitive: bool = True,
+    context_lines: int = 2,
+) -> dict:
+    """Narrow down a previous search result by applying a second regex filter.
+
+    Instead of re-scanning the entire codebase, this reads ONLY the files
+    that appeared in previous_results and applies a tighter regex.
+    Like "search in search results" — dramatically faster for refining.
+
+    Args:
+        previous_results: List of dicts with at least a "file" key (absolute or relative paths).
+        refine_pattern: New regex to apply within those files only.
+        case_insensitive: Case-insensitive matching (default True).
+        context_lines: Lines of context around each match.
+
+    Returns:
+        Dict with filtered matches.
+    """
+    flags = re.IGNORECASE if case_insensitive else 0
+    try:
+        regex = re.compile(refine_pattern, flags)
+    except re.error as e:
+        return {"success": False, "error": f"Invalid regex: {e}"}
+
+    # Deduplicate files from previous results
+    seen: set[str] = set()
+    file_paths: list[str] = []
+    for r in previous_results:
+        fp = r.get("file", "")
+        if fp and fp not in seen:
+            seen.add(fp)
+            file_paths.append(fp)
+
+    ctx = context_lines
+    results: list[dict] = []
+
+    for fp in file_paths:
+        path = Path(fp)
+        if not path.is_file():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            continue
+
+        for i, line in enumerate(lines):
+            if regex.search(line):
+                start = max(0, i - ctx)
+                end = min(len(lines), i + ctx + 1)
+                context = []
+                for j in range(start, end):
+                    prefix = ">>>" if j == i else "   "
+                    context.append(f"{prefix} {j+1:5d} | {lines[j]}")
+                results.append({
+                    "file": fp,
+                    "line": i + 1,
+                    "match": line.strip()[:300],
+                    "context": "\n".join(context),
+                })
+
+    return {
+        "success": True,
+        "original_files": len(file_paths),
+        "refined_pattern": refine_pattern,
+        "total_matches": len(results),
+        "results": results[:100],
+    }
+
+
+# ---------------------------------------------------------------------------
+# batch_read_methods — read multiple method signatures from multiple files
+# ---------------------------------------------------------------------------
+
+def batch_read_methods(
+    file_method_pairs: list[dict],
+    base_dir: str | Path = "",
+) -> dict:
+    """Read specific methods from multiple smali files in one call.
+
+    Instead of calling read_file + analyze_method_deep repeatedly, this
+    extracts just the method bodies the agent needs.
+
+    Args:
+        file_method_pairs: List of {"file": "path/to/File.smali", "method": "methodName"}
+        base_dir: Base directory prepended to relative file paths.
+
+    Returns:
+        Dict with method bodies keyed by file:method.
+    """
+    base = Path(base_dir) if base_dir else None
+    methods_found: list[dict] = []
+
+    for pair in file_method_pairs[:20]:  # Cap at 20 to avoid context explosion
+        fpath = pair.get("file", "")
+        method_name = pair.get("method", "")
+        if not fpath or not method_name:
+            continue
+
+        p = Path(fpath)
+        if not p.is_absolute() and base:
+            p = base / fpath
+
+        if not p.is_file():
+            methods_found.append({
+                "file": fpath, "method": method_name,
+                "success": False, "error": "File not found",
+            })
+            continue
+
+        try:
+            lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception as e:
+            methods_found.append({
+                "file": fpath, "method": method_name,
+                "success": False, "error": str(e),
+            })
+            continue
+
+        # Extract method body from smali
+        in_method = False
+        method_lines: list[str] = []
+        method_start = 0
+        for i, line in enumerate(lines):
+            if not in_method:
+                if f" {method_name}(" in line and line.strip().startswith(".method"):
+                    in_method = True
+                    method_start = i + 1
+                    method_lines.append(line)
+            else:
+                method_lines.append(line)
+                if line.strip() == ".end method":
+                    break
+
+        if method_lines:
+            methods_found.append({
+                "file": fpath, "method": method_name,
+                "success": True,
+                "start_line": method_start,
+                "line_count": len(method_lines),
+                "body": "\n".join(method_lines[:200]),
+            })
+        else:
+            methods_found.append({
+                "file": fpath, "method": method_name,
+                "success": False, "error": f"Method '{method_name}' not found in file",
+            })
+
+    return {
+        "success": True,
+        "requested": len(file_method_pairs),
+        "found": sum(1 for m in methods_found if m.get("success")),
+        "methods": methods_found,
+    }
+
+
+# ---------------------------------------------------------------------------
+# smart_search — one-shot intelligent search with auto-extension + auto-directory
+# ---------------------------------------------------------------------------
+
+def smart_search(
+    query: str,
+    base_dirs: list[Path] | None = None,
+    search_type: str = "code",
+    max_results: int = 30,
+) -> dict:
+    """Intelligent search that picks the right files and directories based on the query type.
+
+    Args:
+        query: The regex pattern to search for.
+        base_dirs: List of directories to search (jadx_dir, apktool_dir, etc.).
+        search_type: "code" | "config" | "resource" | "all"
+            - code: .java, .kt, .smali only
+            - config: .xml, .json, .properties, .yml
+            - resource: .xml in res/ only
+            - all: all file types
+        max_results: Max results.
+
+    Returns:
+        Dict with matches grouped by file.
+    """
+    _type_extensions = {
+        "code": [".java", ".kt", ".smali"],
+        "config": [".xml", ".json", ".properties", ".yml"],
+        "resource": [".xml"],
+        "all": [".java", ".kt", ".smali", ".xml", ".json", ".properties", ".yml"],
+    }
+    exts = _type_extensions.get(search_type, _type_extensions["code"])
+
+    # Directories to skip for each type
+    _type_excludes = {
+        "code": {"res", "build", "original", "META-INF"},
+        "config": set(),
+        "resource": {"smali", "smali_classes2", "smali_classes3", "smali_classes4"},
+        "all": set(),
+    }
+    excludes = _type_excludes.get(search_type, set())
+
+    try:
+        regex = re.compile(query, re.IGNORECASE)
+    except re.error as e:
+        return {"success": False, "error": f"Invalid regex: {e}"}
+
+    all_results: list[dict] = []
+    files_searched = 0
+
+    for base in (base_dirs or []):
+        if not Path(base).is_dir():
+            continue
+        for root, dirs, files in os.walk(base):
+            if excludes:
+                dirs[:] = [d for d in dirs if d not in excludes]
+            for fname in files:
+                if not any(fname.endswith(ext) for ext in exts):
+                    continue
+                fpath = Path(root) / fname
+                try:
+                    if fpath.stat().st_size > 500 * 1024:
+                        continue
+                    text = fpath.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    continue
+                files_searched += 1
+                for i, line in enumerate(text.splitlines(), 1):
+                    if regex.search(line):
+                        all_results.append({
+                            "file": str(fpath),
+                            "line": i,
+                            "content": line.strip()[:300],
+                        })
+                        if len(all_results) >= max_results:
+                            break
+                if len(all_results) >= max_results:
+                    break
+            if len(all_results) >= max_results:
+                break
+        if len(all_results) >= max_results:
+            break
+
+    # Group by file
+    grouped: dict[str, list] = {}
+    for r in all_results:
+        grouped.setdefault(r["file"], []).append({"line": r["line"], "content": r["content"]})
+
+    return {
+        "success": True,
+        "search_type": search_type,
+        "query": query,
+        "files_searched": files_searched,
+        "files_matched": len(grouped),
+        "total_matches": len(all_results),
+        "results_by_file": {k: v[:10] for k, v in list(grouped.items())[:30]},
     }
