@@ -395,10 +395,16 @@ def _chat_loop(
 ) -> None:
     """Main interactive chat loop with normal and orchestrator modes."""
     orchestrator_mode = session_meta.orchestrator_mode
+    auto_mode = session_meta.auto_mode
 
     while True:
         try:
-            mode_tag = " [bold magenta](orchestrator)[/]" if orchestrator_mode else ""
+            if auto_mode:
+                mode_tag = " [bold yellow](auto)[/]"
+            elif orchestrator_mode:
+                mode_tag = " [bold magenta](orchestrator)[/]"
+            else:
+                mode_tag = ""
             user_input = console.input(f"\n[bold green]You{mode_tag} ➜ [/]").strip()
         except (EOFError, KeyboardInterrupt):
             console.print("\n[dim]Goodbye! 👋[/]")
@@ -430,6 +436,19 @@ def _chat_loop(
                 session_meta.orchestrator_mode = False
                 print_success("Switched to Normal chat mode")
                 continue
+            elif result == "auto_on":
+                auto_mode = True
+                session_meta.auto_mode = True
+                print_success(
+                    "Switched to Auto mode — patches auto-approved, "
+                    "agent questions auto-answered. Full one-shot execution."
+                )
+                continue
+            elif result == "auto_off":
+                auto_mode = False
+                session_meta.auto_mode = False
+                print_success("Auto mode disabled — back to interactive confirmations.")
+                continue
             if result is not None:
                 continue
 
@@ -444,7 +463,7 @@ def _chat_loop(
         if orchestrator_mode:
             _run_orchestrator_turn(user_input, project, config)
         else:
-            _run_agent_turn(graph, graph_config, user_input, project, session_meta)
+            _run_agent_turn(graph, graph_config, user_input, project, session_meta, auto_mode=auto_mode)
 
         # Save session after each turn
         save_session_meta(session_meta, project.workspace_path)
@@ -506,6 +525,10 @@ def _handle_command(
             return "orchestrator_on"
         case "/normal":
             return "orchestrator_off"
+        case "/auto":
+            if session_meta.auto_mode:
+                return "auto_off"
+            return "auto_on"
         case "/stop":
             print_info("Operation stopped.")
         case "/quit" | "/exit" | "/q":
@@ -538,7 +561,7 @@ def _handle_command(
 # Agent turn (normal mode)
 # ---------------------------------------------------------------------------
 
-def _run_agent_turn(graph, graph_config: dict, user_input: str, project: Project, session_meta: SessionMeta) -> None:
+def _run_agent_turn(graph, graph_config: dict, user_input: str, project: Project, session_meta: SessionMeta, *, auto_mode: bool = False) -> None:
     """Run one turn of the agent with streaming output and error recovery."""
     from apk_agent.progress import progress_manager
     progress_manager.set_overall_task(user_input)
@@ -567,7 +590,7 @@ def _run_agent_turn(graph, graph_config: dict, user_input: str, project: Project
         # Stream events from the graph
         for event in graph.stream(input_state, config=graph_config, stream_mode="updates"):
             try:
-                _process_stream_event(event, graph, graph_config)
+                _process_stream_event(event, graph, graph_config, auto_mode=auto_mode)
                 error_count = 0  # Reset on success
             except Exception as e:
                 error_count += 1
@@ -746,7 +769,7 @@ def _run_orchestrator_turn(user_input: str, project, config) -> None:
             traceback.print_exc()
 
 
-def _process_stream_event(event: dict, graph, graph_config: dict) -> None:
+def _process_stream_event(event: dict, graph, graph_config: dict, *, auto_mode: bool = False) -> None:
     """Process a single stream event from the LangGraph agent."""
     from apk_agent.ui import print_tool_start
 
@@ -800,15 +823,29 @@ def _process_stream_event(event: dict, graph, graph_config: dict) -> None:
             if isinstance(interrupts, (list, tuple)):
                 for intr in interrupts:
                     value = intr.value if hasattr(intr, 'value') else str(intr)
-                    print_hitl_prompt(str(value))
-                    human_response = console.input("[bold magenta]Your response: [/]").strip()
+
+                    if auto_mode:
+                        # Auto mode: approve patches, auto-answer questions
+                        value_str = str(value)
+                        if "❓" in value_str:
+                            # ask_user question — tell agent to decide itself
+                            human_response = "Proceed with your best judgment."
+                            console.print("[dim]⚡ Auto-mode: agent question auto-answered[/]")
+                        else:
+                            # Patch approval — auto-approve
+                            human_response = "yes"
+                            console.print("[dim]⚡ Auto-mode: patch auto-approved[/]")
+                    else:
+                        print_hitl_prompt(str(value))
+                        human_response = console.input("[bold magenta]Your response: [/]").strip()
+
                     from langgraph.types import Command
                     for resume_event in graph.stream(
                         Command(resume=human_response),
                         config=graph_config,
                         stream_mode="updates",
                     ):
-                        _process_stream_event(resume_event, graph, graph_config)
+                        _process_stream_event(resume_event, graph, graph_config, auto_mode=auto_mode)
 
 
 # ---------------------------------------------------------------------------

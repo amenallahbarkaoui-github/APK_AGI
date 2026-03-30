@@ -33,6 +33,7 @@ class SessionMeta:
     compact_count: int = 0  # how many times auto-compact has run
     last_user_input: str = ""
     orchestrator_mode: bool = False
+    auto_mode: bool = False
     status: str = "active"  # active | paused | completed
 
     def touch(self) -> None:

@@ -327,6 +327,7 @@ def print_help() -> None:
   [cyan]/logs[/]               — Show recent tool logs
   [cyan]/report[/]             — Generate/show the report
   [cyan]/progress[/]           — Show task progress summary
+  [cyan]/auto[/]               — Full auto mode (no confirmations, one-shot deep run)
   [cyan]/orchestrator[/]       — Switch to orchestrator mode (parallel sub-agents)
   [cyan]/normal[/]             — Switch back to normal chat mode
   [cyan]/stop[/]               — Stop the current operation
