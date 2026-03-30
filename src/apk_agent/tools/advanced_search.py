@@ -587,9 +587,11 @@ def smart_search(
 
     all_results: list[dict] = []
     files_searched = 0
+    skipped_dirs: list[str] = []
 
     for base in (base_dirs or []):
         if not Path(base).is_dir():
+            skipped_dirs.append(str(base))
             continue
         for root, dirs, files in os.walk(base):
             if excludes:
@@ -626,7 +628,7 @@ def smart_search(
     for r in all_results:
         grouped.setdefault(r["file"], []).append({"line": r["line"], "content": r["content"]})
 
-    return {
+    result = {
         "success": True,
         "search_type": search_type,
         "query": query,
@@ -635,3 +637,8 @@ def smart_search(
         "total_matches": len(all_results),
         "results_by_file": {k: v[:10] for k, v in list(grouped.items())[:30]},
     }
+    if skipped_dirs:
+        result["warning"] = f"Directories not found (skipped): {skipped_dirs}"
+    if files_searched == 0 and not skipped_dirs:
+        result["hint"] = "No files matched the search_type extensions. Try search_type='all' or check the directory path."
+    return result

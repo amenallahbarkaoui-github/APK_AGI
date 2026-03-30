@@ -117,29 +117,72 @@ def _resolve_dir(directory: str | None, default: str = "jadx") -> Path:
         return _project.jadx_dir
 
     d = directory.strip().strip("/").strip("\\")
-    low = d.lower()
+    low = d.lower().replace("\\", "/")
 
     # Exact alias matching
     if low in ("jadx", "jadx_src"):
         return _project.jadx_dir
-    if low in ("smali", "apktool"):
+    if low == "apktool":
         return _project.apktool_dir
-    if low.startswith("apktool/smali") or low.startswith("apktool\\smali"):
+    if low == "smali":
         return _project.apktool_dir / "smali"
+
+    # Handle "apktool/..." paths — strip the "apktool/" prefix and resolve
+    # under the apktool_dir. Supports: "apktool/smali", "apktool/smali/com/foo",
+    # "apktool/smali_classes2", "apktool/res/values", etc.
+    if low.startswith("apktool/"):
+        sub = d.split("/", 1)[1] if "/" in d else d.split("\\", 1)[1]
+        candidate = _project.apktool_dir / sub
+        if candidate.is_dir():
+            return candidate
+        # Maybe they wrote "apktool/smali/com/foo" but it's actually in
+        # smali_classes2 or smali_classes3 — search all smali dirs
+        if low.startswith("apktool/smali/"):
+            inner = sub.split("/", 1)[1] if "/" in sub else ""
+            if inner:
+                for smali_d in _get_all_smali_dirs():
+                    test = smali_d / inner
+                    if test.is_dir():
+                        return test
+        return candidate  # return best guess even if not found
+
+    # Handle smali_classesN aliases: "smali_classes2", "smali_classes3", etc.
+    if low.startswith("smali_classes") or low.startswith("smali/"):
+        candidate = _project.apktool_dir / d
+        if candidate.is_dir():
+            return candidate
+        return candidate
 
     p = Path(directory)
     if p.is_absolute():
         return p
 
-    # Try under decompiled/ first, then workspace root
+    # Try under decompiled/ first, then workspace root, then apktool subdir
     decompiled = Path(_project.workspace_path) / "decompiled" / d
     if decompiled.is_dir():
         return decompiled
     ws_dir = Path(_project.workspace_path) / d
     if ws_dir.is_dir():
         return ws_dir
+    apk_sub = _project.apktool_dir / d
+    if apk_sub.is_dir():
+        return apk_sub
     # Default to decompiled/ (more likely correct)
     return decompiled
+
+
+def _get_all_smali_dirs() -> list[Path]:
+    """Discover all smali directories (smali/, smali_classes2/, smali_classes3/, ...).
+    Returns a list of existing directories sorted by name.
+    """
+    apk_dir = _project.apktool_dir
+    if not apk_dir.is_dir():
+        return []
+    dirs = []
+    for child in sorted(apk_dir.iterdir()):
+        if child.is_dir() and (child.name == "smali" or child.name.startswith("smali_classes")):
+            dirs.append(child)
+    return dirs
 
 
 # ---------------------------------------------------------------------------
@@ -407,8 +450,6 @@ def search_in_code(
     """
     from apk_agent.tools.file_ops import search_in_files
 
-    search_dir = _resolve_dir(directory, default="jadx")
-
     exts = None
     if file_extensions:
         exts = [e.strip() for e in file_extensions.split(",")]
@@ -417,10 +458,30 @@ def search_in_code(
     if exclude_dirs:
         excl = [d.strip() for d in exclude_dirs.split(",")]
 
+    # When directory is "smali" or None with smali extensions, search ALL smali dirs
+    low_dir = (directory or "").strip().lower().replace("\\", "/")
+    search_all_smali = low_dir in ("smali", "apktool/smali", "apktool")
+
     def _run():
-        result = search_in_files(search_dir, pattern, file_extensions=exts,
-                                  exclude_dirs=excl, max_results=max_results)
-        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
+        if search_all_smali:
+            # Search all smali dirs (smali/, smali_classes2/, smali_classes3/, ...)
+            all_matches = []
+            for smali_d in _get_all_smali_dirs():
+                result = search_in_files(smali_d, pattern, file_extensions=exts,
+                                          exclude_dirs=excl, max_results=max_results)
+                if isinstance(result, dict) and result.get("matches"):
+                    all_matches.extend(result["matches"])
+                elif isinstance(result, list):
+                    all_matches.extend(result)
+            return json.dumps({"matches": all_matches[:max_results],
+                              "total": len(all_matches),
+                              "smali_dirs_searched": len(_get_all_smali_dirs())},
+                             ensure_ascii=False, indent=2)[:15000]
+        else:
+            search_dir = _resolve_dir(directory, default="jadx")
+            result = search_in_files(search_dir, pattern, file_extensions=exts,
+                                      exclude_dirs=excl, max_results=max_results)
+            return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
     return _safe_call(_run, "search_in_code")
 
 
@@ -1226,17 +1287,24 @@ def smart_search(
             - "config": .xml .json .properties .yml (excludes res/drawable, res/mipmap)
             - "resource": .xml in res/ only
             - "all": everything, no filtering
-        directory: Base directory. Defaults to JADX for "code", apktool for others.
+        directory: Base directory. Defaults to JADX + all smali dirs for "code", apktool for others.
         max_results: Maximum matches (default 30).
     """
     from apk_agent.tools.advanced_search import smart_search as _smart
 
     if directory:
-        d = _resolve_dir(directory, default="jadx")
+        base_dirs = [str(_resolve_dir(directory, default="jadx"))]
+    elif search_type == "code":
+        # Search BOTH jadx Java sources AND all smali directories
+        base_dirs = [str(_project.jadx_dir)]
+        for sd in _get_all_smali_dirs():
+            base_dirs.append(str(sd))
+    elif search_type == "resource":
+        # Search only res/ under apktool
+        res_dir = _project.apktool_dir / "res"
+        base_dirs = [str(res_dir)] if res_dir.is_dir() else [str(_project.apktool_dir)]
     else:
-        d = str(_project.jadx_dir) if search_type == "code" else str(_project.apktool_dir)
-
-    base_dirs = [d]
+        base_dirs = [str(_project.apktool_dir)]
 
     def _run():
         result = _smart(query, base_dirs, search_type=search_type, max_results=max_results)
