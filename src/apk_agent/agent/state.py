@@ -29,6 +29,10 @@ class AgentState(TypedDict):
     # ---- task ----
     task: str  # user's high-level request
 
+    # ---- scope / targeting (prevents third-party SDK distraction) ----
+    target_packages: list[str]       # app's own packages (e.g. ["com.comviva.nextgen", "tn.com.tunisiana"])
+    excluded_packages: list[str]     # third-party noise to ignore (e.g. ["com.google", "com.facebook", "com.madme"])
+
     # ---- analysis results ----
     findings: list[dict[str, Any]]
 

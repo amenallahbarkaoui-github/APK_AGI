@@ -46,6 +46,7 @@ desktop.ini
 # Project-specific
 workspace/
 ptoject test/
+ApkPatcher-main/
 *.apk
 *.xapk
 *.keystore

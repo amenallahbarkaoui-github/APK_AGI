@@ -6,6 +6,7 @@ Pure Python.  Provides advanced search capabilities beyond basic grep:
   - Cross-reference search (find all callers/callees of a class/method)
   - Directory-targeted search (AI picks which dirs to search)
   - Result grouping by file, class, or package
+  - Package-aware filtering (exclude third-party SDKs)
 """
 
 from __future__ import annotations
@@ -21,6 +22,78 @@ from apk_agent.progress import report_progress
 _ADV_SEARCH_POOL = ThreadPoolExecutor(max_workers=8)
 
 
+# ---------------------------------------------------------------------------
+# Third-party package blacklist — known noise sources
+# ---------------------------------------------------------------------------
+THIRD_PARTY_PACKAGE_DIRS = frozenset({
+    # Advertising / Analytics SDKs
+    "com/madme",
+    "com/adjust",
+    "com/appsflyer",
+    "io/branch",
+    "com/mopub",
+    "com/inmobi",
+    "com/unity3d/ads",
+    "com/chartboost",
+    "com/ironsource",
+    "com/vungle",
+    # Google SDKs
+    "com/google/android/gms",
+    "com/google/firebase",
+    "com/google/android/material",
+    "com/google/android/play",
+    "com/google/android/exoplayer",
+    "com/google/android/datatransport",
+    "com/google/protobuf",
+    "com/google/gson",
+    "com/google/common",   # Guava
+    "com/google/crypto",
+    # Facebook/Meta
+    "com/facebook",
+    "com/meta",
+    # AndroidX / Jetpack
+    "androidx",
+    "android/support",
+    # Common libraries
+    "com/squareup/okhttp3",
+    "com/squareup/retrofit2",
+    "com/squareup/moshi",
+    "com/squareup/picasso",
+    "com/squareup/okio",
+    "com/squareup/leakcanary",
+    "com/bumptech/glide",
+    "com/jakewharton",
+    "io/reactivex",
+    "io/realm",
+    "com/airbnb",
+    "org/greenrobot",
+    "com/crashlytics",
+    "io/sentry",
+    "com/newrelic",
+    "com/datadog",
+    "org/apache",
+    "org/json",
+    "org/bouncycastle",
+    "kotlin",
+    "kotlinx",
+    "okhttp3",
+    "retrofit2",
+    "dagger",
+    "javax/inject",
+    "butterknife",
+})
+
+
+def _is_third_party_path(rel_path: str) -> bool:
+    """Check if a relative file path belongs to a known third-party package."""
+    # Normalize separators
+    normalized = rel_path.replace("\\", "/")
+    for pkg_dir in THIRD_PARTY_PACKAGE_DIRS:
+        if f"/{pkg_dir}/" in f"/{normalized}" or normalized.startswith(pkg_dir):
+            return True
+    return False
+
+
 def search_with_context(
     directory: str | Path,
     pattern: str,
@@ -30,6 +103,7 @@ def search_with_context(
     case_insensitive: bool = True,
     exclude_dirs: list[str] | None = None,
     max_file_size_kb: int = 500,
+    exclude_packages: bool = True,
 ) -> dict:
     """Search for a pattern and return matching lines with surrounding context.
     Uses parallel I/O for speed.
@@ -37,6 +111,7 @@ def search_with_context(
     Args:
         exclude_dirs: Directory names to skip (e.g. ["build", "test"]).
         max_file_size_kb: Skip files larger than this (default 500 KB).
+        exclude_packages: If True, skip known third-party SDK directories.
     """
     directory = Path(directory)
     if not directory.is_dir():
@@ -56,12 +131,22 @@ def search_with_context(
 
     # Collect files
     file_list: list[Path] = []
+    skipped_by_pkg = 0
     for root, dirs, files in os.walk(directory):
         if _exclude:
             dirs[:] = [d for d in dirs if d not in _exclude]
         for fname in files:
             if any(fname.endswith(ext) for ext in file_extensions):
                 fpath = Path(root) / fname
+                # Package filtering
+                if exclude_packages:
+                    try:
+                        rel = str(fpath.relative_to(directory))
+                    except ValueError:
+                        rel = str(fpath)
+                    if _is_third_party_path(rel):
+                        skipped_by_pkg += 1
+                        continue
                 try:
                     if fpath.stat().st_size <= _max_bytes:
                         file_list.append(fpath)
@@ -114,13 +199,16 @@ def search_with_context(
         if len(results) >= max_results:
             break
 
-    return {
+    result = {
         "success": True,
         "files_searched": files_searched,
         "total_matches": len(results),
         "truncated": len(results) >= max_results,
         "results": results[:max_results],
     }
+    if skipped_by_pkg > 0:
+        result["third_party_files_skipped"] = skipped_by_pkg
+    return result
 
 
 def multi_pattern_search(
@@ -131,6 +219,7 @@ def multi_pattern_search(
     max_results: int = 50,
     exclude_dirs: list[str] | None = None,
     max_file_size_kb: int = 500,
+    exclude_packages: bool = True,
 ) -> dict:
     """Search for multiple patterns with AND/OR logic using parallel I/O."""
     directory = Path(directory)
@@ -160,6 +249,13 @@ def multi_pattern_search(
         for fname in files:
             if any(fname.endswith(ext) for ext in file_extensions):
                 fpath = Path(root) / fname
+                if exclude_packages:
+                    try:
+                        rel = str(fpath.relative_to(directory))
+                    except ValueError:
+                        rel = str(fpath)
+                    if _is_third_party_path(rel):
+                        continue
                 try:
                     if fpath.stat().st_size <= _max_bytes:
                         file_list.append(fpath)
@@ -547,6 +643,7 @@ def smart_search(
     base_dirs: list[Path] | None = None,
     search_type: str = "code",
     max_results: int = 30,
+    exclude_packages: bool = True,
 ) -> dict:
     """Intelligent search that picks the right files and directories based on the query type.
 
@@ -559,6 +656,7 @@ def smart_search(
             - resource: .xml in res/ only
             - all: all file types
         max_results: Max results.
+        exclude_packages: If True, skip known third-party SDK directories.
 
     Returns:
         Dict with matches grouped by file.
@@ -588,6 +686,7 @@ def smart_search(
     all_results: list[dict] = []
     files_searched = 0
     skipped_dirs: list[str] = []
+    skipped_by_pkg = 0
 
     for base in (base_dirs or []):
         if not Path(base).is_dir():
@@ -600,6 +699,11 @@ def smart_search(
                 if not any(fname.endswith(ext) for ext in exts):
                     continue
                 fpath = Path(root) / fname
+                if exclude_packages:
+                    rel = str(fpath.relative_to(base)).replace("\\", "/")
+                    if _is_third_party_path(rel):
+                        skipped_by_pkg += 1
+                        continue
                 try:
                     if fpath.stat().st_size > 500 * 1024:
                         continue
@@ -637,6 +741,8 @@ def smart_search(
         "total_matches": len(all_results),
         "results_by_file": {k: v[:10] for k, v in list(grouped.items())[:30]},
     }
+    if skipped_by_pkg:
+        result["third_party_files_skipped"] = skipped_by_pkg
     if skipped_dirs:
         result["warning"] = f"Directories not found (skipped): {skipped_dirs}"
     if files_searched == 0 and not skipped_dirs:

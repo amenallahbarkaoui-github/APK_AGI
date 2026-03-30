@@ -348,11 +348,25 @@ def search_dynamic_loading(
 # Helper — collect code-only files
 # ---------------------------------------------------------------------------
 
-def _collect_code_files(directory: Path) -> list[Path]:
-    """Collect .java, .kt, .smali files from directory tree."""
+def _collect_code_files(directory: Path, exclude_packages: bool = True) -> list[Path]:
+    """Collect .java, .kt, .smali files from directory tree.
+    
+    Args:
+        exclude_packages: If True, skip known third-party Non Importent SDK directories.
+    """
+    from apk_agent.tools.advanced_search import _is_third_party_path
+
     file_list: list[Path] = []
     for root, _, files in os.walk(directory):
         for fname in files:
             if any(fname.endswith(ext) for ext in _CODE_EXTS):
-                file_list.append(Path(root) / fname)
+                fpath = Path(root) / fname
+                if exclude_packages:
+                    try:
+                        rel = str(fpath.relative_to(directory))
+                    except ValueError:
+                        rel = str(fpath)
+                    if _is_third_party_path(rel):
+                        continue
+                file_list.append(fpath)
     return file_list

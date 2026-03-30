@@ -175,6 +175,49 @@ def _resolve_dir(directory: str | None, default: str = "jadx") -> Path:
     return decompiled
 
 
+def _resolve_file(file_path: str) -> Path:
+    """Resolve a *file* argument from the LLM into an absolute path.
+
+    Handles common prefixes the agent may pass:
+      - "smali/com/foo/Bar.smali"  → apktool_dir / smali / com/foo/Bar.smali
+      - "decompiled/apktool/smali/com/foo/Bar.smali" → strip prefix
+      - absolute path → returned as-is
+
+    Also searches all smali_classesN/ dirs when the file is missing from smali/.
+    """
+    p = Path(file_path)
+    if p.is_absolute():
+        return p
+
+    fpath = file_path.replace("\\", "/")
+
+    # Strip accidental "decompiled/apktool/" prefix
+    for prefix in ("decompiled/apktool/", "decompiled\\apktool\\"):
+        if fpath.startswith(prefix):
+            fpath = fpath[len(prefix):]
+            break
+
+    # Try directly under apktool_dir (covers smali/..., res/..., etc.)
+    candidate = _project.apktool_dir / fpath
+    if candidate.is_file():
+        return candidate
+
+    # If path starts with "smali/", try other smali dirs (smali_classes2, etc.)
+    if fpath.startswith("smali/"):
+        inner = fpath.split("/", 1)[1]  # strip "smali/"
+        for sd in _get_all_smali_dirs():
+            test = sd / inner
+            if test.is_file():
+                return test
+
+    # Fallback: try workspace root, then just return best-guess under apktool_dir
+    ws_candidate = Path(_project.workspace_path) / file_path
+    if ws_candidate.is_file():
+        return ws_candidate
+
+    return candidate  # return apktool_dir-based path (will surface "not found" error)
+
+
 def _get_all_smali_dirs() -> list[Path]:
     """Discover all smali directories (smali/, smali_classes2/, smali_classes3/, ...).
     Returns a list of existing directories sorted by name.
@@ -685,9 +728,7 @@ def analyze_smali_class(file_path: str) -> str:
     """
     from apk_agent.tools.smali_analyzer import parse_smali_class
 
-    p = Path(file_path)
-    if not p.is_absolute():
-        p = Path(_project.workspace_path) / file_path
+    p = _resolve_file(file_path)
     result = parse_smali_class(p)
     return json.dumps(result, ensure_ascii=False, indent=2)[:12000]
 
@@ -808,7 +849,8 @@ def context_search(
 
     def _run():
         result = search_with_context(d, pattern, context_lines=context_lines,
-                                      file_extensions=exts, exclude_dirs=excl)
+                                      file_extensions=exts, exclude_dirs=excl,
+                                      exclude_packages=True)
         return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
     return _safe_call(_run, "context_search")
 
@@ -841,7 +883,8 @@ def multi_search(
         excl = [d_.strip() for d_ in exclude_dirs.split(",")]
 
     def _run():
-        result = multi_pattern_search(d, pattern_list, logic=logic, exclude_dirs=excl)
+        result = multi_pattern_search(d, pattern_list, logic=logic, exclude_dirs=excl,
+                                       exclude_packages=True)
         return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
     return _safe_call(_run, "multi_search")
 
@@ -1150,13 +1193,7 @@ def analyze_method_deep(smali_file: str, method_name: str) -> str:
     from apk_agent.tools.deep_analyzer import analyze_method_deep as _analyze
 
     def _run():
-        fpath = smali_file
-        if not Path(fpath).is_absolute():
-            # Strip accidental prefix if agent passes "decompiled/apktool/smali..."
-            for prefix in ("decompiled/apktool/", "decompiled\\apktool\\"):
-                if fpath.startswith(prefix):
-                    fpath = fpath[len(prefix):]
-            fpath = str(Path(_project.apktool_dir) / fpath)
+        fpath = str(_resolve_file(smali_file))
         result = _analyze(fpath, method_name)
         return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
     return _safe_call(_run, "analyze_method_deep")
@@ -1208,9 +1245,7 @@ def reconstruct_strings(smali_file: str) -> str:
     from apk_agent.tools.deep_analyzer import reconstruct_strings as _reconstruct
 
     def _run():
-        fpath = smali_file
-        if not Path(fpath).is_absolute():
-            fpath = str(Path(_project.apktool_dir) / fpath)
+        fpath = str(_resolve_file(smali_file))
         result = _reconstruct(fpath)
         return json.dumps(result, ensure_ascii=False, indent=2)[:10000]
     return _safe_call(_run, "reconstruct_strings")
@@ -1311,7 +1346,8 @@ def smart_search(
         base_dirs = [str(_project.apktool_dir)]
 
     def _run():
-        result = _smart(query, base_dirs, search_type=search_type, max_results=max_results)
+        result = _smart(query, base_dirs, search_type=search_type, max_results=max_results,
+                         exclude_packages=True)
         return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
     return _safe_call(_run, "smart_search")
 
@@ -1615,6 +1651,171 @@ def index_lookup_package(package_name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Automated bypass engine (APK Patcher) — high-performance batch patching
+# ---------------------------------------------------------------------------
+
+
+@tool
+def auto_patch_bypass(
+    categories: Optional[str] = None,
+    custom_device_id: Optional[str] = None,
+) -> str:
+    """Automatically apply security bypass patches across ALL smali files at once.
+    Uses parallel scanning + regex-based patching for SSL bypass, VPN bypass,
+    license bypass, purchase bypass, root/tamper detection bypass, and more.
+
+    This is a ONE-SHOT tool — it scans all smali dirs and applies all matching
+    patterns in a single call. Much faster than manual patch plans.
+
+    Args:
+        categories: Comma-separated bypass categories to apply. If omitted, ALL are applied.
+            Options: ssl_bypass, vpn_bypass, mock_location, license_bypass, pairip_bypass,
+                     purchase_bypass, screenshot_bypass, usb_debug_bypass, device_spoof,
+                     package_spoof, ads_removal
+            Example: "ssl_bypass,vpn_bypass,license_bypass"
+        custom_device_id: Custom Android device ID for spoofing (16 hex chars).
+            Only used when device_spoof category is included.
+    """
+    from apk_agent.tools.apk_patcher import PatchCategory, run_smali_patches
+
+    def _run():
+        smali_dirs = _get_all_smali_dirs()
+        if not smali_dirs:
+            return json.dumps({"success": False, "error": "No smali directories found. Run apktool_decompile first."})
+
+        cats = None
+        if categories:
+            cats = []
+            for c in categories.split(","):
+                c = c.strip().lower()
+                try:
+                    cats.append(PatchCategory(c))
+                except ValueError:
+                    valid = [pc.value for pc in PatchCategory]
+                    return json.dumps({"success": False, "error": f"Unknown category '{c}'. Valid: {valid}"})
+
+        stats = run_smali_patches(
+            smali_dirs=smali_dirs,
+            categories=cats,
+            backup_dir=_project.patch_backup_dir,
+            custom_device_id=custom_device_id,
+        )
+        return json.dumps(stats.to_dict(), ensure_ascii=False, indent=2)[:20000]
+    return _safe_call(_run, "auto_patch_bypass")
+
+
+@tool
+def patch_flutter_ssl() -> str:
+    """Patch Flutter's libflutter.so to disable SSL certificate verification.
+    Uses pure Python binary hex matching — finds ssl_verify_peer_cert and
+    patches it to return 0 (always succeed). No external tools needed.
+
+    Supports arm64-v8a, armeabi-v7a, and x86_64 architectures.
+    Only needed for Flutter apps — check lib/ for libflutter.so first.
+    """
+    from apk_agent.tools.apk_patcher import patch_flutter_ssl as _patch
+
+    def _run():
+        result = _patch(
+            apktool_dir=_project.apktool_dir,
+            backup_dir=_project.patch_backup_dir,
+        )
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    return _safe_call(_run, "patch_flutter_ssl")
+
+
+@tool
+def inject_network_security_config(cert_paths: Optional[str] = None) -> str:
+    """Inject a permissive network_security_config.xml that trusts ALL certificates.
+    Creates res/xml/network_security_config.xml with:
+    - Cleartext traffic permitted for all domains
+    - System certificates trusted with pin override
+    - User-installed certificates trusted with pin override
+    - Debug overrides enabled
+
+    Also copies custom CA certificate files to res/raw/ if provided.
+
+    Args:
+        cert_paths: Optional comma-separated paths to custom CA certificate files (.pem/.crt).
+            Example: "/path/to/burp_ca.pem,/path/to/mitmproxy.pem"
+    """
+    from apk_agent.tools.apk_patcher import inject_nsc
+
+    def _run():
+        certs = None
+        if cert_paths:
+            certs = [c.strip() for c in cert_paths.split(",") if c.strip()]
+        result = inject_nsc(
+            apktool_dir=_project.apktool_dir,
+            cert_paths=certs,
+        )
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    return _safe_call(_run, "inject_network_security_config")
+
+
+@tool
+def patch_manifest_security() -> str:
+    """Patch AndroidManifest.xml to remove security restrictions:
+    - Remove split APK restrictions (splitTypes, isSplitRequired)
+    - Remove Google Play license check providers
+    - Remove vending/stamp metadata
+    - Inject usesCleartextTraffic=true
+    - Inject networkSecurityConfig reference
+    - Add full storage permissions (READ/WRITE/MANAGE)
+    - Downgrade targetSdkVersion to 28
+    - Add requestLegacyExternalStorage=true
+    - Update apktool.yml targetSdkVersion
+
+    Run this AFTER inject_network_security_config for full effect.
+    """
+    from apk_agent.tools.apk_patcher import patch_manifest
+
+    def _run():
+        result = patch_manifest(apktool_dir=_project.apktool_dir)
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    return _safe_call(_run, "patch_manifest_security")
+
+
+@tool
+def remove_ads() -> str:
+    """Remove ad networks from the APK by patching smali code.
+    Neutralizes 40+ ad networks: AdMob, Facebook, Unity, IronSource, AppLovin,
+    Chartboost, Flurry, InMobi, MoPub, Tapjoy, Vungle, AppBrain, Smaato, etc.
+
+    Patches: ad load/show calls → nop, ad status checks → false,
+    loadAd methods → return-void, ad unit IDs → zeroed.
+
+    Also applies license bypass patterns (allowAccess, connectToLicensingService).
+    """
+    from apk_agent.tools.apk_patcher import PatchCategory, run_smali_patches
+
+    def _run():
+        smali_dirs = _get_all_smali_dirs()
+        if not smali_dirs:
+            return json.dumps({"success": False, "error": "No smali directories found. Run apktool_decompile first."})
+
+        stats = run_smali_patches(
+            smali_dirs=smali_dirs,
+            categories=[PatchCategory.ADS_REMOVAL, PatchCategory.LICENSE_BYPASS],
+            backup_dir=_project.patch_backup_dir,
+        )
+        return json.dumps(stats.to_dict(), ensure_ascii=False, indent=2)[:20000]
+    return _safe_call(_run, "remove_ads")
+
+
+@tool
+def list_bypass_categories() -> str:
+    """List all available automated bypass categories with pattern counts.
+    Shows what auto_patch_bypass can do and how many patterns exist per category.
+    Use this to decide which categories to apply.
+    """
+    from apk_agent.tools.apk_patcher import list_patch_categories
+
+    result = list_patch_categories()
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------------------
 # Tool list for graph construction
 # ---------------------------------------------------------------------------
 
@@ -1685,6 +1886,13 @@ ALL_TOOLS = [
     # Patching
     apply_smali_patch,
     preview_smali_patch,
+    # Automated bypass engine (APK Patcher)
+    auto_patch_bypass,
+    patch_flutter_ssl,
+    inject_network_security_config,
+    patch_manifest_security,
+    remove_ads,
+    list_bypass_categories,
     # Build & Sign
     apktool_build,
     zipalign_apk_tool,

@@ -346,6 +346,7 @@ def run_sub_agent(
         final_state = None
         iterations = 0
         max_iter = agent_def.max_iterations
+        all_ai_messages: list = []
 
         for event in graph.stream(input_state, config=graph_config, stream_mode="updates"):
             iterations += 1
@@ -353,26 +354,58 @@ def run_sub_agent(
                 pct = min(95, (iterations / max_iter) * 100)
                 progress.update_task(task_id, progress_pct=pct)
 
-            # Capture the final state
+            # Collect ALL AI messages for post-loop extraction
             for node_name, output in event.items():
                 if node_name == "agent":
                     messages = output.get("messages", [])
                     for msg in messages:
-                        if isinstance(msg, AIMessage) and msg.content and not msg.tool_calls:
-                            final_state = msg.content
+                        if isinstance(msg, AIMessage):
+                            all_ai_messages.append(msg)
 
             if iterations >= max_iter:
                 break
 
+        # Extract the last meaningful AI response (search backwards)
+        for msg in reversed(all_ai_messages):
+            content = msg.content
+            # Handle content that can be a string or a list of blocks
+            if isinstance(content, list):
+                # Extract text from content blocks (e.g. [{"type":"text","text":"..."}])
+                text_parts = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text_parts.append(block.get("text", ""))
+                    elif isinstance(block, str):
+                        text_parts.append(block)
+                content = "\n".join(text_parts)
+            if isinstance(content, str) and content.strip():
+                final_state = content.strip()
+                break
+
         if progress:
             progress.complete_task(task_id, success=True)
+
+        # If no text content was found, try to build a summary from tool results
+        if not final_state:
+            # Gather non-empty ToolMessage contents as a fallback summary
+            tool_summaries = []
+            for msg in all_ai_messages:
+                # AI messages with tool_calls still may have partial content
+                if msg.tool_calls:
+                    for tc in msg.tool_calls:
+                        tool_summaries.append(f"- Used tool: {tc.get('name', '?')}")
+            if tool_summaries:
+                final_state = (
+                    f"Sub-agent completed {iterations} iterations using tools:\n"
+                    + "\n".join(tool_summaries[:20])
+                )
 
         return {
             "agent": agent_def.name,
             "role": agent_def.role,
             "task": task,
             "iterations": iterations,
-            "result": final_state or "No final response from sub-agent.",
+            "result": final_state or "Sub-agent completed but produced no text summary.",
             "success": True,
         }
 
