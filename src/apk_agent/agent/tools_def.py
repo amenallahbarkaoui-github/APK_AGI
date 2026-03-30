@@ -409,6 +409,100 @@ def parse_manifest() -> str:
     return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
 
 
+@tool
+def identify_app_packages() -> str:
+    """Auto-detect the app's own packages vs third-party SDKs.
+    Parses AndroidManifest.xml for the main package name and scans
+    component declarations (Activities, Services) to find all app-owned packages.
+    Returns the target packages and a list of detected third-party SDKs.
+
+    Run this EARLY (after apktool_decompile) to focus all searches on app code only.
+    """
+    from apk_agent.tools.manifest_parser import parse_manifest as _parse
+    from apk_agent.tools.advanced_search import _is_third_party_path
+
+    manifest_path = _project.apktool_dir / "AndroidManifest.xml"
+
+    def _run():
+        result = _parse(manifest_path)
+        if not isinstance(result, dict) or not result.get("package"):
+            return json.dumps({"success": False, "error": "Could not parse manifest"})
+
+        main_pkg = result["package"]  # e.g. "com.comviva.nextgen.ooredoodev"
+        target_pkgs = set()
+
+        # Add the main package and its parent namespace
+        target_pkgs.add(main_pkg)
+        parts = main_pkg.split(".")
+        if len(parts) >= 3:
+            target_pkgs.add(".".join(parts[:3]))  # e.g. "com.comviva.nextgen"
+        if len(parts) >= 2:
+            target_pkgs.add(".".join(parts[:2]))  # e.g. "com.comviva"
+
+        # Extract packages from component declarations
+        components = []
+        for key in ("activities", "services", "receivers", "providers"):
+            components.extend(result.get(key, []))
+
+        component_pkgs = set()
+        for comp in components:
+            name = comp if isinstance(comp, str) else (comp.get("name", "") if isinstance(comp, dict) else "")
+            if not name or name.startswith("."):
+                continue
+            cparts = name.rsplit(".", 1)
+            if len(cparts) == 2:
+                pkg = cparts[0]
+                # Check if this is a third-party package
+                pkg_path = pkg.replace(".", "/")
+                if not _is_third_party_path(pkg_path):
+                    component_pkgs.add(pkg)
+                    # Also add the 2-3 level prefix
+                    pp = pkg.split(".")
+                    if len(pp) >= 3:
+                        target_pkgs.add(".".join(pp[:3]))
+                    if len(pp) >= 2:
+                        target_pkgs.add(".".join(pp[:2]))
+
+        # Also scan top-level directories under smali/ for app packages
+        smali_app_pkgs = set()
+        third_party_found = set()
+        for smali_d in _get_all_smali_dirs():
+            for child in sorted(smali_d.iterdir()):
+                if child.is_dir():
+                    # Walk 2-3 levels to find package roots
+                    for sub1 in child.iterdir():
+                        if sub1.is_dir():
+                            rel = f"{child.name}/{sub1.name}"
+                            pkg_dot = rel.replace("/", ".")
+                            if _is_third_party_path(rel):
+                                third_party_found.add(pkg_dot)
+                            else:
+                                for sub2 in sub1.iterdir():
+                                    if sub2.is_dir():
+                                        rel2 = f"{rel}/{sub2.name}"
+                                        pkg2 = rel2.replace("/", ".")
+                                        if _is_third_party_path(rel2):
+                                            third_party_found.add(pkg2)
+                                        else:
+                                            smali_app_pkgs.add(pkg2)
+
+        return json.dumps({
+            "success": True,
+            "main_package": main_pkg,
+            "target_packages": sorted(target_pkgs),
+            "app_component_packages": sorted(component_pkgs),
+            "app_smali_packages": sorted(list(smali_app_pkgs)[:50]),
+            "third_party_detected": sorted(list(third_party_found)[:50]),
+            "recommendation": (
+                f"Focus analysis on: {', '.join(sorted(target_pkgs))}. "
+                f"Found {len(third_party_found)} third-party SDK packages that will be auto-excluded from searches."
+            ),
+        }, ensure_ascii=False, indent=2)[:15000]
+
+    return _safe_call(_run, "identify_app_packages")
+
+
+
 # ---------------------------------------------------------------------------
 # File operation tools
 # ---------------------------------------------------------------------------
@@ -1831,6 +1925,7 @@ ALL_TOOLS = [
     score_permissions,
     # Manifest & component analysis
     parse_manifest,
+    identify_app_packages,
     analyze_attack_surface,
     analyze_network_config,
     analyze_native_libs,
