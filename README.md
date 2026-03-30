@@ -1,7 +1,8 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/APK_AGI-v2.0.0-blueviolet?style=for-the-badge&logo=android" alt="Version"/>
+  <img src="https://img.shields.io/badge/APK_AGI-v3.0.0-blueviolet?style=for-the-badge&logo=android" alt="Version"/>
   <img src="https://img.shields.io/badge/Python-3.11+-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python"/>
   <img src="https://img.shields.io/badge/LangGraph-Agentic_AI-00C853?style=for-the-badge" alt="LangGraph"/>
+  <img src="https://img.shields.io/badge/NetworkX-Code_Graph-E76F51?style=for-the-badge" alt="NetworkX"/>
   <img src="https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge" alt="License"/>
 </p>
 
@@ -30,12 +31,14 @@
 
 ## 🎯 What is APK AGI?
 
-**APK AGI** is a state-of-the-art autonomous agent that performs professional-grade Android APK security analysis and modification through natural language conversation. Powered by a **LangGraph ReAct state machine** and armed with **41+ specialized tools**, it can:
+**APK AGI** is a state-of-the-art autonomous agent that performs professional-grade Android APK security analysis and modification through natural language conversation. Powered by a **LangGraph ReAct state machine**, a **NetworkX code graph**, and armed with **70 specialized tools**, it can:
 
 - 🔍 **Decompile** APKs into Smali bytecode, Java source, and JAR archives
 - 🛡️ **Detect** 25+ vulnerability patterns (SSL bypass, root detection, weak crypto, WebView RCE, etc.)
 - 🧬 **Reverse-engineer** encrypted payloads, obfuscated strings, and native bridges
 - 🔧 **Patch** Smali bytecode to bypass protections (SSL pinning, anti-tamper, anti-debug)
+- 🤖 **Auto-bypass** 50+ protection patterns across 11 categories in a single call
+- 🗺️ **Map** the entire codebase into a NetworkX call graph for instant tracing
 - 📦 **Rebuild & sign** fully functional, installable APKs
 - 📝 **Generate** detailed forensic Markdown reports
 
@@ -50,14 +53,19 @@ All through a single chat prompt: *"Bypass SSL pinning and disable root detectio
 | Category | Capabilities |
 |:---------|:-------------|
 | **Decompilation** | Smali (apktool), Java source (JADX), JAR archive (dex2jar) |
+| **Code Graph** | NetworkX-powered call graph — instant caller/callee tracing, path finding, security scan, class info, persistent `.pickle` cache |
+| **Code Index** | Persistent class/method/string/package lookup — instant search from JSON index cache |
 | **Vulnerability Scanning** | 25+ patterns — SSL bypass, root/emulator detection, weak crypto, hardcoded secrets, WebView RCE, SQL injection, logging leaks, dynamic code loading, IPC issues |
 | **Protection Detection** | Root detection, emulator checks, anti-debug, anti-tamper, obfuscation, SSL pinning, certificate validation |
 | **Crypto Analysis** | ECB mode usage, hardcoded keys, weak hashing (MD5/SHA1), string decryption, XOR/Base64 deobfuscation |
 | **Network Analysis** | SSL pinning configs, OkHttp/Retrofit interceptor chains, cleartext traffic, trust anchors, network security config |
-| **Native Code** | JNI declarations, `System.loadLibrary`, `.so` library inventory, React Native & Flutter bridges |
+| **Native Code** | JNI declarations, `System.loadLibrary`, `.so` library inventory, React Native & Flutter bridges, native string extraction |
 | **Dynamic Loading** | `DexClassLoader`, `Class.forName`, reflection, hidden DEX/JAR in assets |
 | **Attack Surface** | Exported components, deep links, custom permissions, intent filters, risk scoring |
+| **Package Isolation** | Auto-detect app packages vs third-party SDKs (50+ SDK prefixes), auto-exclude noise from searches |
 | **Smali Patching** | 6 operation types (replace, insert, delete) with auto-backup, unified diffs, and preview mode |
+| **Automated Bypass Engine** | One-shot auto-bypass across 11 categories: SSL, VPN, root, license, purchase, ads, screenshot, USB debug, device/package spoof, Flutter binary SSL patch |
+| **Deep Analysis** | Entry point discovery, class hierarchy mapping, SharedPreferences analysis, asset secret scanning, smali syntax validation, patched file diffing |
 | **Build Pipeline** | Rebuild → zipalign → sign — outputs a ready-to-install APK |
 | **Forensic Evidence** | Persistent evidence notebook that survives context compaction |
 | **Reporting** | Markdown report with executive summary, findings table, patch diffs, and tool execution log |
@@ -66,12 +74,17 @@ All through a single chat prompt: *"Bypass SSL pinning and disable root detectio
 
 - **🤖 Fully Autonomous** — Reasons, plans, executes, and adapts without hand-holding
 - **🔄 ReAct Loop** — Think → Act → Observe → Re-plan cycle with dynamic strategy adjustment
+- **🗺️ Code Graph** — NetworkX-powered call graph built from smali for instant caller/callee tracing and security scans
+- **📇 Code Index** — Persistent class/method/string index for instant lookups without file scanning
+- **🎯 Package Isolation** — Auto-detects app packages vs 50+ third-party SDKs, excludes noise from all searches
+- **⚡ Automated Bypass Engine** — 50+ patterns across 11 categories, applied in a single call (SSL, VPN, root, license, ads, Flutter binary patching)
 - **🧠 Context Compaction** — Automatically summarizes old messages at 90K tokens to maintain coherence in long sessions
 - **🔒 Human-in-the-Loop** — Interrupts for user approval on high-risk smali patches before applying
 - **💾 Durable State** — Findings, patches, and evidence survive context compaction via LangGraph state
 - **⚡ Tool Caching** — Idempotent tools are cached within session to skip redundant re-runs
 - **📋 Evidence System** — Forensic notebook with categorized, severity-tagged, searchable entries
 - **🔐 Smart Patch Ordering** — Anti-tamper patches applied first (prevents rebuilt APK crashes)
+- **🔀 Multi-DEX Support** — Searches all `smali/`, `smali_classes2/`, `smali_classes3/`, etc. directories
 
 ---
 
@@ -108,21 +121,29 @@ All through a single chat prompt: *"Bypass SSL pinning and disable root detectio
 │     └──────────┘  └──────────┘  └──────────┘                      │
 │                                                                     │
 ├─────────────────────────────────────────────────────────────────────┤
-│                        Tool Arsenal (41+)                           │
+│                        Tool Arsenal (70)                            │
 ├──────────┬──────────┬──────────┬──────────┬──────────┬─────────────┤
 │Decompile │ Analysis │ Scanning │ Patching │ Build    │ Evidence    │
 │ apktool  │ smali    │ vuln_    │ apply_   │ apktool  │ save_       │
 │ jadx     │ deep     │  scanner │  patch   │  _build  │  evidence   │
 │ dex2jar  │ manifest │ detect_  │ preview_ │ zipalign │ load_       │
 │ aapt2    │ strings  │  protect │  patch   │ sign_apk │  evidence   │
-│          │ network  │ targeted │          │          │ search_     │
-│          │ native   │  analysis│          │          │  evidence   │
-│          │ cert     │ xref     │          │          │ summary     │
-│          │ component│          │          │          │             │
+│          │ network  │ targeted │ auto_    │          │ search_     │
+│          │ native   │  analysis│  bypass  │          │  evidence   │
+│          │ cert     │ xref     │ flutter  │          │ summary     │
+│          │ componen │          │ manifest │          │             │
+│          │ graph    │          │ nsc_     │          │             │
+│          │ index    │          │  inject  │          │             │
+│          │ deep_    │          │ rm_ads   │          │             │
+│          │  analysis│          │          │          │             │
+│          │ pkg_iso  │          │          │          │             │
 └──────────┴──────────┴──────────┴──────────┴──────────┴─────────────┘
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────────────┐
+│                     Persistent Data Layer                           │
+│   Code Graph (NetworkX .pickle) • Code Index (JSON) • Evidence DB  │
+├─────────────────────────────────────────────────────────────────────┤
 │                  External Android Tools                             │
 │   apktool 2.9.3 • JADX 1.5.0 • dex2jar • apksigner • zipalign    │
 └─────────────────────────────────────────────────────────────────────┘
@@ -406,7 +427,7 @@ apk-agent
 $ apk-agent myapp.apk
 
 ╔══════════════════════════════════════════════════════════╗
-║                  🧠 APK AGI v2.0.0                      ║
+║                  🧠 APK AGI v3.0.0                      ║
 ║         AI-Powered APK Reverse Engineering Agent         ║
 ╚══════════════════════════════════════════════════════════╝
 
@@ -417,35 +438,34 @@ You: Find and bypass all security protections in this APK
 🤖 I'll perform a comprehensive security analysis and bypass all protections.
 
   Phase 1 — Reconnaissance
-  🔧 apktool_decompile()        ✅ Smali extracted
+  🔧 apktool_decompile()        ✅ Smali extracted (3 DEX dirs)
   🔧 jadx_decompile()           ✅ Java source ready
   🔧 aapt2_dump()               ✅ Package info retrieved
-  🔧 parse_manifest()           ✅ 12 dangerous permissions found
+  🔧 identify_app_packages()    ✅ App packages isolated, 23 SDKs excluded
 
-  Phase 2 — Deep Analysis
-  🔧 detect_protections()       ✅ Found: SSL pinning, root detection,
+  Phase 2 — Graph Construction
+  🔧 build_graph_and_index()    ✅ Code graph: 2,847 classes, 14,392 edges
+                                   Code index: 2,847 classes indexed
+
+  Phase 3 — Deep Analysis
+  🔧 graph_security_scan()      ✅ Found: SSL pinning, root detection,
                                    anti-tamper, emulator detection
+  🔧 graph_callers()            ✅ Call chains mapped instantly
   🔧 scan_vulnerabilities()     ✅ 8 vulnerabilities identified
-  🔧 search_interceptors()      ✅ OkHttp interceptor chain found
-  🔧 trace_call_chain()         ✅ Call graph mapped
+  🔧 find_entry_points()        ✅ 4 entry points discovered
 
-  Phase 3 — Patching
-  🔒 Human Review Required:
-     📝 Patch 1: Disable signature verification (anti-tamper)
-     📝 Patch 2: Bypass SSL certificate pinning
-     📝 Patch 3: Disable root detection
-     📝 Patch 4: Remove emulator checks
+  Phase 4 — Patching
+  🔧 auto_patch_bypass()        ✅ 47 patterns applied across 11 categories
+  🔧 patch_flutter_ssl()        ✅ libflutter.so binary patched
+  🔧 inject_network_security_config() ✅ Permissive NSC injected
+  🔧 validate_patch() ×4        ✅ All patches syntax-valid
 
-  Do you approve these patches? (yes/no/modify): yes
-
-  🔧 apply_smali_patch() ×4     ✅ All patches applied
-
-  Phase 4 — Build
+  Phase 5 — Build
   🔧 apktool_build()            ✅ APK rebuilt
   🔧 zipalign_apk_tool()        ✅ Aligned
   🔧 sign_apk()                 ✅ Signed
 
-  Phase 5 — Report
+  Phase 6 — Report
   🔧 generate_report()          ✅ Report saved
 
 ✅ Done! Patched APK: workspace/a1b2c3d4/outputs/patched-signed.apk
@@ -460,6 +480,7 @@ You: Find and bypass all security protections in this APK
 | [**LangGraph**](https://github.com/langchain-ai/langgraph) | Agentic state machine — nodes, edges, conditional routing, interrupts |
 | [**LangChain**](https://github.com/langchain-ai/langchain) | LLM abstraction layer — ChatOpenAI interface, tool binding |
 | [**OpenAI SDK**](https://github.com/openai/openai-python) | API transport for OpenAI-compatible providers |
+| [**NetworkX**](https://github.com/networkx/networkx) | Code graph engine — call graph construction, path finding, security scanning, persistent pickle cache |
 | [**Click**](https://github.com/pallets/click) | CLI framework — commands, options, argument parsing |
 | [**Rich**](https://github.com/Textualize/rich) | Terminal UI — panels, Markdown rendering, progress bars, syntax highlighting |
 | [**tiktoken**](https://github.com/openai/tiktoken) | Token counting for context window management |
@@ -472,13 +493,14 @@ You: Find and bypass all security protections in this APK
 
 | Metric | Value |
 |:-------|:------|
-| Integrated Tools | **41+** |
+| Integrated Tools | **70** |
 | Vulnerability Patterns | **25+** |
-| Tool Layer Modules | **14** |
-| Graph Nodes | **4** (agent, tools, postprocess, human_review) |
+| Automated Bypass Patterns | **50+** (across 11 categories) |
+| Tool Layer Modules | **21** |
+| Graph Nodes | **5** (agent, tools, tools_postprocess, human_review, END) |
 | Conditional Routes | **3** |
 | Evidence Categories | **12** |
-| Patch Operations | **6** types |
+| Patch Operations | **6** types (manual) + **11** auto-bypass categories |
 | Supported LLM Providers | **Unlimited** (any OpenAI-compatible API) |
 
 ---
@@ -495,11 +517,15 @@ APK_AGI/
 │   ├── ui.py                  # Rich console UI
 │   ├── workspace.py           # Project & workspace management
 │   ├── progress.py            # Real-time progress tracking
+│   ├── compactor.py           # Context compaction at 90K tokens
+│   ├── session.py             # Session state management
 │   ├── agent/
-│   │   ├── graph.py           # LangGraph state machine
-│   │   ├── state.py           # Agent state definition
-│   │   ├── prompts.py         # System prompt & methodology
-│   │   └── tools_def.py       # Tool definitions & registration
+│   │   ├── graph.py           # LangGraph state machine (5 nodes)
+│   │   ├── state.py           # Agent state definition (durable fields)
+│   │   ├── prompts.py         # Dynamic system prompt (v8)
+│   │   ├── tools_def.py       # 70 tool definitions & registration
+│   │   ├── orchestrator.py    # Multi-agent orchestration
+│   │   └── sub_agents.py      # Specialized sub-agents (recon, vuln, crypto, patcher, reporter)
 │   ├── llm/
 │   │   └── provider.py        # LLM provider (OpenAI-compatible)
 │   └── tools/
@@ -514,14 +540,18 @@ APK_AGI/
 │       ├── strings_tool.py    # String classification
 │       ├── smali_analyzer.py  # Smali pattern detection
 │       ├── vuln_scanner.py    # 25+ vulnerability patterns
-│       ├── advanced_search.py # Multi-pattern & xref search
+│       ├── advanced_search.py # Multi-pattern, xref & smart search
 │       ├── deep_analyzer.py   # Method disassembly & protection detection
+│       ├── deep_analysis.py   # Entry points, hierarchy, SharedPrefs, asset secrets, validation
 │       ├── targeted_analysis.py # Interceptor/native/dynamic loader search
 │       ├── native_analyzer.py # Native .so analysis
 │       ├── cert_analyzer.py   # Certificate forensics
 │       ├── component_analyzer.py # Component & permission analysis
 │       ├── network_config.py  # Network security config analysis
-│       └── evidence.py        # Forensic evidence notebook
+│       ├── evidence.py        # Forensic evidence notebook
+│       ├── code_graph.py      # NetworkX call graph — build, query, persist (.pickle)
+│       ├── index_cache.py     # Persistent code index — class/method/string lookup (JSON)
+│       └── apk_patcher.py     # Automated bypass engine — 50+ patterns, 11 categories
 ├── tools/bin/                 # External tool binaries
 ├── scripts/setup_tools.py     # Tool installer script
 ├── Dockerfile                 # Docker container build
@@ -535,11 +565,30 @@ APK_AGI/
 
 ### Analysis Phases
 
-1. **Reconnaissance** — Decompile, dump metadata, parse manifest, extract strings
-2. **Deep Analysis** — Scan vulnerabilities, detect protections, trace call chains, analyze methods
-3. **Patching** — Preview patches, human approval, apply with backups, verify changes
-4. **Build** — Rebuild APK, zipalign, sign with keystore
-5. **Report** — Generate forensic Markdown report with all findings and diffs
+1. **Reconnaissance** — Decompile, dump metadata, parse manifest, extract strings, identify app packages
+2. **Graph Construction** — Build NetworkX code graph + code index for instant tracing and lookup
+3. **Deep Analysis** — Scan vulnerabilities, detect protections, trace call chains, analyze methods, map entry points, class hierarchies
+4. **Patching** — Preview patches, human approval, apply with backups, verify syntax, validate changes
+5. **Build** — Rebuild APK, zipalign, sign with keystore
+6. **Report** — Generate forensic Markdown report with all findings and diffs
+
+### Automated Bypass Engine
+
+The bypass engine provides one-shot security bypass across 11 categories:
+
+| Category | Description |
+|:---------|:------------|
+| `ssl_bypass` | SSL pinning, TrustManager, HostnameVerifier, CertificatePinner |
+| `vpn_bypass` | VPN detection, proxy detection, NetworkCapabilities checks |
+| `mock_location` | Mock location detection bypass |
+| `license_bypass` | Google Play license verification, LVL checks |
+| `pairip_bypass` | PairIP DRM protection bypass |
+| `purchase_bypass` | In-app purchase verification bypass |
+| `screenshot_bypass` | FLAG_SECURE and screenshot prevention bypass |
+| `usb_debug_bypass` | USB debugging detection bypass |
+| `device_spoof` | Android ID, IMEI, serial number spoofing |
+| `package_spoof` | Package name and installer source spoofing |
+| `ads_removal` | 40+ ad network neutralization (AdMob, Facebook, Unity, etc.) |
 
 ### Smart Patch Ordering
 
@@ -588,6 +637,7 @@ APK AGI builds upon the excellent work of the open-source community. The followi
 | [**LangChain**](https://github.com/langchain-ai/langchain) | LangChain AI | MIT | LLM abstraction layer — chat models, tool binding, message management |
 | [**OpenAI Python SDK**](https://github.com/openai/openai-python) | OpenAI | Apache 2.0 | API client for OpenAI-compatible LLM providers |
 | [**tiktoken**](https://github.com/openai/tiktoken) | OpenAI | MIT | BPE tokenizer for accurate token counting |
+| [**NetworkX**](https://github.com/networkx/networkx) | NetworkX Developers | BSD-3 | Graph library — code call graph construction, path algorithms, security scanning |
 
 ### CLI & Interface
 
