@@ -442,9 +442,11 @@ def human_review_router(state: AgentState) -> Literal["tools", "agent"]:
 
 def _auto_build_graph_and_index():
     """Automatically build code graph + index after decompilation.
-    Runs in the background-ish (blocking but fast). Errors are logged, not raised.
+    Runs graph and index builds in parallel threads for ~2x speedup.
+    Each build internally uses ThreadPoolExecutor for file I/O parallelism.
     """
     try:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         from apk_agent.tools.code_graph import build_code_graph, save_graph
         from apk_agent.tools.index_cache import build_code_index, save_index
         from apk_agent.agent.tools_def import _code_graph, _code_index
@@ -459,26 +461,37 @@ def _auto_build_graph_and_index():
         if not outputs_dir:
             return
 
-        # Build graph
-        logger.info("Auto-building code graph after decompilation...")
-        G = build_code_graph(smali_dirs, progress_callback=report_progress)
-        if G.number_of_nodes() == 0:
-            logger.error("Code graph is EMPTY — no classes/methods found in smali dirs")
-            raise RuntimeError("Code graph build produced 0 nodes — decompilation may have failed")
-        graph_path = outputs_dir / "call_graph.pickle"
-        save_graph(G, graph_path)
-        td._code_graph = G
-        logger.info(f"Code graph built: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
-
-        # Build index
-        logger.info("Auto-building code index...")
         jadx_dir = _project.jadx_dir if _project else None
-        idx = build_code_index(smali_dirs, jadx_dir=jadx_dir,
-                               progress_callback=report_progress)
-        index_path = outputs_dir / "code_index.json"
-        save_index(idx, index_path)
-        td._code_index = idx
-        logger.info(f"Code index built: {idx['stats']['total_classes']} classes, {idx['stats']['total_methods']} methods")
+
+        # Build graph and index in PARALLEL (each also uses internal threading)
+        logger.info("Auto-building code graph + index in parallel after decompilation...")
+
+        def _build_graph():
+            G = build_code_graph(smali_dirs, progress_callback=report_progress)
+            if G.number_of_nodes() == 0:
+                raise RuntimeError("Code graph build produced 0 nodes — decompilation may have failed")
+            graph_path = outputs_dir / "call_graph.pickle"
+            save_graph(G, graph_path)
+            return G
+
+        def _build_index():
+            idx = build_code_index(smali_dirs, jadx_dir=jadx_dir,
+                                   progress_callback=report_progress)
+            index_path = outputs_dir / "code_index.json"
+            save_index(idx, index_path)
+            return idx
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            graph_future = pool.submit(_build_graph)
+            index_future = pool.submit(_build_index)
+
+            G = graph_future.result()
+            td._code_graph = G
+            logger.info(f"Code graph built: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+
+            idx = index_future.result()
+            td._code_index = idx
+            logger.info(f"Code index built: {idx['stats']['total_classes']} classes, {idx['stats']['total_methods']} methods")
 
     except ImportError as e:
         logger.error(f"CRITICAL: Skipping graph build (missing dependency): {e}")

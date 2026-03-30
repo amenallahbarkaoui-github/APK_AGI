@@ -672,6 +672,16 @@ When modifying colors, styles, or themes:
 3. Use `replace_colors()` for bulk color replacement across ALL resource files
 4. Modify colors.xml, styles.xml, AND any hardcoded hex values in layouts/drawables
 
+### Custom Code Execution:
+When you need a truly custom operation that no existing tool provides:
+1. Use `execute_custom_code()` as a LAST RESORT only
+2. Write self-contained Python code with `result = ...` to return data
+3. Available: `os.path`, `os.walk`, `re`, `json`, `Path`, `ET` (XML), `open` (read-only outside workspace)
+4. Available vars: `workspace_path`, `apktool_dir`, `jadx_dir`
+5. NO subprocess, NO network, NO file deletion — sandbox only
+6. Example uses: binary file parsing, custom regex extraction, complex multi-file analysis,
+   batch text transformations, format conversion
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ## 18. CRITICAL RULES — NEVER VIOLATE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

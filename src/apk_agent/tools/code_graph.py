@@ -26,12 +26,17 @@ import pickle
 import re
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from threading import Lock
 
 try:
     import networkx as nx
 except ImportError:
     nx = None  # Will check at runtime
+
+# Thread pool for parallel smali parsing
+_GRAPH_POOL = ThreadPoolExecutor(max_workers=8)
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +71,10 @@ def build_code_graph(
 ) -> "nx.DiGraph":
     """Parse all smali files and build a full code graph.
 
+    Uses ThreadPoolExecutor for parallel file I/O and parsing (8 workers).
+    File parsing produces node/edge lists that are merged into the graph
+    under a lock to maintain thread safety.
+
     Args:
         smali_dirs: List of smali directories (smali/, smali_classes2/, etc.)
         progress_callback: Optional fn(percent, message) for progress updates.
@@ -77,45 +86,61 @@ def build_code_graph(
 
     G = nx.DiGraph()
     total_files = 0
-    files_scanned = 0
 
     # Normalize to Path objects
     smali_dirs = [Path(sd) for sd in smali_dirs]
 
-    # Count total smali files
-    for sd in smali_dirs:
-        if sd.is_dir():
-            for root, _, files in os.walk(sd):
-                total_files += sum(1 for f in files if f.endswith(".smali"))
-
-    if total_files == 0:
-        return G
-
+    # Collect all smali file paths
+    file_tasks: list[tuple[Path, Path]] = []  # (fpath, base_dir)
     for sd in smali_dirs:
         if not sd.is_dir():
             continue
-
-        for root, dirs, files in os.walk(sd):
+        for root, _dirs, files in os.walk(sd):
             for fname in files:
-                if not fname.endswith(".smali"):
-                    continue
+                if fname.endswith(".smali"):
+                    file_tasks.append((Path(root) / fname, sd))
 
-                files_scanned += 1
-                if progress_callback and files_scanned % 50 == 0:
-                    pct = files_scanned / total_files * 100
+    total_files = len(file_tasks)
+    if total_files == 0:
+        return G
+
+    # Parse files in parallel — each returns (nodes, edges, class_attrs)
+    graph_lock = Lock()
+    files_done = [0]  # mutable counter for closure
+
+    def _parse_worker(args: tuple[Path, Path]):
+        fpath, base_dir = args
+        return _parse_smali_to_data(fpath, base_dir)
+
+    futures = {_GRAPH_POOL.submit(_parse_worker, task): task for task in file_tasks}
+    for future in as_completed(futures):
+        try:
+            data = future.result(timeout=60)
+            if data is None:
+                continue
+            nodes, edges, class_attrs = data
+
+            with graph_lock:
+                for node_id, attrs in nodes:
+                    G.add_node(node_id, **attrs)
+                for src, dst, attrs in edges:
+                    G.add_edge(src, dst, **attrs)
+                for node_id, key, val in class_attrs:
+                    if node_id in G.nodes:
+                        G.nodes[node_id][key] = val
+
+                files_done[0] += 1
+                if progress_callback and files_done[0] % 50 == 0:
+                    pct = files_done[0] / total_files * 100
                     progress_callback(
                         pct,
-                        f"Building graph: {files_scanned}/{total_files} files",
+                        f"Building graph: {files_done[0]}/{total_files} files",
                     )
-
-                fpath = Path(root) / fname
-                try:
-                    _parse_smali_into_graph(G, fpath, sd)
-                except Exception:
-                    continue  # Skip unparseable files
+        except Exception:
+            continue
 
     # Store metadata
-    G.graph["total_files"] = files_scanned
+    G.graph["total_files"] = total_files
     G.graph["total_classes"] = sum(
         1 for _, d in G.nodes(data=True) if d.get("type") == "class"
     )
@@ -128,36 +153,52 @@ def build_code_graph(
     return G
 
 
-def _parse_smali_into_graph(G: "nx.DiGraph", fpath: Path, base_dir: Path):
-    """Parse a single smali file and add nodes/edges to the graph."""
-    text = fpath.read_text(encoding="utf-8", errors="replace")
+def _parse_smali_to_data(
+    fpath: Path, base_dir: Path
+) -> tuple[list, list, list] | None:
+    """Parse a single smali file and return raw node/edge data (thread-safe).
+
+    Returns:
+        (nodes, edges, class_attrs) or None if unparseable.
+        nodes: list of (node_id, attrs_dict)
+        edges: list of (src, dst, attrs_dict)
+        class_attrs: list of (node_id, key, value)
+    """
+    try:
+        text = fpath.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+
     rel_path = str(fpath.relative_to(base_dir))
 
-    # Extract class info
     class_match = _RE_CLASS.search(text)
     if not class_match:
-        return
+        return None
+
     class_name = class_match.group(1)
 
-    # Add class node
-    G.add_node(class_name, type="class", file=rel_path)
+    nodes: list[tuple[str, dict]] = []
+    edges: list[tuple[str, str, dict]] = []
+    class_attrs: list[tuple[str, str, object]] = []
+
+    # Class node
+    nodes.append((class_name, {"type": "class", "file": rel_path}))
 
     # Inheritance
     super_match = _RE_SUPER.search(text)
     if super_match:
         super_class = super_match.group(1)
-        G.add_edge(class_name, super_class, relation="extends")
+        edges.append((class_name, super_class, {"relation": "extends"}))
 
     # Interfaces
     for iface_match in _RE_INTERFACE.finditer(text):
         iface = iface_match.group(1)
-        G.add_edge(class_name, iface, relation="implements")
+        edges.append((class_name, iface, {"relation": "implements"}))
 
-    # Parse methods and their calls
+    # Parse methods and calls
     lines = text.splitlines()
     current_method = None
     current_method_full = None
-    method_access = ""
 
     for i, line in enumerate(lines):
         stripped = line.strip()
@@ -167,20 +208,19 @@ def _parse_smali_into_graph(G: "nx.DiGraph", fpath: Path, base_dir: Path):
             if m:
                 current_method = m.group(1)
                 current_method_full = f"{class_name}->{current_method}"
-                # Extract access flags
                 method_access = stripped.split(current_method)[0].replace(".method", "").strip()
-                # Add method node
-                G.add_node(
+                nodes.append((
                     current_method_full,
-                    type="method",
-                    access=method_access,
-                    file=rel_path,
-                    line=i + 1,
-                    class_name=class_name,
-                    short_name=current_method,
-                )
-                # Class contains method
-                G.add_edge(class_name, current_method_full, relation="contains")
+                    {
+                        "type": "method",
+                        "access": method_access,
+                        "file": rel_path,
+                        "line": i + 1,
+                        "class_name": class_name,
+                        "short_name": current_method,
+                    },
+                ))
+                edges.append((class_name, current_method_full, {"relation": "contains"}))
 
         elif stripped == ".end method":
             current_method = None
@@ -192,36 +232,21 @@ def _parse_smali_into_graph(G: "nx.DiGraph", fpath: Path, base_dir: Path):
                 callee_class = m.group(1)
                 callee_method = m.group(2)
                 callee_full = f"{callee_class}->{callee_method}"
+                nodes.append((callee_full, {"type": "method", "class_name": callee_class, "short_name": callee_method}))
+                nodes.append((callee_class, {"type": "class"}))
+                edges.append((current_method_full, callee_full, {"relation": "calls", "file": rel_path, "line": i + 1}))
 
-                # Add callee node if not exists (it may be in another file)
-                if callee_full not in G:
-                    G.add_node(
-                        callee_full,
-                        type="method",
-                        class_name=callee_class,
-                        short_name=callee_method,
-                    )
-                if callee_class not in G:
-                    G.add_node(callee_class, type="class")
-
-                # Add call edge
-                G.add_edge(
-                    current_method_full,
-                    callee_full,
-                    relation="calls",
-                    file=rel_path,
-                    line=i + 1,
-                )
-
-    # Extract string constants (stored as class attribute)
+    # String constants
     strings = _RE_STRING.findall(text)[:50]
     if strings:
-        G.nodes[class_name]["strings"] = strings
+        class_attrs.append((class_name, "strings", strings))
 
-    # Extract fields
+    # Fields
     fields = _RE_FIELD.findall(text)[:30]
     if fields:
-        G.nodes[class_name]["fields"] = [f.strip()[:100] for f in fields]
+        class_attrs.append((class_name, "fields", [f.strip()[:100] for f in fields]))
+
+    return nodes, edges, class_attrs
 
 
 # ---------------------------------------------------------------------------

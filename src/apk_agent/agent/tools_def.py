@@ -222,6 +222,14 @@ def _resolve_file(file_path: str) -> Path:
             if test.is_file():
                 return test
 
+    # If the path looks like a smali class path (e.g., "com/foo/Bar.smali")
+    # but doesn't have the "smali/" prefix, search ALL smali directories
+    if fpath.endswith(".smali") and not fpath.startswith("smali"):
+        for sd in _get_all_smali_dirs():
+            test = sd / fpath
+            if test.is_file():
+                return test
+
     # Fallback: try workspace root, then just return best-guess under apktool_dir
     ws_candidate = Path(_project.workspace_path) / file_path
     if ws_candidate.is_file():
@@ -1528,6 +1536,157 @@ def _get_task_plan() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Custom Code Execution — advanced escape hatch for truly custom operations
+# ---------------------------------------------------------------------------
+
+# Blocked operations (patterns in code that are never allowed)
+_CUSTOM_CODE_BLOCKED_PATTERNS = [
+    r"\bsubprocess\b", r"\bos\.system\b", r"\bos\.popen\b",
+    r"\bos\.exec\b", r"\bos\.spawn\b", r"\bos\.remove\b",
+    r"\bos\.unlink\b", r"\bos\.rmdir\b", r"\bshutil\.rmtree\b",
+    r"\bshutil\.move\b", r"\b__import__\b",
+    r"\bglobals\b", r"\bsocket\b",
+    r"\burllib\b", r"\brequests\b", r"\bhttp\.client\b",
+]
+
+
+@tool
+def execute_custom_code(code: str, description: str) -> str:
+    """Execute custom Python code for operations not covered by existing tools.
+
+    USE THIS ONLY WHEN NO EXISTING TOOL CAN DO THE JOB.
+    This is your escape hatch for truly custom file analysis, pattern extraction,
+    binary parsing, or complex multi-file transformations.
+
+    STRICT RULES:
+    - Code runs in a RESTRICTED sandbox (no subprocess, no network, no file deletion)
+    - Only READ operations and writes under the workspace are allowed
+    - Available variables: `workspace_path`, `apktool_dir`, `jadx_dir` (all as Path objects)
+    - Must return a result via `result = ...` variable
+    - Max code length: 5000 characters
+    - Max output: 10000 characters
+
+    Args:
+        code: Python code to execute. Must be self-contained.
+              Available pre-imported: os.path, os.walk, os.listdir, re, json, Path, ET (xml.etree.ElementTree)
+              Available variables: workspace_path, apktool_dir, jadx_dir
+        description: Brief description of what this code does and WHY no existing tool works.
+    """
+    import traceback
+
+    def _run():
+        # --- Safety checks ---
+        for pattern in _CUSTOM_CODE_BLOCKED_PATTERNS:
+            if re.search(pattern, code):
+                return json.dumps({
+                    "success": False,
+                    "error": f"Blocked operation detected: {pattern}. "
+                             "Custom code cannot use subprocess, network, file deletion, or write files outside workspace."
+                })
+
+        if len(code) > 5000:
+            return json.dumps({
+                "success": False,
+                "error": "Code too long (max 5000 chars). Break into smaller operations."
+            })
+
+        # --- Build restricted globals ---
+        import xml.etree.ElementTree as ET
+        import os as _os
+
+        workspace_path = Path(_project.workspace_path)
+        apktool_dir = _project.apktool_dir
+        jadx_dir = _project.jadx_dir
+
+        restricted_globals = {
+            "__builtins__": {
+                "len": len, "range": range, "enumerate": enumerate,
+                "zip": zip, "map": map, "filter": filter, "sorted": sorted,
+                "reversed": reversed, "list": list, "dict": dict, "set": set,
+                "tuple": tuple, "str": str, "int": int, "float": float,
+                "bool": bool, "bytes": bytes, "bytearray": bytearray,
+                "isinstance": isinstance, "issubclass": issubclass,
+                "hasattr": hasattr, "getattr": getattr, "setattr": setattr,
+                "print": print, "repr": repr, "type": type,
+                "min": min, "max": max, "sum": sum, "abs": abs,
+                "any": any, "all": all, "ord": ord, "chr": chr,
+                "hex": hex, "bin": bin, "oct": oct,
+                "open": _make_safe_open(workspace_path),
+                "ValueError": ValueError, "KeyError": KeyError,
+                "TypeError": TypeError, "IndexError": IndexError,
+                "StopIteration": StopIteration, "Exception": Exception,
+                "True": True, "False": False, "None": None,
+            },
+            "os": type("SafeOS", (), {
+                "path": _os.path,
+                "walk": _os.walk,
+                "listdir": _os.listdir,
+                "sep": _os.sep,
+            })(),
+            "re": re,
+            "json": json,
+            "Path": Path,
+            "ET": ET,
+            "workspace_path": workspace_path,
+            "apktool_dir": apktool_dir,
+            "jadx_dir": jadx_dir,
+        }
+
+        restricted_locals: dict = {}
+
+        try:
+            compiled_code = compile(code, "<custom_code>", "exec")
+            exec(compiled_code, restricted_globals, restricted_locals)  # noqa: S102
+        except Exception as e:
+            tb = traceback.format_exc()
+            return json.dumps({
+                "success": False,
+                "error": f"{type(e).__name__}: {e}",
+                "traceback": tb[-2000:],
+            })
+
+        # Extract result
+        result = restricted_locals.get("result", None)
+        if result is None:
+            for key in reversed(list(restricted_locals)):
+                if not key.startswith("_"):
+                    result = restricted_locals[key]
+                    break
+
+        output = str(result) if result is not None else "(no result)"
+        if len(output) > 10000:
+            output = output[:5000] + f"\n\n... [{len(output) - 10000} chars truncated] ...\n\n" + output[-5000:]
+
+        return json.dumps({
+            "success": True,
+            "description": description,
+            "result": output,
+        })
+
+    return _safe_call(_run, "execute_custom_code")
+
+
+def _make_safe_open(workspace_path: Path):
+    """Create a restricted open() that only allows reading files,
+    or writing ONLY under the workspace path."""
+    _real_open = open
+
+    def safe_open(file, mode="r", *args, **kwargs):
+        file_path = Path(file).resolve()
+        if "w" in mode or "a" in mode or "x" in mode:
+            if not str(file_path).startswith(str(workspace_path.resolve())):
+                raise PermissionError(
+                    f"Write access denied: {file_path} is outside workspace. "
+                    f"Only files under {workspace_path} can be written."
+                )
+        if "b" in mode and ("w" in mode or "a" in mode):
+            raise PermissionError("Binary write mode not allowed in custom code.")
+        return _real_open(file, mode, *args, **kwargs)
+
+    return safe_open
+
+
+# ---------------------------------------------------------------------------
 # Android Resource Tools — structured color/style/theme operations
 # ---------------------------------------------------------------------------
 
@@ -2337,6 +2496,8 @@ ALL_TOOLS = [
     find_app_styles,
     replace_colors,
     list_drawables,
+    # Custom code execution (advanced escape hatch)
+    execute_custom_code,
     # Patching
     apply_smali_patch,
     preview_smali_patch,

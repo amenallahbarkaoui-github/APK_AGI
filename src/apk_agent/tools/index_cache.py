@@ -19,7 +19,11 @@ import os
 import re
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+# Thread pool for parallel file indexing
+_INDEX_POOL = ThreadPoolExecutor(max_workers=8)
 
 # ---------------------------------------------------------------------------
 # Regex patterns
@@ -42,6 +46,9 @@ def build_code_index(
     progress_callback=None,
 ) -> dict:
     """Build a comprehensive index of all classes/methods/strings.
+
+    Uses ThreadPoolExecutor for parallel file I/O and parsing (8 workers).
+    Each worker produces a partial index that is merged into the main index.
 
     Args:
         smali_dirs: All smali directories (smali/, smali_classes2/, ...).
@@ -66,89 +73,55 @@ def build_code_index(
     if jadx_dir is not None:
         jadx_dir = Path(jadx_dir)
 
-    total_files = 0
-    for sd in smali_dirs:
-        if sd.is_dir():
-            for root, _, files in os.walk(sd):
-                total_files += sum(1 for f in files if f.endswith(".smali"))
-
-    files_scanned = 0
-    total_methods = 0
-
+    # Collect all smali file paths
+    file_tasks: list[tuple[Path, Path]] = []  # (fpath, base_dir)
     for sd in smali_dirs:
         if not sd.is_dir():
             continue
         for root, _, files in os.walk(sd):
             for fname in files:
-                if not fname.endswith(".smali"):
-                    continue
-                files_scanned += 1
+                if fname.endswith(".smali"):
+                    file_tasks.append((Path(root) / fname, sd))
 
-                if progress_callback and files_scanned % 50 == 0:
-                    pct = files_scanned / max(total_files, 1) * 100
-                    progress_callback(pct, f"Indexing: {files_scanned}/{total_files}")
+    total_files = len(file_tasks)
+    files_done = [0]
+    total_methods = 0
 
-                fpath = Path(root) / fname
-                try:
-                    text = fpath.read_text(encoding="utf-8", errors="replace")
-                except Exception:
-                    continue
+    # Parse files in parallel — each returns a partial result
+    def _index_worker(args: tuple[Path, Path]) -> dict | None:
+        fpath, base_dir = args
+        return _parse_smali_for_index(fpath, base_dir)
 
-                rel_path = str(fpath.relative_to(sd))
-                class_match = _RE_CLASS.search(text)
-                if not class_match:
-                    continue
+    futures = {_INDEX_POOL.submit(_index_worker, task): task for task in file_tasks}
+    for future in as_completed(futures):
+        try:
+            data = future.result(timeout=60)
+            if data is None:
+                continue
 
-                class_name = class_match.group(1)
-                super_match = _RE_SUPER.search(text)
-                super_class = super_match.group(1) if super_match else ""
-                interfaces = _RE_INTERFACE.findall(text)
+            class_name = data["class_name"]
+            index["classes"][class_name] = data["class_info"]
 
-                # Methods
-                methods = []
-                for m in _RE_METHOD.finditer(text):
-                    access = m.group(1).strip()
-                    name = m.group(2)
-                    params = m.group(3)
-                    ret = m.group(4)
-                    full_sig = f"{name}({params}){ret}"
-                    full_name = f"{class_name}->{name}"
-                    methods.append({
-                        "name": name,
-                        "signature": full_sig,
-                        "access": access,
-                    })
-                    total_methods += 1
-                    # Method reverse index
-                    index["method_index"].setdefault(name, []).append(full_name)
+            # Merge method index
+            for method_name, full_names in data["method_refs"].items():
+                index["method_index"].setdefault(method_name, []).extend(full_names)
 
-                # Strings (max 30 per class)
-                strings = _RE_STRING.findall(text)[:30]
-                for s in strings:
-                    if len(s) >= 3:  # Skip tiny strings
-                        index["strings"].setdefault(s[:100], []).append(class_name)
+            # Merge string index
+            for s, cls_list in data["string_refs"].items():
+                index["strings"].setdefault(s, []).extend(cls_list)
 
-                # Fields
-                fields = [f.strip()[:100] for f in _RE_FIELD.findall(text)][:20]
+            # Track packages
+            pkg = data["package"]
+            index["packages"].setdefault(pkg, []).append(class_name)
 
-                # Package
-                pkg = _class_to_package(class_name)
+            total_methods += data["method_count"]
 
-                # Store class info
-                index["classes"][class_name] = {
-                    "file": rel_path,
-                    "super": super_class,
-                    "interfaces": interfaces,
-                    "methods": methods,
-                    "method_count": len(methods),
-                    "fields": fields[:10],
-                    "field_count": len(fields),
-                    "string_count": len(strings),
-                    "line_count": text.count("\n"),
-                    "package": pkg,
-                }
-
-                index["packages"].setdefault(pkg, []).append(class_name)
+            files_done[0] += 1
+            if progress_callback and files_done[0] % 50 == 0:
+                pct = files_done[0] / max(total_files, 1) * 100
+                progress_callback(pct, f"Indexing: {files_done[0]}/{total_files}")
+        except Exception:
+            continue
 
     # Also index JADX Java files (just package + class names)
     jadx_classes = 0
@@ -172,7 +145,7 @@ def build_code_index(
             index["method_index"][name] = refs[:10]
 
     index["stats"] = {
-        "total_smali_files": files_scanned,
+        "total_smali_files": files_done[0],
         "total_classes": len(index["classes"]),
         "total_methods": total_methods,
         "total_packages": len(index["packages"]),
@@ -181,6 +154,81 @@ def build_code_index(
     }
 
     return index
+
+
+def _parse_smali_for_index(fpath: Path, base_dir: Path) -> dict | None:
+    """Parse a single smali file for indexing (thread-safe, no shared state).
+
+    Returns:
+        Dict with class_name, class_info, method_refs, string_refs, package, method_count.
+        Or None if the file can't be parsed.
+    """
+    try:
+        text = fpath.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+
+    rel_path = str(fpath.relative_to(base_dir))
+    class_match = _RE_CLASS.search(text)
+    if not class_match:
+        return None
+
+    class_name = class_match.group(1)
+    super_match = _RE_SUPER.search(text)
+    super_class = super_match.group(1) if super_match else ""
+    interfaces = _RE_INTERFACE.findall(text)
+
+    # Methods
+    methods = []
+    method_refs: dict[str, list[str]] = {}
+    for m in _RE_METHOD.finditer(text):
+        access = m.group(1).strip()
+        name = m.group(2)
+        params = m.group(3)
+        ret = m.group(4)
+        full_sig = f"{name}({params}){ret}"
+        full_name = f"{class_name}->{name}"
+        methods.append({
+            "name": name,
+            "signature": full_sig,
+            "access": access,
+        })
+        method_refs.setdefault(name, []).append(full_name)
+
+    # Strings (max 30 per class)
+    string_refs: dict[str, list[str]] = {}
+    strings = _RE_STRING.findall(text)[:30]
+    for s in strings:
+        if len(s) >= 3:
+            string_refs.setdefault(s[:100], []).append(class_name)
+
+    # Fields
+    fields = [f.strip()[:100] for f in _RE_FIELD.findall(text)][:20]
+
+    # Package
+    pkg = _class_to_package(class_name)
+
+    class_info = {
+        "file": rel_path,
+        "super": super_class,
+        "interfaces": interfaces,
+        "methods": methods,
+        "method_count": len(methods),
+        "fields": fields[:10],
+        "field_count": len(fields),
+        "string_count": len(strings),
+        "line_count": text.count("\n"),
+        "package": pkg,
+    }
+
+    return {
+        "class_name": class_name,
+        "class_info": class_info,
+        "method_refs": method_refs,
+        "string_refs": string_refs,
+        "package": pkg,
+        "method_count": len(methods),
+    }
 
 
 def _class_to_package(class_name: str) -> str:
