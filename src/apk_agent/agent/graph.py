@@ -68,26 +68,51 @@ def agent_node(state: AgentState) -> dict:
     # Inject durable findings summary as a reminder (survives compaction)
     findings = state.get("findings") or []
     patches = state.get("patch_results") or []
-    if findings or patches:
-        summary_parts = []
-        if findings:
-            by_sev: dict[str, int] = {}
-            for f in findings:
-                s = f.get("severity", "info")
-                by_sev[s] = by_sev.get(s, 0) + 1
-            summary_parts.append(f"📋 Findings: {dict(by_sev)}")
-            # Show top critical/high
-            critical = [f for f in findings if f.get("severity") in ("CRITICAL", "critical", "HIGH", "high")]
-            for c in critical[:8]:
-                summary_parts.append(f"  • [{c.get('severity','')}] {c.get('name','')}: {c.get('file','')}")
-        if patches:
-            ok = sum(1 for p in patches if p.get("success"))
-            summary_parts.append(f"🔧 Patches applied: {ok}/{len(patches)}")
-        findings_msg = "\n".join(summary_parts)
+    graph_ready = state.get("graph_ready", False)
+    target_pkgs = state.get("target_packages") or []
+    excluded_pkgs = state.get("excluded_packages") or []
+
+    # Always inject state awareness (even without findings)
+    summary_parts = []
+
+    # Graph / index status — critical for tool selection
+    if graph_ready:
+        summary_parts.append(
+            "⚡ Code graph + index: READY — use graph_callers, graph_callees, "
+            "graph_security_scan, graph_find_path, index_lookup_* for instant results. "
+            "These are 100x faster than search tools."
+        )
+    else:
+        summary_parts.append(
+            "⏳ Code graph: NOT BUILT YET — run apktool_decompile first (it auto-builds the graph)."
+        )
+
+    # Package scope — critical for avoiding third-party SDK noise
+    if target_pkgs:
+        summary_parts.append(f"🎯 App packages (YOUR SCOPE): {', '.join(target_pkgs)}")
+    if excluded_pkgs:
+        summary_parts.append(f"🚫 Excluded SDKs: {len(excluded_pkgs)} third-party packages auto-filtered")
+
+    if findings:
+        by_sev: dict[str, int] = {}
+        for f in findings:
+            s = f.get("severity", "info")
+            by_sev[s] = by_sev.get(s, 0) + 1
+        summary_parts.append(f"📋 Findings: {dict(by_sev)}")
+        # Show top critical/high
+        critical = [f for f in findings if f.get("severity") in ("CRITICAL", "critical", "HIGH", "high")]
+        for c in critical[:8]:
+            summary_parts.append(f"  • [{c.get('severity','')}] {c.get('name','')}: {c.get('file','')}")
+    if patches:
+        ok = sum(1 for p in patches if p.get("success"))
+        summary_parts.append(f"🔧 Patches applied: {ok}/{len(patches)}")
+
+    if summary_parts:
+        state_msg = "\n".join(summary_parts)
         # Insert after system prompt
         insert_idx = 1 if isinstance(messages[0], SystemMessage) else 0
         messages.insert(insert_idx, HumanMessage(
-            content=f"[DURABLE STATE — findings & patches so far]\n{findings_msg}"
+            content=f"[DURABLE STATE — graph, scope, findings & patches]\n{state_msg}"
         ))
 
     # --- Auto-compact check ---
@@ -394,6 +419,20 @@ def tools_postprocess(state: AgentState) -> dict:
             except (json.JSONDecodeError, KeyError):
                 pass
 
+        # Extract app package scope from identify_app_packages
+        if tool_name == "identify_app_packages":
+            try:
+                data = json.loads(content)
+                if isinstance(data, dict):
+                    app_pkgs = data.get("app_packages") or data.get("target_packages") or []
+                    excluded = data.get("excluded_packages") or data.get("third_party_packages") or []
+                    if app_pkgs:
+                        updates["target_packages"] = app_pkgs
+                    if excluded:
+                        updates["excluded_packages"] = excluded
+            except (json.JSONDecodeError, KeyError):
+                pass
+
         # Extract patch results
         if tool_name == "apply_smali_patch":
             try:
@@ -413,6 +452,25 @@ def tools_postprocess(state: AgentState) -> dict:
             try:
                 _auto_build_graph_and_index()
                 updates["graph_ready"] = True
+                # Inject a visible message so the agent KNOWS graph is ready
+                from apk_agent.agent.tools_def import _code_graph, _code_index
+                import apk_agent.agent.tools_def as td
+                g = td._code_graph
+                idx = td._code_index
+                graph_info = ""
+                if g:
+                    graph_info += f"{g.number_of_nodes()} nodes, {g.number_of_edges()} edges"
+                if idx and isinstance(idx, dict) and "stats" in idx:
+                    s = idx["stats"]
+                    graph_info += f", {s.get('total_classes', '?')} classes, {s.get('total_methods', '?')} methods indexed"
+                notify_msg = HumanMessage(content=(
+                    f"[SYSTEM] ⚡ Code graph + index built successfully ({graph_info}). "
+                    "You MUST now use graph tools (graph_callers, graph_callees, graph_security_scan, "
+                    "graph_find_path, graph_class_info, index_lookup_*) instead of slow search tools. "
+                    "They are 100x faster and give better results."
+                ))
+                # Append notification to messages via state update
+                updates.setdefault("messages", []).append(notify_msg)
             except Exception as e:
                 logger.error(f"Auto graph/index build FAILED: {e}")
                 updates["graph_ready"] = False
