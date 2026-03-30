@@ -682,11 +682,25 @@ def _show_token_count() -> None:
 # ---------------------------------------------------------------------------
 
 def _run_orchestrator_turn(user_input: str, project, config) -> None:
-    """Run a full orchestrator turn with parallel sub-agents."""
+    """Run an orchestrator turn — either dispatch sub-agents or chat."""
     from apk_agent.agent.orchestrator import Orchestrator
     from apk_agent.ui import print_orchestrator_plan, print_progress_summary, print_sub_agent_result
 
     orchestrator = Orchestrator(config, project, max_parallel=3)
+
+    # Route: does this need sub-agents or is it a conversational message?
+    route = orchestrator.route_message(user_input)
+
+    if route == "chat":
+        # Conversational response using previous results
+        console.print("[dim]💬 Answering from previous results...[/]")
+        try:
+            answer = orchestrator.chat(user_input)
+            from apk_agent.ui import print_ai_message
+            print_ai_message(answer)
+        except Exception as e:
+            print_error(f"Chat error: {e}")
+        return
 
     def _callback(event: str, data):
         if event == "plan_created":

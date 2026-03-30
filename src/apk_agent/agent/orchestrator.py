@@ -478,7 +478,16 @@ def run_sub_agent(
 # ---------------------------------------------------------------------------
 
 class Orchestrator:
-    """High-level orchestrator that plans and dispatches sub-agent tasks."""
+    """High-level orchestrator that plans and dispatches sub-agent tasks.
+
+    Supports two interaction modes:
+    - dispatch: break task into sub-agents and run them in parallel
+    - chat: answer conversationally using previous results as context
+    """
+
+    # Class-level storage for results across turns so follow-up questions work
+    _previous_results: list[dict] = []
+    _conversation_history: list[dict] = []  # [{"role":"user","content":...}, ...]
 
     def __init__(self, config: AppConfig, project: Project, max_parallel: int = 3):
         self.config = config
@@ -486,6 +495,101 @@ class Orchestrator:
         self.max_parallel = max_parallel
         self.progress = progress_manager
         self.results: list[dict] = []
+
+    def route_message(self, user_input: str) -> str:
+        """Classify user input: 'dispatch' (needs sub-agents) or 'chat' (conversational).
+
+        Returns 'dispatch' or 'chat'.
+        """
+        # If no previous results, always dispatch (nothing to chat about)
+        if not Orchestrator._previous_results:
+            return "dispatch"
+
+        llm = get_llm(self.config, temperature=0.0)
+        route_prompt = (
+            "You are a router for an APK security analysis orchestrator.\n"
+            "The user is in orchestrator mode. Previous analysis results exist.\n\n"
+            "Classify the user's message into ONE of these categories:\n"
+            "- DISPATCH: The user wants NEW analysis, scanning, patching, or a task "
+            "that requires running tools and sub-agents (e.g., 'scan for SSL issues', "
+            "'find crypto algorithms', 'bypass root detection', 'do a full audit').\n"
+            "- CHAT: The user is asking a question, requesting clarification, "
+            "discussing previous results, asking for a summary, or having a conversation "
+            "that does NOT require new sub-agent work (e.g., 'what did you find?', "
+            "'explain the crypto issue', 'show me the results', 'what is AES?', "
+            "'which classes are vulnerable?').\n\n"
+            f"Previous analysis agents used: "
+            f"{', '.join(r.get('role', '?') for r in Orchestrator._previous_results)}\n\n"
+            f"User message: {user_input}\n\n"
+            "Reply with ONLY one word: DISPATCH or CHAT"
+        )
+        try:
+            response = llm.invoke([HumanMessage(content=route_prompt)])
+            answer = response.content.strip().upper()
+            if "CHAT" in answer:
+                return "chat"
+        except Exception as e:
+            logger.warning("Route classification failed: %s — defaulting to dispatch", e)
+
+        return "dispatch"
+
+    def chat(self, user_input: str) -> str:
+        """Answer conversationally using previous results as context."""
+        llm = get_llm(self.config, temperature=1.0)
+
+        # Build context from previous results
+        context_parts = []
+        for r in Orchestrator._previous_results:
+            result_text = r.get("result", "")
+            role = r.get("role", "unknown")
+            if len(result_text) > 4000:
+                result_text = result_text[:3000] + "\n...\n" + result_text[-1000:]
+            context_parts.append(f"### {role}\n{result_text}")
+
+        # Build conversation history
+        history_msgs = []
+        for entry in Orchestrator._conversation_history[-6:]:  # last 6 turns
+            if entry["role"] == "user":
+                history_msgs.append(f"User: {entry['content']}")
+            else:
+                history_msgs.append(f"Assistant: {entry['content'][:500]}")
+        history_text = "\n".join(history_msgs) if history_msgs else "(no prior conversation)"
+
+        chat_prompt = (
+            f"You are an APK security analysis expert assistant.\n"
+            f"The user is in orchestrator mode and has already run analysis on: "
+            f"{self.project.apk_name}\n\n"
+            f"## Previous Analysis Results\n\n"
+            f"{''.join(context_parts)}\n\n"
+            f"## Recent Conversation\n{history_text}\n\n"
+            f"## User's Current Message\n{user_input}\n\n"
+            f"Answer the user's question based on the analysis results above. "
+            f"Be specific — reference exact class names, file paths, algorithms, "
+            f"and findings from the results. If the user asks for something that "
+            f"requires new analysis, tell them you'll need to run sub-agents and "
+            f"suggest they phrase it as a task."
+        )
+        try:
+            response = llm.invoke([HumanMessage(content=chat_prompt)])
+            content = response.content
+            if isinstance(content, list):
+                parts = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        parts.append(block.get("text", ""))
+                    elif isinstance(block, str):
+                        parts.append(block)
+                content = "\n".join(parts)
+            answer = content.strip() if isinstance(content, str) else str(content)
+        except Exception as e:
+            logger.error("Chat failed: %s", e)
+            answer = f"Error generating response: {e}"
+
+        # Update conversation history
+        Orchestrator._conversation_history.append({"role": "user", "content": user_input})
+        Orchestrator._conversation_history.append({"role": "assistant", "content": answer})
+
+        return answer
 
     def plan_and_execute(self, user_task: str, callback=None) -> list[dict]:
         """Plan sub-tasks from the user's request and execute them.
@@ -551,6 +655,14 @@ class Orchestrator:
                 results.append(result)
 
         self.results = results
+        # Store results at class level so follow-up messages can reference them
+        Orchestrator._previous_results = results
+        Orchestrator._conversation_history.append(
+            {"role": "user", "content": user_task}
+        )
+        Orchestrator._conversation_history.append(
+            {"role": "assistant", "content": f"[Dispatched {len(results)} sub-agents]"}
+        )
         return results
 
     def _create_plan(self, user_task: str) -> dict:

@@ -37,6 +37,8 @@ _CACHEABLE_TOOLS = frozenset({
     "graph_find_path", "graph_security_scan", "graph_stats",
     "index_lookup_class", "index_lookup_method",
     "index_lookup_string", "index_lookup_package",
+    "find_entry_points", "map_hierarchy",
+    "analyze_shared_prefs", "scan_assets_secrets",
 })
 
 
@@ -2135,6 +2137,14 @@ ALL_TOOLS = [
     patch_manifest_security,
     remove_ads,
     list_bypass_categories,
+    # Deep Analysis
+    validate_patch,
+    find_entry_points,
+    map_hierarchy,
+    analyze_shared_prefs,
+    extract_native_strings,
+    scan_assets_secrets,
+    diff_patched_file,
     # Build & Sign
     apktool_build,
     zipalign_apk_tool,
