@@ -8,6 +8,7 @@ All tools are wrapped with error recovery — they never crash the agent.
 from __future__ import annotations
 
 import json
+import re
 import traceback
 import uuid
 from pathlib import Path
@@ -20,6 +21,7 @@ from apk_agent.progress import progress_manager, TaskStatus, set_current_task
 # We use a module-level config holder that gets set at graph construction time.
 _config = None
 _project = None
+_auto_mode = False  # Set by CLI — skips all interrupts when True
 
 # ---------------------------------------------------------------------------
 # Tool result cache — avoids re-running expensive scans with same args
@@ -1686,6 +1688,15 @@ def ask_user(question: str, options: str = "") -> str:
         options: Optional comma-separated list of choices (e.g., "retry,skip,alternative").
             If empty, user gives free-form response.
     """
+    # In auto mode, skip the interrupt entirely — return immediately
+    if _auto_mode:
+        return json.dumps({
+            "success": True,
+            "question": question,
+            "user_response": "Proceed with your best judgment — auto mode is ON.",
+            "auto_mode": True,
+        }, ensure_ascii=False)
+
     from langgraph.types import interrupt
 
     # Build the prompt
@@ -1739,45 +1750,87 @@ def _get_task_plan() -> list[dict]:
 # Custom Code Execution — advanced escape hatch for truly custom operations
 # ---------------------------------------------------------------------------
 
-# Blocked operations (patterns in code that are never allowed)
+# Blocked operations (patterns checked against CODE ONLY, not comments/strings)
 _CUSTOM_CODE_BLOCKED_PATTERNS = [
     r"\bsubprocess\b", r"\bos\.system\b", r"\bos\.popen\b",
     r"\bos\.exec\b", r"\bos\.spawn\b", r"\bos\.remove\b",
     r"\bos\.unlink\b", r"\bos\.rmdir\b", r"\bshutil\.rmtree\b",
-    r"\bshutil\.move\b", r"\b__import__\b",
+    r"\bshutil\.move\b",
     r"\bglobals\b", r"\bsocket\b",
     r"\burllib\b", r"\brequests\b", r"\bhttp\.client\b",
 ]
 
+# Modules the sandbox is allowed to import
+_CUSTOM_CODE_SAFE_MODULES = {
+    "re", "json", "math", "string", "base64", "hashlib", "hmac",
+    "binascii", "struct", "io", "collections", "itertools", "functools",
+    "operator", "textwrap", "difflib", "copy", "pprint", "dataclasses",
+    "typing", "enum", "abc", "contextlib", "decimal", "fractions",
+    "statistics", "unicodedata", "codecs", "fnmatch", "glob",
+    "xml", "xml.etree", "xml.etree.ElementTree",
+    "pathlib", "posixpath", "ntpath",
+    "csv", "configparser", "html", "html.parser",
+}
+
+
+def _strip_comments_and_strings(code: str) -> str:
+    """Remove comments and string literals so blocked-pattern checks
+    don't false-positive on words inside comments/strings."""
+    # Remove single-line comments
+    stripped = re.sub(r'#[^\n]*', '', code)
+    # Remove triple-quoted strings (both kinds)
+    stripped = re.sub(r'"""[\s\S]*?"""', '""', stripped)
+    stripped = re.sub(r"'''[\s\S]*?'''", "''", stripped)
+    # Remove regular strings
+    stripped = re.sub(r'"(?:[^"\\]|\\.)*"', '""', stripped)
+    stripped = re.sub(r"'(?:[^'\\]|\\.)*'", "''", stripped)
+    return stripped
+
+
+def _make_safe_import(safe_modules: set[str]):
+    """Create a restricted __import__ that only allows whitelisted modules."""
+    _real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
+
+    def safe_import(name, *args, **kwargs):
+        # Allow the module itself or any sub-module of an allowed parent
+        top = name.split(".")[0]
+        if name not in safe_modules and top not in safe_modules:
+            raise ImportError(
+                f"Module '{name}' is not allowed in the sandbox. "
+                f"Allowed: {', '.join(sorted(safe_modules))}"
+            )
+        return _real_import(name, *args, **kwargs)
+
+    return safe_import
+
 
 @tool
 def execute_custom_code(code: str, description: str) -> str:
-    """Execute custom Python code for operations not covered by existing tools.
+    """Execute custom Python code in a sandbox. USE ONLY WHEN NO EXISTING TOOL WORKS.
 
-    USE THIS ONLY WHEN NO EXISTING TOOL CAN DO THE JOB.
-    This is your escape hatch for truly custom file analysis, pattern extraction,
-    binary parsing, or complex multi-file transformations.
+    IMPORTANT: Keep code SHORT and SIMPLE to avoid JSON serialization errors.
+    Use semicolons to join statements. Avoid triple-quotes and backslashes.
 
-    STRICT RULES:
-    - Code runs in a RESTRICTED sandbox (no subprocess, no network, no file deletion)
-    - Only READ operations and writes under the workspace are allowed
-    - Available variables: `workspace_path`, `apktool_dir`, `jadx_dir` (all as Path objects)
-    - Must return a result via `result = ...` variable
-    - Max code length: 5000 characters
-    - Max output: 10000 characters
+    Sandbox rules:
+    - No subprocess, network, or file deletion
+    - Writes only under workspace
+    - Set `result = ...` for output
+    - Max 5000 chars code, 10000 chars output
 
     Args:
-        code: Python code to execute. Must be self-contained.
-              Available pre-imported: os.path, os.walk, os.listdir, re, json, Path, ET (xml.etree.ElementTree)
-              Available variables: workspace_path, apktool_dir, jadx_dir
-        description: Brief description of what this code does and WHY no existing tool works.
+        code: Short Python code. Pre-imported: os.path, re, json, Path, ET.
+              Can import: hashlib, base64, struct, math, collections, itertools, io, csv, etc.
+              Variables: workspace_path, apktool_dir, jadx_dir (Path objects).
+              KEEP IT SIMPLE — prefer one-liners joined with semicolons.
+        description: What this code does and why no existing tool works.
     """
     import traceback
 
     def _run():
-        # --- Safety checks ---
+        # --- Safety checks (strip comments/strings first to avoid false positives) ---
+        code_only = _strip_comments_and_strings(code)
         for pattern in _CUSTOM_CODE_BLOCKED_PATTERNS:
-            if re.search(pattern, code):
+            if re.search(pattern, code_only):
                 return json.dumps({
                     "success": False,
                     "error": f"Blocked operation detected: {pattern}. "
@@ -1798,8 +1851,13 @@ def execute_custom_code(code: str, description: str) -> str:
         apktool_dir = _project.apktool_dir
         jadx_dir = _project.jadx_dir
 
+        safe_import = _make_safe_import(_CUSTOM_CODE_SAFE_MODULES)
+
         restricted_globals = {
             "__builtins__": {
+                "__import__": safe_import,
+                "__name__": "__main__",
+                "__build_class__": __build_class__,
                 "len": len, "range": range, "enumerate": enumerate,
                 "zip": zip, "map": map, "filter": filter, "sorted": sorted,
                 "reversed": reversed, "list": list, "dict": dict, "set": set,
@@ -1811,10 +1869,24 @@ def execute_custom_code(code: str, description: str) -> str:
                 "min": min, "max": max, "sum": sum, "abs": abs,
                 "any": any, "all": all, "ord": ord, "chr": chr,
                 "hex": hex, "bin": bin, "oct": oct,
+                "round": round, "pow": pow, "divmod": divmod,
+                "format": format, "id": id, "hash": hash,
+                "callable": callable, "iter": iter, "next": next,
+                "slice": slice, "property": property, "staticmethod": staticmethod,
+                "classmethod": classmethod, "super": super,
+                "frozenset": frozenset, "memoryview": memoryview,
+                "complex": complex,
                 "open": _make_safe_open(workspace_path),
                 "ValueError": ValueError, "KeyError": KeyError,
                 "TypeError": TypeError, "IndexError": IndexError,
+                "AttributeError": AttributeError, "RuntimeError": RuntimeError,
+                "FileNotFoundError": FileNotFoundError, "OSError": OSError,
+                "PermissionError": PermissionError, "NotImplementedError": NotImplementedError,
                 "StopIteration": StopIteration, "Exception": Exception,
+                "ImportError": ImportError, "ModuleNotFoundError": ModuleNotFoundError,
+                "UnicodeDecodeError": UnicodeDecodeError, "UnicodeEncodeError": UnicodeEncodeError,
+                "IOError": IOError, "EOFError": EOFError,
+                "ZeroDivisionError": ZeroDivisionError, "OverflowError": OverflowError,
                 "True": True, "False": False, "None": None,
             },
             "os": type("SafeOS", (), {

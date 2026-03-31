@@ -76,7 +76,12 @@ def load_session_meta(project_path: str | Path) -> Optional[SessionMeta]:
         return None
     try:
         data = json.loads(mp.read_text(encoding="utf-8"))
-        return SessionMeta(**data)
+        # Backwards compatibility: strip unknown fields and apply defaults
+        # for fields added after initial release (e.g. auto_mode)
+        import dataclasses
+        valid_fields = {f.name for f in dataclasses.fields(SessionMeta)}
+        filtered = {k: v for k, v in data.items() if k in valid_fields}
+        return SessionMeta(**filtered)
     except Exception as e:
         logger.warning("Failed to load session meta: %s", e)
         return None

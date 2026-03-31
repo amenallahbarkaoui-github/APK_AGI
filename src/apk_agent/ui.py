@@ -204,6 +204,52 @@ def print_status(
     ))
 
 
+def print_task_plan(plan: list[dict]) -> None:
+    """Display the agent's current task plan in a compact table."""
+    if not plan:
+        return
+
+    status_icons = {
+        "pending": "[dim]⏳[/]",
+        "in_progress": "[yellow]🔄[/]",
+        "done": "[green]✅[/]",
+        "failed": "[red]❌[/]",
+        "skipped": "[dim]⏭️[/]",
+    }
+
+    table = Table(
+        title="📋 Task Plan",
+        show_header=True,
+        header_style="bold cyan",
+        border_style="dim",
+        padding=(0, 1),
+    )
+    table.add_column("#", style="bold", width=3)
+    table.add_column("Task", min_width=30)
+    table.add_column("Status", width=14)
+
+    done = 0
+    total = len(plan)
+    for t in plan:
+        tid = str(t.get("id", "?"))
+        desc = t.get("desc", t.get("description", "—"))
+        status = t.get("status", "pending")
+        icon = status_icons.get(status, f"[dim]{status}[/]")
+        if status == "done":
+            done += 1
+            style = "dim green"
+        elif status == "in_progress":
+            style = "bold yellow"
+        elif status == "failed":
+            style = "red"
+        else:
+            style = ""
+        table.add_row(tid, f"[{style}]{desc}[/]" if style else desc, icon)
+
+    console.print(table)
+    console.print(f"  [dim]Progress: {done}/{total} completed[/]")
+
+
 def print_progress_summary(summary: dict) -> None:
     """Print a progress summary from the ProgressManager."""
     elapsed = summary.get("elapsed", 0)
@@ -327,6 +373,7 @@ def print_help() -> None:
   [cyan]/logs[/]               — Show recent tool logs
   [cyan]/report[/]             — Generate/show the report
   [cyan]/progress[/]           — Show task progress summary
+  [cyan]/plan[/]               — Show the agent's current task plan
   [cyan]/auto[/]               — Full auto mode (no confirmations, one-shot deep run)
   [cyan]/orchestrator[/]       — Switch to orchestrator mode (parallel sub-agents)
   [cyan]/normal[/]             — Switch back to normal chat mode

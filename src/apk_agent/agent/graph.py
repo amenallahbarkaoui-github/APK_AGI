@@ -238,6 +238,8 @@ def agent_node(state: AgentState) -> dict:
                 "503", "service unavailable", "overloaded",
                 "500", "internal server error",
                 "tool name is required",
+                "must be in json format", "invalidparameter",
+                "invalid_parameter_error",
             ])
             # On "tool name is required" errors, re-sanitize before retry
             if "tool name is required" in err_str:
@@ -247,6 +249,28 @@ def agent_node(state: AgentState) -> dict:
                 for _m in messages:
                     if isinstance(_m, AIMessage) and _m.tool_calls:
                         _m.tool_calls = [tc for tc in _m.tool_calls if tc.get("name")]
+            # On "must be in json format" errors — the LLM produced malformed
+            # tool call arguments (commonly from multi-line code strings).
+            # Strip the last AIMessage with bad tool_calls and tell the LLM
+            # to retry with simpler arguments.
+            if "must be in json format" in err_str or "invalidparameter" in err_str:
+                logger.warning("Malformed tool-call JSON — stripping bad AI message and retrying...")
+                # Remove the last AIMessage that had broken tool_calls
+                while messages and isinstance(messages[-1], AIMessage):
+                    messages.pop()
+                messages.append(HumanMessage(
+                    content=(
+                        "[SYSTEM] Your previous tool call failed because the arguments "
+                        "were not valid JSON. This usually happens with multi-line code "
+                        "in execute_custom_code. RULES FOR RETRY:\n"
+                        "1. Keep code SHORT — prefer using existing tools instead of execute_custom_code\n"
+                        "2. If you must use execute_custom_code, use SIMPLE one-liner code\n"
+                        "3. Avoid triple-quotes, backslashes, and special chars in code strings\n"
+                        "4. Use semicolons to join statements on one line\n"
+                        "5. Prefer read_file, smart_search, context_search over custom code\n"
+                        "Now proceed with your task using a different approach."
+                    )
+                ))
             # 403 "API key limit" = quota exhausted, not retryable
             if not is_retryable or attempt >= max_retries:
                 raise
@@ -301,6 +325,11 @@ _MAX_NUDGES = 2  # max times we'll nudge the agent to call tools before allowing
 def should_continue(state: AgentState) -> Literal["tools", "human_review", "nudge", "__end__"]:
     """Route after agent node: tool call → tools, text-only → nudge or end."""
     global _consecutive_no_tool_count
+
+    if not state["messages"]:
+        _consecutive_no_tool_count = 0
+        return "__end__"
+
     last_msg = state["messages"][-1]
 
     if not isinstance(last_msg, AIMessage):
@@ -357,7 +386,10 @@ def human_review_node(state: AgentState) -> dict:
 
     Uses LangGraph's interrupt() to pause the graph.
     The CLI will collect user input and resume with a Command.
+    In auto mode, patches are approved instantly without interrupt.
     """
+    from apk_agent.agent.tools_def import _auto_mode
+
     last_msg = state["messages"][-1]
 
     # Build a summary of what the agent wants to do
@@ -402,6 +434,10 @@ def human_review_node(state: AgentState) -> dict:
                     )
                 )
         return {"messages": reject_msgs, "human_feedback": "rejected"}
+
+    # Auto mode: approve immediately without interrupt — saves API requests
+    if _auto_mode:
+        return {"messages": [], "human_feedback": "approved"}
 
     prompt_parts = [
         "🔒 **Human Review Required**",

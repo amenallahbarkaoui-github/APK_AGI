@@ -521,6 +521,14 @@ def _handle_command(
                 print_progress_summary(summary)
             else:
                 print_info("No tasks tracked yet.")
+        case "/plan":
+            from apk_agent.agent.tools_def import _get_task_plan
+            from apk_agent.ui import print_task_plan
+            plan = _get_task_plan()
+            if plan:
+                print_task_plan(plan)
+            else:
+                print_info("No task plan created yet. The agent creates one when starting a complex task.")
         case "/orchestrator":
             return "orchestrator_on"
         case "/normal":
@@ -563,6 +571,10 @@ def _handle_command(
 
 def _run_agent_turn(graph, graph_config: dict, user_input: str, project: Project, session_meta: SessionMeta, *, auto_mode: bool = False) -> None:
     """Run one turn of the agent with streaming output and error recovery."""
+    # Set auto_mode flag at graph/tool level so interrupts are skipped entirely
+    import apk_agent.agent.tools_def as _td
+    _td._auto_mode = auto_mode
+
     from apk_agent.progress import progress_manager
     progress_manager.set_overall_task(user_input)
 
@@ -581,6 +593,11 @@ def _run_agent_turn(graph, graph_config: dict, user_input: str, project: Project
         "current_plan": [],
         "plan_step_index": 0,
         "human_feedback": "",
+        "graph_ready": False,
+        "target_packages": [],
+        "excluded_packages": [],
+        "scratchpad": {},
+        "task_plan": [],
     }
 
     max_consecutive_errors = 3
@@ -603,14 +620,20 @@ def _run_agent_turn(graph, graph_config: dict, user_input: str, project: Project
         print_warning("Operation interrupted by user.")
     except Exception as e:
         error_str = str(e)
-        if "rate_limit" in error_str.lower() or "429" in error_str:
+        err_lower = error_str.lower()
+        if "rate_limit" in err_lower or "429" in error_str:
             print_warning("Rate limited by API. Wait a moment and try again.")
-        elif "api key limit" in error_str.lower() or ("403" in error_str and "limit" in error_str.lower()):
+        elif "api key limit" in err_lower or ("403" in error_str and "limit" in err_lower):
             print_error("API quota exhausted. Top up your API credits or wait for reset.")
-        elif "timeout" in error_str.lower():
+        elif "timeout" in err_lower:
             print_warning("API timeout. The request took too long. Try a simpler query.")
-        elif "authentication" in error_str.lower() or "401" in error_str:
+        elif "authentication" in err_lower or "401" in error_str:
             print_error("API authentication failed. Check your API_KEY in .env")
+        elif "must be in json format" in err_lower or "invalidparameter" in err_lower:
+            print_warning(
+                "LLM produced malformed tool arguments (JSON error). "
+                "This is transient — try again. If it persists, try a simpler prompt."
+            )
         else:
             print_error(f"Agent error: {e}")
             import traceback
@@ -784,11 +807,13 @@ def _process_stream_event(event: dict, graph, graph_config: dict, *, auto_mode: 
                         print_ai_message(msg.content)
                     # Show tool calls being made with args summary
                     if msg.tool_calls:
+                        n_calls = len(msg.tool_calls)
+                        if n_calls > 1:
+                            console.print(f"[dim]  ⚡ {n_calls} tools in parallel[/]")
                         for tc in msg.tool_calls:
                             args = tc.get("args", {})
                             arg_summary = ""
                             if args:
-                                # Show first few args for context
                                 parts = []
                                 for k, v in list(args.items())[:2]:
                                     v_str = str(v)[:40]
@@ -809,6 +834,17 @@ def _process_stream_event(event: dict, graph, graph_config: dict, *, auto_mode: 
                         and '"error"' not in content_start[:50]
                     )
                     print_tool_output(msg.name or "tool", msg.content, success=success)
+
+                    # Show task plan whenever it changes
+                    if msg.name in ("update_task_plan", "mark_task_done", "edit_task_plan"):
+                        try:
+                            from apk_agent.agent.tools_def import _get_task_plan
+                            from apk_agent.ui import print_task_plan
+                            plan = _get_task_plan()
+                            if plan:
+                                print_task_plan(plan)
+                        except Exception:
+                            pass
 
         elif node_name == "human_review":
             pass
