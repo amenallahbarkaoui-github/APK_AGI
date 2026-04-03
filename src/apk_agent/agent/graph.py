@@ -225,6 +225,56 @@ def agent_node(state: AgentState) -> dict:
                     name=getattr(msg, "name", None) or "unknown_tool",
                 )
 
+    # --- Final safety: ensure no orphaned tool_call_ids remain ---
+    # Build set of all valid tool_call ids from AIMessages (check BOTH
+    # .tool_calls AND additional_kwargs["tool_calls"] — LangChain uses
+    # additional_kwargs as fallback when .tool_calls is empty, so both
+    # must be consistent)
+    _valid_tc_ids: set[str] = set()
+    for msg in messages:
+        if isinstance(msg, AIMessage):
+            # Collect from .tool_calls
+            for tc in (msg.tool_calls or []):
+                tid = tc.get("id") or ""
+                if tid:
+                    _valid_tc_ids.add(tid)
+            # Also collect from additional_kwargs (the raw API format)
+            for tc in msg.additional_kwargs.get("tool_calls", []):
+                tid = tc.get("id") or ""
+                if tid:
+                    _valid_tc_ids.add(tid)
+
+    # Sync additional_kwargs["tool_calls"] with .tool_calls on every AIMessage
+    # to prevent ghost tool_calls from leaking into the API payload
+    for msg in messages:
+        if isinstance(msg, AIMessage):
+            ak_tcs = msg.additional_kwargs.get("tool_calls")
+            if ak_tcs is not None:
+                # Keep only entries whose id is in the current .tool_calls
+                current_ids = {tc.get("id") for tc in (msg.tool_calls or [])}
+                msg.additional_kwargs["tool_calls"] = [
+                    tc for tc in ak_tcs if tc.get("id") in current_ids
+                ]
+                # If .tool_calls was emptied (e.g. by loop detector), clear ak too
+                if not msg.tool_calls:
+                    msg.additional_kwargs.pop("tool_calls", None)
+
+    # Rebuild valid IDs after sync
+    _valid_tc_ids = set()
+    for msg in messages:
+        if isinstance(msg, AIMessage):
+            for tc in (msg.tool_calls or []):
+                tid = tc.get("id") or ""
+                if tid:
+                    _valid_tc_ids.add(tid)
+
+    # Drop any ToolMessage whose tool_call_id is missing or not in any AIMessage
+    messages = [
+        msg for msg in messages
+        if not isinstance(msg, ToolMessage)
+        or (msg.tool_call_id and msg.tool_call_id in _valid_tc_ids)
+    ]
+
     # Retry with exponential backoff for transient API errors
     max_retries = 3
     for attempt in range(max_retries + 1):
@@ -240,7 +290,12 @@ def agent_node(state: AgentState) -> dict:
                 "tool name is required",
                 "must be in json format", "invalidparameter",
                 "invalid_parameter_error",
+                "tool_call_id", "is not found",
             ])
+            # On "tool_call_id is not found" errors, re-sanitize to drop orphans
+            if "tool_call_id" in err_str and "not found" in err_str:
+                logger.warning("Orphaned tool_call_id error — re-sanitizing messages...")
+                messages = _sanitize_messages(messages)
             # On "tool name is required" errors, re-sanitize before retry
             if "tool name is required" in err_str:
                 logger.warning("Gemini tool-name error — re-sanitizing messages...")

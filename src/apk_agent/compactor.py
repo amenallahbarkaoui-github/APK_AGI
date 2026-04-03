@@ -230,16 +230,33 @@ class Compactor:
         compact_prompt = build_compact_prompt(old_messages)
 
         try:
-            # Use LLM to summarize
-            summary_response = llm.invoke([
-                SystemMessage(content=COMPACT_SYSTEM_PROMPT),
-                HumanMessage(content=compact_prompt),
-            ])
+            # Use LLM to summarize — retry once on empty response
+            summary_text = ""
+            for _attempt in range(2):
+                summary_response = llm.invoke([
+                    SystemMessage(content=COMPACT_SYSTEM_PROMPT),
+                    HumanMessage(content=compact_prompt),
+                ])
 
-            summary_text = summary_response.content
-            if not summary_text or not summary_text.strip():
-                logger.warning("Compactor returned empty summary. Skipping.")
-                return messages
+                # Handle content that might be a string or list of parts
+                raw_content = summary_response.content
+                if isinstance(raw_content, list):
+                    summary_text = " ".join(
+                        p.get("text", "") if isinstance(p, dict) else str(p)
+                        for p in raw_content
+                    ).strip()
+                else:
+                    summary_text = str(raw_content or "").strip()
+
+                if summary_text:
+                    break
+                logger.warning("Compactor LLM returned empty (attempt %d/2)", _attempt + 1)
+
+            if not summary_text:
+                logger.warning("Compactor returned empty summary after retries. Using fallback trim.")
+                return _sanitize_compacted(
+                    _fallback_trim(messages, system_msg, recent_messages, old_messages)
+                )
 
             self.compact_count += 1
 

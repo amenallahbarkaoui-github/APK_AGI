@@ -65,11 +65,10 @@ def _sanitize_messages(messages: list) -> list:
             else:
                 msg.content = ""
 
-    # --- Pass 0b: Fix empty/missing tool names (Gemini requirement) ---
-    # Gemini API rejects requests where tool_calls or ToolMessages have
-    # empty or None names. Ensure every tool-related name is non-empty.
+    # --- Pass 0b: Fix empty/missing tool names and ids ---
+    # APIs reject tool_calls or ToolMessages with empty name or id.
     _tool_id_to_name: dict[str, str] = {}
-    # First pass: collect name mappings from AIMessage tool_calls
+    # First sub-pass: collect name mappings from AIMessage tool_calls
     for msg in messages:
         if isinstance(msg, AIMessage) and msg.tool_calls:
             for tc in msg.tool_calls:
@@ -77,12 +76,34 @@ def _sanitize_messages(messages: list) -> list:
                 tid = tc.get("id") or ""
                 if name and tid:
                     _tool_id_to_name[tid] = name
-    # Second pass: fix empty names
+    # Second sub-pass: fix empty names, strip tool_calls with empty ids,
+    # and sync additional_kwargs["tool_calls"] to prevent ghost entries
     for msg in messages:
         if isinstance(msg, AIMessage) and msg.tool_calls:
+            # Remove tool_calls that have no id — API cannot match them
+            msg.tool_calls = [
+                tc for tc in msg.tool_calls if tc.get("id")
+            ]
             for tc in msg.tool_calls:
                 if not tc.get("name"):
                     tc["name"] = _tool_id_to_name.get(tc.get("id", ""), "unknown_tool")
+            # Also fix invalid_tool_calls if present
+            if hasattr(msg, "invalid_tool_calls") and msg.invalid_tool_calls:
+                msg.invalid_tool_calls = [
+                    tc for tc in msg.invalid_tool_calls if tc.get("id")
+                ]
+            # Sync additional_kwargs["tool_calls"] with .tool_calls
+            # LangChain falls back to additional_kwargs when .tool_calls is empty,
+            # which can leak ghost tool_call_ids to the API
+            ak_tcs = msg.additional_kwargs.get("tool_calls")
+            if ak_tcs is not None:
+                current_ids = {tc.get("id") for tc in msg.tool_calls}
+                msg.additional_kwargs["tool_calls"] = [
+                    tc for tc in ak_tcs if tc.get("id") in current_ids
+                ]
+        if isinstance(msg, AIMessage) and not msg.tool_calls:
+            # If tool_calls was fully emptied, also clear additional_kwargs
+            msg.additional_kwargs.pop("tool_calls", None)
         if isinstance(msg, ToolMessage):
             if not getattr(msg, "name", None):
                 msg.name = _tool_id_to_name.get(msg.tool_call_id, "unknown_tool")
@@ -181,7 +202,30 @@ def _sanitize_messages(messages: list) -> list:
                     sanitized.append(synthetic)
                     existing_tool_result_ids.add(tc["id"])
 
-    return sanitized
+    # --- Pass 3: Drop orphaned ToolMessages without matching AIMessage tool_call ---
+    # After compaction or session resume, ToolMessages may reference tool_call_ids
+    # that no longer exist in any AIMessage. The API rejects these.
+    all_ai_tool_ids: set[str] = set()
+    for msg in sanitized:
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for tc in msg.tool_calls:
+                tid = tc.get("id") or ""
+                if tid:
+                    all_ai_tool_ids.add(tid)
+
+    pass3 = []
+    for msg in sanitized:
+        if isinstance(msg, ToolMessage):
+            tid = msg.tool_call_id or ""
+            if not tid or tid not in all_ai_tool_ids:
+                logger.debug(
+                    "Dropping orphaned ToolMessage (tool_call_id=%r not in any AIMessage)",
+                    tid[:20] if tid else "<empty>",
+                )
+                continue
+        pass3.append(msg)
+
+    return pass3
 
 
 # ---------------------------------------------------------------------------
