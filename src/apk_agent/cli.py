@@ -65,9 +65,9 @@ def _print_startup() -> None:
     """Print the full-screen startup banner."""
     console.print()
     console.print("[bold cyan]╔══════════════════════════════════════════════════════╗[/]")
-    console.print("[bold cyan]║[/]     [bold white]🔬 APK Agent v2.0.0[/]                            [bold cyan]║[/]")
+    console.print("[bold cyan]║[/]     [bold white]🔬 APK Agent v3.0.0[/]                            [bold cyan]║[/]")
     console.print("[bold cyan]║[/]     [dim]Interactive APK Reverse Engineering[/]            [bold cyan]║[/]")
-    console.print("[bold cyan]║[/]     [dim]40+ tools • Sub-agents • Parallel execution[/]   [bold cyan]║[/]")
+    console.print("[bold cyan]║[/]     [dim]70+ tools • Sub-agents • Parallel execution[/]   [bold cyan]║[/]")
     console.print("[bold cyan]╚══════════════════════════════════════════════════════╝[/]")
     console.print()
 
@@ -169,7 +169,7 @@ def _ask_for_apk(pm: ProjectManager, config: AppConfig) -> Project | None:
             search_dirs.append(candidate)
 
     found_apks: list[Path] = []
-    seen: set[Path] = set()
+    seen: set[str] = set()  # normalized resolved path strings for robust dedup
     for d in search_dirs:
         if not d.is_dir():
             continue
@@ -178,8 +178,9 @@ def _ask_for_apk(pm: ProjectManager, config: AppConfig) -> Project | None:
             for f in sorted(d.iterdir()):
                 if f.is_file() and f.suffix.lower() in (".apk", ".xapk"):
                     resolved = f.resolve()
-                    if resolved not in seen:
-                        seen.add(resolved)
+                    key = str(resolved).casefold()
+                    if key not in seen:
+                        seen.add(key)
                         found_apks.append(f)
         except PermissionError:
             continue
@@ -191,8 +192,9 @@ def _ask_for_apk(pm: ProjectManager, config: AppConfig) -> Project | None:
                         for f in sorted(sub.iterdir()):
                             if f.is_file() and f.suffix.lower() in (".apk", ".xapk"):
                                 resolved = f.resolve()
-                                if resolved not in seen:
-                                    seen.add(resolved)
+                                key = str(resolved).casefold()
+                                if key not in seen:
+                                    seen.add(key)
                                     found_apks.append(f)
                     except PermissionError:
                         continue

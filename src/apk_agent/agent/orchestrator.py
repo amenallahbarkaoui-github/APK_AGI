@@ -341,7 +341,62 @@ def _build_sub_agent_graph(agent_def: SubAgentDef, config: AppConfig, project: P
                         name=getattr(msg, "name", None),
                     )
 
-        response = _sub_llm_store["llm"].invoke(messages)
+        # --- Final safety: sync additional_kwargs and drop orphaned ToolMessages ---
+        for msg in messages:
+            if isinstance(msg, AIMessage):
+                ak_tcs = msg.additional_kwargs.get("tool_calls")
+                if ak_tcs is not None:
+                    current_ids = {tc.get("id") for tc in (msg.tool_calls or [])}
+                    msg.additional_kwargs["tool_calls"] = [
+                        tc for tc in ak_tcs if tc.get("id") in current_ids
+                    ]
+                    if not msg.tool_calls:
+                        msg.additional_kwargs.pop("tool_calls", None)
+        _valid_tc_ids: set[str] = set()
+        for msg in messages:
+            if isinstance(msg, AIMessage):
+                for tc in (msg.tool_calls or []):
+                    tid = tc.get("id") or ""
+                    if tid:
+                        _valid_tc_ids.add(tid)
+        messages = [
+            msg for msg in messages
+            if not isinstance(msg, ToolMessage)
+            or (msg.tool_call_id and msg.tool_call_id in _valid_tc_ids)
+        ]
+
+        # Retry with exponential backoff for transient API errors
+        max_retries = 3
+        for attempt in range(max_retries + 1):
+            try:
+                response = _sub_llm_store["llm"].invoke(messages)
+                break
+            except Exception as e:
+                err_str = str(e).lower()
+                is_retryable = any(k in err_str for k in [
+                    "429", "rate_limit", "rate limit",
+                    "503", "service unavailable", "overloaded",
+                    "500", "internal server error",
+                    "tool name is required",
+                    "must be in json format", "invalidparameter",
+                    "tool_call_id", "is not found",
+                ])
+                if "tool_call_id" in err_str and "not found" in err_str:
+                    logger.warning("Sub-agent orphaned tool_call_id — re-sanitizing...")
+                    messages = _sanitize_messages(messages)
+                if "tool name is required" in err_str:
+                    messages = _sanitize_messages(messages)
+                    for _m in messages:
+                        if isinstance(_m, AIMessage) and _m.tool_calls:
+                            _m.tool_calls = [tc for tc in _m.tool_calls if tc.get("name")]
+                if not is_retryable or attempt >= max_retries:
+                    raise
+                wait = 2 ** attempt * 3
+                logger.warning(
+                    "Sub-agent API error (attempt %d/%d): %s — retrying in %ds...",
+                    attempt + 1, max_retries, str(e)[:120], wait,
+                )
+                time.sleep(wait)
 
         # Extract key findings from the response into the notebook
         if hasattr(response, "content") and response.content:
@@ -408,6 +463,11 @@ def run_sub_agent(
             "current_plan": [],
             "plan_step_index": 0,
             "human_feedback": "",
+            "graph_ready": False,
+            "target_packages": [],
+            "excluded_packages": [],
+            "scratchpad": {},
+            "task_plan": [],
         }
 
         # Run the graph
@@ -771,16 +831,32 @@ Return ONLY the JSON, no markdown formatting."""
 
         # Parse the plan
         try:
-            # Try to extract JSON from the response
+            # Try to extract JSON from markdown code blocks
             if "```" in content:
-                content = content.split("```")[1]
-                if content.startswith("json"):
-                    content = content[4:]
+                parts = content.split("```")
+                if len(parts) >= 3:
+                    json_block = parts[1]
+                else:
+                    json_block = parts[1] if len(parts) > 1 else content
+                json_block = json_block.strip()
+                # Strip language tag (json, JSON, etc.)
+                if json_block.lower().startswith("json"):
+                    json_block = json_block[4:].strip()
+                content = json_block
             plan = json.loads(content)
         except (json.JSONDecodeError, IndexError):
-            # Fallback: default plan
-            logger.warning("Could not parse LLM plan, using default")
-            plan = self._default_plan(user_task)
+            # Try to find a JSON object anywhere in the response
+            import re
+            json_match = re.search(r'\{[\s\S]*\}', content)
+            if json_match:
+                try:
+                    plan = json.loads(json_match.group())
+                except json.JSONDecodeError:
+                    logger.warning("Could not parse LLM plan, using default")
+                    plan = self._default_plan(user_task)
+            else:
+                logger.warning("Could not parse LLM plan, using default")
+                plan = self._default_plan(user_task)
 
         return plan
 
