@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import re
 import shutil
+import stat
 import struct
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -499,6 +500,9 @@ def _apply_patterns_to_file(
                 shutil.copy2(str(path), str(bk))
             except Exception:
                 pass
+        # Clear read-only flag on Windows before writing
+        if path.exists():
+            path.chmod(path.stat().st_mode | stat.S_IWRITE)
         path.write_text(content, encoding="utf-8")
 
     return applied
@@ -751,6 +755,8 @@ def inject_nsc(apktool_dir: Path, cert_paths: list[str] | None = None) -> dict:
 
     nsc_content = _NSC_TEMPLATE.replace("{cert_entries}", cert_entries.rstrip())
     nsc_path = xml_dir / "network_security_config.xml"
+    if nsc_path.exists():
+        nsc_path.chmod(nsc_path.stat().st_mode | stat.S_IWRITE)
     nsc_path.write_text(nsc_content, encoding="utf-8")
     files_created.append(str(nsc_path))
 
@@ -866,6 +872,8 @@ def patch_manifest(apktool_dir: Path) -> dict:
     changes.append("Added storage permissions (READ/WRITE/MANAGE)")
 
     if content != original:
+        if manifest_path.exists():
+            manifest_path.chmod(manifest_path.stat().st_mode | stat.S_IWRITE)
         manifest_path.write_text(content, encoding="utf-8")
 
     # 7. Also patch apktool.yml targetSdkVersion
@@ -874,6 +882,8 @@ def patch_manifest(apktool_dir: Path) -> dict:
         yml = yml_path.read_text(encoding="utf-8", errors="ignore")
         new_yml = re.sub(r'(targetSdkVersion:) \d+', r'\1 28', yml)
         if new_yml != yml:
+            if yml_path.exists():
+                yml_path.chmod(yml_path.stat().st_mode | stat.S_IWRITE)
             yml_path.write_text(new_yml, encoding="utf-8")
             changes.append("Updated apktool.yml targetSdkVersion to 28")
 

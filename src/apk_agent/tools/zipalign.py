@@ -24,7 +24,8 @@ def zipalign(
     output_apk = Path(output_apk).resolve()
     output_apk.parent.mkdir(parents=True, exist_ok=True)
 
-    cmd = [zipalign_bin, "-v", str(alignment), str(input_apk), str(output_apk)]
+    # -f forces overwrite if output already exists
+    cmd = [zipalign_bin, "-f", "-v", str(alignment), str(input_apk), str(output_apk)]
     result = run_tool_command(cmd, log_file=log_file, timeout=120)
 
     if result.success or output_apk.is_file():

@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 import difflib
+import os
 import re
 import shutil
+import stat
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Optional
+
+
+def _ensure_writable(path: Path) -> None:
+    """Clear the read-only flag on Windows so we can write to the file."""
+    if path.exists():
+        path.chmod(path.stat().st_mode | stat.S_IWRITE)
 
 
 class PatchOperation(str, Enum):
@@ -145,7 +153,8 @@ class PatchEngine:
             result.errors.append("No steps were applied — all patterns failed to match.")
             return result
 
-        # Write modified file
+        # Write modified file (clear read-only flag on Windows if needed)
+        _ensure_writable(target)
         target.write_text(current, encoding="utf-8")
         result.files_modified.append(str(target))
 
@@ -197,14 +206,65 @@ class PatchEngine:
     # ---- Operation implementations ----
 
     def _find_pattern(self, text: str, pattern: str, is_regex: bool) -> Optional[re.Match]:
-        """Find pattern in text."""
+        """Find pattern in text.
+
+        For regex patterns, if the initial match fails, retries with smali
+        metacharacters escaped — the LLM often emits `.method foo()V[\\s\\S]*?.end method`
+        where `()` and `.method`/`.end` contain unescaped regex metacharacters.
+        """
         if is_regex:
-            return re.search(pattern, text, re.MULTILINE | re.DOTALL)
+            try:
+                m = re.search(pattern, text, re.MULTILINE | re.DOTALL)
+                if m:
+                    return m
+            except re.error:
+                pass
+
+            # Retry: auto-escape smali-specific metacharacters that the LLM
+            # leaves unescaped.  Targets: parentheses in method signatures,
+            # dots in `.method`/`.end method`/`.field`/`.local` etc., and `$`
+            # in inner-class names.  Preserve intentional regex like [\s\S]*?
+            # and .* / .+ by only escaping when adjacent to smali keywords.
+            escaped = pattern
+            # Escape literal parentheses in method signatures: Foo(Ljava/...) → Foo\(Ljava/...\)
+            escaped = re.sub(r'(?<!\\)\((?!\?)', r'\\(', escaped)  # ( not preceded by \ and not followed by ? (regex group)
+            escaped = re.sub(r'(?<!\\)\)(?![*+?])', r'\\)', escaped)  # ) not followed by quantifier
+            # Escape leading dot in smali directives: .method .end .field .local etc.
+            escaped = re.sub(r'(?<!\\)\.(?=method|end |field|local|super|source|class|implements|annotation|param|line|registers|locals|prologue|epilogue)', r'\\.', escaped)
+            # Escape $ in class names like Foo$Bar
+            escaped = re.sub(r'(?<!\\)\$(?=[A-Za-z_])', r'\\$', escaped)
+
+            if escaped != pattern:
+                try:
+                    m = re.search(escaped, text, re.MULTILINE | re.DOTALL)
+                    if m:
+                        return m
+                except re.error:
+                    pass
+
+            # Final fallback: try treating the whole pattern as literal with
+            # only [\s\S]*? / .* / .+ as wildcards
+            # Split on common regex wildcards, escape everything else, rejoin
+            parts = re.split(r'(\[\\s\\S\]\*\?|\.\*\??|\.\+\??|\\s\+|\\S\+)', pattern)
+            if len(parts) > 1:
+                reassembled = ""
+                for i, part in enumerate(parts):
+                    if i % 2 == 0:  # literal fragment
+                        reassembled += re.escape(part)
+                    else:  # regex wildcard — keep as-is
+                        reassembled += part
+                try:
+                    m = re.search(reassembled, text, re.MULTILINE | re.DOTALL)
+                    if m:
+                        return m
+                except re.error:
+                    pass
+
+            return None
         else:
             idx = text.find(pattern)
             if idx == -1:
                 return None
-            # Create a fake match-like result
             return _FakeMatch(idx, idx + len(pattern), pattern)
 
     def _op_replace_line(self, text: str, step: PatchStep) -> Optional[str]:

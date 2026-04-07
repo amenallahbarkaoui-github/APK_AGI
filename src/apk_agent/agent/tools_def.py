@@ -641,6 +641,10 @@ def write_file(file_path: str, content: str) -> str:
         pass  # resolve can fail on non-existent paths; allow creation under apktool_dir
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
+        # Clear read-only flag on Windows (apktool-extracted files are often read-only)
+        if p.exists():
+            import stat
+            p.chmod(p.stat().st_mode | stat.S_IWRITE)
         p.write_text(content, encoding="utf-8")
         # Invalidate search cache for this file (so searches return fresh data)
         _invalidate_cache_for_file(str(p))
@@ -1327,11 +1331,25 @@ def extract_native_strings(so_file: str) -> str:
     """
     from apk_agent.tools.deep_analysis import extract_strings_from_binary
 
-    p = Path(so_file)
-    if not p.is_absolute():
-        p = _project.apktool_dir / so_file
+    p = _resolve_file(so_file)
+
+    # If _resolve_file didn't find it, also try under workspace root
+    if not p.is_file():
+        ws = Path(_project.workspace_path)
+        for candidate_dir in [_project.apktool_dir, ws]:
+            candidate = candidate_dir / so_file.replace("\\", "/")
+            if candidate.is_file():
+                p = candidate
+                break
 
     def _run():
+        if not p.is_file():
+            return json.dumps({
+                "success": False,
+                "error": f"File not found: {so_file}. "
+                         f"Searched in apktool dir and workspace. "
+                         f"Use list_directory on 'lib/' to find available .so files.",
+            })
         result = extract_strings_from_binary(p)
         return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
     return _safe_call(_run, "extract_native_strings")
@@ -1754,8 +1772,8 @@ def _get_task_plan() -> list[dict]:
 _CUSTOM_CODE_BLOCKED_PATTERNS = [
     r"\bsubprocess\b", r"\bos\.system\b", r"\bos\.popen\b",
     r"\bos\.exec\b", r"\bos\.spawn\b", r"\bos\.remove\b",
-    r"\bos\.unlink\b", r"\bos\.rmdir\b", r"\bshutil\.rmtree\b",
-    r"\bshutil\.move\b",
+    r"\bos\.unlink\b", r"\bos\.rmdir\b", r"\bos\.rename\b",
+    r"\bshutil\.rmtree\b", r"\bshutil\.move\b",
     r"\bglobals\b", r"\bsocket\b",
     r"\burllib\b", r"\brequests\b", r"\bhttp\.client\b",
 ]
@@ -1787,17 +1805,28 @@ def _strip_comments_and_strings(code: str) -> str:
     return stripped
 
 
-def _make_safe_import(safe_modules: set[str]):
-    """Create a restricted __import__ that only allows whitelisted modules."""
+def _make_safe_import(safe_modules: set[str], sandbox_overrides: dict | None = None):
+    """Create a restricted __import__ that only allows whitelisted modules.
+
+    Args:
+        safe_modules: Set of module names allowed for import.
+        sandbox_overrides: Optional dict mapping module name to a sandboxed
+            replacement object.  When the code does ``import os``, the sandbox
+            stub is returned instead of the real ``os`` module.
+    """
     _real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
+    _overrides = sandbox_overrides or {}
 
     def safe_import(name, *args, **kwargs):
+        # Return sandbox stub if one exists for this module
+        if name in _overrides:
+            return _overrides[name]
         # Allow the module itself or any sub-module of an allowed parent
         top = name.split(".")[0]
         if name not in safe_modules and top not in safe_modules:
             raise ImportError(
                 f"Module '{name}' is not allowed in the sandbox. "
-                f"Allowed: {', '.join(sorted(safe_modules))}"
+                f"Allowed: {', '.join(sorted(safe_modules | set(_overrides)))}"
             )
         return _real_import(name, *args, **kwargs)
 
@@ -1851,7 +1880,27 @@ def execute_custom_code(code: str, description: str) -> str:
         apktool_dir = _project.apktool_dir
         jadx_dir = _project.jadx_dir
 
-        safe_import = _make_safe_import(_CUSTOM_CODE_SAFE_MODULES)
+        # Build a sandboxed 'os' module — safe subset only (no remove/exec/etc.)
+        # Implements __fspath__/__str__ so if agent accidentally passes `os`
+        # where a path is expected, it degrades to the workspace path.
+        _ws_str = str(workspace_path)
+        _safe_os = type("SafeOS", (), {
+            "path": _os.path,
+            "walk": _os.walk,
+            "listdir": _os.listdir,
+            "getcwd": _os.getcwd,
+            "sep": _os.sep,
+            "linesep": _os.linesep,
+            "makedirs": _os.makedirs,
+            "__fspath__": lambda self: _ws_str,
+            "__str__": lambda self: _ws_str,
+            "__repr__": lambda self: f"<SafeOS workspace={_ws_str}>",
+        })()
+
+        safe_import = _make_safe_import(
+            _CUSTOM_CODE_SAFE_MODULES,
+            sandbox_overrides={"os": _safe_os, "os.path": _os.path},
+        )
 
         restricted_globals = {
             "__builtins__": {
@@ -1889,12 +1938,7 @@ def execute_custom_code(code: str, description: str) -> str:
                 "ZeroDivisionError": ZeroDivisionError, "OverflowError": OverflowError,
                 "True": True, "False": False, "None": None,
             },
-            "os": type("SafeOS", (), {
-                "path": _os.path,
-                "walk": _os.walk,
-                "listdir": _os.listdir,
-                "sep": _os.sep,
-            })(),
+            "os": _safe_os,
             "re": re,
             "json": json,
             "Path": Path,

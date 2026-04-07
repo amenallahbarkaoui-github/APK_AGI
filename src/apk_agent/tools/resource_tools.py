@@ -13,6 +13,7 @@ import colorsys
 import logging
 import os
 import re
+import stat
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Optional
@@ -287,6 +288,8 @@ def replace_colors(
             new_content = combined_re.sub(_replacer, content)
 
             if count > 0:
+                if fpath.exists():
+                    fpath.chmod(fpath.stat().st_mode | stat.S_IWRITE)
                 fpath.write_text(new_content, encoding="utf-8")
                 total_replacements += count
                 files_modified += 1
