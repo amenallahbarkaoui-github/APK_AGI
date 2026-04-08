@@ -198,18 +198,27 @@ def _resolve_dir(directory: str | None, default: str = "jadx") -> Path:
 
     p = Path(directory)
     if p.is_absolute():
+        # If the LLM passed a file path instead of a directory, use its parent
+        if p.is_file():
+            return p.parent
         return p
 
     # Try under decompiled/ first, then workspace root, then apktool subdir
     decompiled = Path(_project.workspace_path) / "decompiled" / d
     if decompiled.is_dir():
         return decompiled
+    if decompiled.is_file():
+        return decompiled.parent
     ws_dir = Path(_project.workspace_path) / d
     if ws_dir.is_dir():
         return ws_dir
+    if ws_dir.is_file():
+        return ws_dir.parent
     apk_sub = _project.apktool_dir / d
     if apk_sub.is_dir():
         return apk_sub
+    if apk_sub.is_file():
+        return apk_sub.parent
     # Default to decompiled/ (more likely correct)
     return decompiled
 

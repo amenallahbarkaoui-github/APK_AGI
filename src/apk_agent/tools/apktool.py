@@ -42,6 +42,8 @@ def build(
     project_dir: str | Path,
     output_apk: Optional[str | Path] = None,
     log_file: Optional[Path] = None,
+    use_aapt2: bool = True,
+    force_all: bool = False,
 ) -> ToolResult:
     """Rebuild an APK from decompiled apktool project using apktool b.
 
@@ -50,6 +52,10 @@ def build(
     project_dir = Path(project_dir).resolve()
 
     cmd = [apktool_bin, "b", str(project_dir)]
+    if use_aapt2:
+        cmd.append("--use-aapt2")
+    if force_all:
+        cmd.append("--force-all")
     if output_apk:
         output_apk = Path(output_apk).resolve()
         cmd.extend(["-o", str(output_apk)])
@@ -57,6 +63,17 @@ def build(
         output_apk = project_dir / "dist" / (project_dir.name + ".apk")
 
     result = run_tool_command(cmd, log_file=log_file, timeout=300)
+
+    # If build failed due to private resource errors, retry with --force-all
+    if not result.success and not force_all:
+        stderr = result.stderr or ""
+        if "is private" in stderr or "failed linking file resources" in stderr:
+            result = run_tool_command(
+                cmd + (["--force-all"] if "--force-all" not in cmd else []),
+                log_file=log_file,
+                timeout=300,
+            )
+
     if result.success:
         # apktool puts output in dist/ by default
         if output_apk and output_apk.is_file():
