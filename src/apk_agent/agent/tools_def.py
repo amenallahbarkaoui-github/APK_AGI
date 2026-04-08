@@ -8,7 +8,6 @@ All tools are wrapped with error recovery — they never crash the agent.
 from __future__ import annotations
 
 import json
-import re
 import traceback
 import uuid
 from pathlib import Path
@@ -21,7 +20,6 @@ from apk_agent.progress import progress_manager, TaskStatus, set_current_task
 # We use a module-level config holder that gets set at graph construction time.
 _config = None
 _project = None
-_auto_mode = False  # Set by CLI — skips all interrupts when True
 
 # ---------------------------------------------------------------------------
 # Tool result cache — avoids re-running expensive scans with same args
@@ -39,33 +37,24 @@ _CACHEABLE_TOOLS = frozenset({
     "graph_find_path", "graph_security_scan", "graph_stats",
     "index_lookup_class", "index_lookup_method",
     "index_lookup_string", "index_lookup_package",
-    "find_entry_points", "map_hierarchy",
-    "analyze_shared_prefs", "scan_assets_secrets",
+    "unified_scan", "run_taint_analysis", "find_hardcoded_crypto",
+    "analyze_manifest_deep", "scan_cloud_secrets", "smali_index_stats",
 })
 
 
 def set_tool_context(config, project) -> None:
     """Set the config and project for tool execution. Called once per session."""
-    global _config, _project, _tool_cache, _code_graph, _code_index
+    global _config, _project, _tool_cache, _smali_index
     _config = config
     _project = project
     _tool_cache.clear()  # fresh cache per session
-    _code_graph = None   # reset graph — prevent stale data across sessions
-    _code_index = None   # reset index — will be rebuilt/loaded on first use
+    _smali_index = None
 
 
 def _log_file() -> Path:
     if _project:
         return Path(_project.workspace_path) / "logs" / "tools.log"
     return Path("tools.log")
-
-
-def _invalidate_cache_for_file(file_path: str) -> None:
-    """Remove cache entries that might reference a modified file."""
-    norm = file_path.replace("\\", "/")
-    keys_to_remove = [k for k in _tool_cache if norm in k.replace("\\", "/")]
-    for k in keys_to_remove:
-        del _tool_cache[k]
 
 
 def _safe_call(func, tool_name: str, *args, **kwargs) -> str:
@@ -137,19 +126,6 @@ def _resolve_dir(directory: str | None, default: str = "jadx") -> Path:
     d = directory.strip().strip("/").strip("\\")
     low = d.lower().replace("\\", "/")
 
-    # Strip "decompiled/..." prefixes so downstream handlers can match
-    for prefix in ("decompiled/jadx_src/", "decompiled/apktool/",
-                   "decompiled/sources/", "decompiled/"):
-        if low.startswith(prefix):
-            d = d[len(prefix):]
-            low = d.lower().replace("\\", "/")
-            # "decompiled/sources/X" → d is now "X" (sources/ was stripped).
-            # Prepend "sources/" back so the sources handler below catches it.
-            if prefix == "decompiled/sources/":
-                d = "sources/" + d
-                low = d.lower().replace("\\", "/")
-            break
-
     # Exact alias matching
     if low in ("jadx", "jadx_src"):
         return _project.jadx_dir
@@ -184,41 +160,20 @@ def _resolve_dir(directory: str | None, default: str = "jadx") -> Path:
             return candidate
         return candidate
 
-    # Handle "sources/..." paths — these go under jadx_dir
-    if low.startswith("sources") or low.startswith("jadx_src/") or low.startswith("jadx/"):
-        sub = d
-        if low.startswith("jadx_src/"):
-            sub = d.split("/", 1)[1] if "/" in d else d
-        elif low.startswith("jadx/"):
-            sub = d.split("/", 1)[1] if "/" in d else d
-        candidate = _project.jadx_dir / sub
-        if candidate.is_dir():
-            return candidate
-        return candidate
-
     p = Path(directory)
     if p.is_absolute():
-        # If the LLM passed a file path instead of a directory, use its parent
-        if p.is_file():
-            return p.parent
         return p
 
     # Try under decompiled/ first, then workspace root, then apktool subdir
     decompiled = Path(_project.workspace_path) / "decompiled" / d
     if decompiled.is_dir():
         return decompiled
-    if decompiled.is_file():
-        return decompiled.parent
     ws_dir = Path(_project.workspace_path) / d
     if ws_dir.is_dir():
         return ws_dir
-    if ws_dir.is_file():
-        return ws_dir.parent
     apk_sub = _project.apktool_dir / d
     if apk_sub.is_dir():
         return apk_sub
-    if apk_sub.is_file():
-        return apk_sub.parent
     # Default to decompiled/ (more likely correct)
     return decompiled
 
@@ -228,9 +183,7 @@ def _resolve_file(file_path: str) -> Path:
 
     Handles common prefixes the agent may pass:
       - "smali/com/foo/Bar.smali"  → apktool_dir / smali / com/foo/Bar.smali
-      - "sources/com/foo/Bar.java" → jadx_dir / sources / com/foo/Bar.java
       - "decompiled/apktool/smali/com/foo/Bar.smali" → strip prefix
-      - "decompiled/jadx_src/sources/com/foo/Bar.java" → strip prefix
       - absolute path → returned as-is
 
     Also searches all smali_classesN/ dirs when the file is missing from smali/.
@@ -241,25 +194,16 @@ def _resolve_file(file_path: str) -> Path:
 
     fpath = file_path.replace("\\", "/")
 
-    # Strip accidental "decompiled/" prefixes
-    for prefix in ("decompiled/apktool/", "decompiled/jadx_src/",
-                   "decompiled/sources/", "decompiled/"):
+    # Strip accidental "decompiled/apktool/" prefix
+    for prefix in ("decompiled/apktool/", "decompiled\\apktool\\"):
         if fpath.startswith(prefix):
             fpath = fpath[len(prefix):]
-            # "decompiled/sources/X" → fpath is now "X"; restore "sources/" prefix
-            if prefix == "decompiled/sources/":
-                fpath = "sources/" + fpath
             break
 
     # Try directly under apktool_dir (covers smali/..., res/..., etc.)
     candidate = _project.apktool_dir / fpath
     if candidate.is_file():
         return candidate
-
-    # Try directly under jadx_dir (covers sources/..., resources/..., etc.)
-    jadx_candidate = _project.jadx_dir / fpath
-    if jadx_candidate.is_file():
-        return jadx_candidate
 
     # If path starts with "smali/", try other smali dirs (smali_classes2, etc.)
     if fpath.startswith("smali/"):
@@ -269,29 +213,11 @@ def _resolve_file(file_path: str) -> Path:
             if test.is_file():
                 return test
 
-    # If the path looks like a smali class path (e.g., "com/foo/Bar.smali")
-    # but doesn't have the "smali/" prefix, search ALL smali directories
-    if fpath.endswith(".smali") and not fpath.startswith("smali"):
-        for sd in _get_all_smali_dirs():
-            test = sd / fpath
-            if test.is_file():
-                return test
-
-    # If path looks like a Java/Kotlin source without "sources/" prefix,
-    # try under jadx_dir/sources/
-    if fpath.endswith((".java", ".kt")) and not fpath.startswith("sources"):
-        jadx_src = _project.jadx_dir / "sources" / fpath
-        if jadx_src.is_file():
-            return jadx_src
-
-    # Fallback: try workspace root, then just return best-guess
+    # Fallback: try workspace root, then just return best-guess under apktool_dir
     ws_candidate = Path(_project.workspace_path) / file_path
     if ws_candidate.is_file():
         return ws_candidate
 
-    # Return whichever candidate is more likely based on extension
-    if fpath.endswith((".java", ".kt")):
-        return jadx_candidate
     return candidate  # return apktool_dir-based path (will surface "not found" error)
 
 
@@ -628,35 +554,15 @@ def write_file(file_path: str, content: str) -> str:
     Use this for direct smali edits, adding new files, or modifying XML configs.
 
     Args:
-        file_path: Absolute path or path relative to the apktool decompiled directory
-                   (e.g., "res/values/colors.xml" writes to apktool_dir/res/values/colors.xml).
+        file_path: Absolute path or path relative to the project workspace.
         content: The full file content to write.
     """
     p = Path(file_path)
     if not p.is_absolute():
-        # Use _resolve_file for consistency with read_file —
-        # "res/values/colors.xml" → apktool_dir/res/values/colors.xml
-        p = _resolve_file(file_path)
-    # Security: only allow writes under the project workspace
-    ws = Path(_project.workspace_path).resolve()
-    try:
-        resolved = p.resolve()
-        if not str(resolved).startswith(str(ws)):
-            return json.dumps({
-                "success": False,
-                "error": f"Write denied: path {p} is outside project workspace.",
-            })
-    except (OSError, ValueError):
-        pass  # resolve can fail on non-existent paths; allow creation under apktool_dir
+        p = Path(_project.workspace_path) / file_path
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        # Clear read-only flag on Windows (apktool-extracted files are often read-only)
-        if p.exists():
-            import stat
-            p.chmod(p.stat().st_mode | stat.S_IWRITE)
         p.write_text(content, encoding="utf-8")
-        # Invalidate search cache for this file (so searches return fresh data)
-        _invalidate_cache_for_file(str(p))
         return json.dumps({
             "success": True,
             "path": str(p),
@@ -801,16 +707,6 @@ def apply_smali_patch(patch_plan_json: str) -> str:
             "error": "Patch plan has no steps. Add at least one step with operation and match_pattern.",
         })
 
-    # Pre-resolve target_file path through centralized resolver
-    raw_target = plan_data.get("target_file", "")
-    resolved = _resolve_file(raw_target)
-    if resolved.is_file():
-        # Convert to relative path within apktool_dir for PatchEngine
-        try:
-            plan_data["target_file"] = str(resolved.relative_to(_project.apktool_dir))
-        except ValueError:
-            plan_data["target_file"] = str(resolved)
-
     plan = PatchPlan.from_dict(plan_data)
     engine = PatchEngine(
         apktool_dir=_project.apktool_dir,
@@ -853,15 +749,6 @@ def preview_smali_patch(patch_plan_json: str) -> str:
         plan_data = json.loads(patch_plan_json)
     except json.JSONDecodeError as e:
         return f"Invalid JSON: {e}"
-
-    # Pre-resolve target_file path through centralized resolver
-    raw_target = plan_data.get("target_file", "")
-    resolved = _resolve_file(raw_target)
-    if resolved.is_file():
-        try:
-            plan_data["target_file"] = str(resolved.relative_to(_project.apktool_dir))
-        except ValueError:
-            plan_data["target_file"] = str(resolved)
 
     plan = PatchPlan.from_dict(plan_data)
     engine = PatchEngine(
@@ -1252,153 +1139,6 @@ def analyze_native_libs() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Deep Analysis tools
-# ---------------------------------------------------------------------------
-
-@tool
-def validate_patch(file_path: str) -> str:
-    """Validate smali syntax AFTER patching — catch errors BEFORE apktool_build.
-    Checks for unclosed methods, missing .end directives, unknown opcodes, etc.
-    Run this after apply_smali_patch to avoid build failures.
-
-    Args:
-        file_path: Path to the .smali file to validate (absolute or relative).
-    """
-    from apk_agent.tools.deep_analysis import validate_smali_syntax
-
-    p = _resolve_file(file_path)
-
-    def _run():
-        result = validate_smali_syntax(p)
-        return json.dumps(result, ensure_ascii=False, indent=2)[:10000]
-    return _safe_call(_run, "validate_patch")
-
-
-@tool
-def find_entry_points() -> str:
-    """Discover ALL app entry points in execution order:
-    ContentProviders (auto-init first) → Application.onCreate() →
-    LauncherActivity → BootReceivers → ExportedServices.
-
-    Start analysis from here — these are where security checks are initialized.
-    """
-    from apk_agent.tools.deep_analysis import find_entry_points as _find
-
-    manifest_path = _project.apktool_dir / "AndroidManifest.xml"
-
-    def _run():
-        result = _find(manifest_path, _get_all_smali_dirs())
-        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
-    return _safe_call(_run, "find_entry_points")
-
-
-@tool
-def map_hierarchy(target_class: str = "") -> str:
-    """Map the class inheritance hierarchy from smali code.
-    Find all parents/children of a class, or get an overview of
-    security-relevant hierarchies (TrustManager, Interceptor, etc.).
-
-    Args:
-        target_class: Class to trace (e.g., "MyTrustManager", "Lcom/app/Foo;").
-            If empty, returns overview of all hierarchies with security highlights.
-    """
-    from apk_agent.tools.deep_analysis import map_class_hierarchy
-
-    def _run():
-        result = map_class_hierarchy(_get_all_smali_dirs(), target_class=target_class)
-        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
-    return _safe_call(_run, "map_hierarchy")
-
-
-@tool
-def analyze_shared_prefs() -> str:
-    """Find ALL SharedPreferences usage — preference files, stored keys, and
-    security-sensitive values (tokens, flags, license checks).
-
-    Identifies boolean flags that may be bypass targets (is_premium, is_rooted).
-    """
-    from apk_agent.tools.deep_analysis import analyze_shared_prefs as _analyze
-
-    dirs = [_project.jadx_dir]
-    for sd in _get_all_smali_dirs():
-        dirs.append(sd)
-
-    def _run():
-        result = _analyze(dirs)
-        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
-    return _safe_call(_run, "analyze_shared_prefs")
-
-
-@tool
-def extract_native_strings(so_file: str) -> str:
-    """Extract readable strings from a compiled .so native library.
-    Finds: JNI method names, crypto library indicators, URLs/endpoints,
-    hardcoded API keys/tokens. Like Unix 'strings' but with classification.
-
-    Args:
-        so_file: Path to the .so file (e.g., "lib/arm64-v8a/libnative.so").
-    """
-    from apk_agent.tools.deep_analysis import extract_strings_from_binary
-
-    p = _resolve_file(so_file)
-
-    # If _resolve_file didn't find it, also try under workspace root
-    if not p.is_file():
-        ws = Path(_project.workspace_path)
-        for candidate_dir in [_project.apktool_dir, ws]:
-            candidate = candidate_dir / so_file.replace("\\", "/")
-            if candidate.is_file():
-                p = candidate
-                break
-
-    def _run():
-        if not p.is_file():
-            return json.dumps({
-                "success": False,
-                "error": f"File not found: {so_file}. "
-                         f"Searched in apktool dir and workspace. "
-                         f"Use list_directory on 'lib/' to find available .so files.",
-            })
-        result = extract_strings_from_binary(p)
-        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
-    return _safe_call(_run, "extract_native_strings")
-
-
-@tool
-def scan_assets_secrets() -> str:
-    """Scan assets/, res/raw/, res/xml/ for embedded secrets:
-    API keys, Firebase URLs, AWS keys, private keys, hardcoded passwords,
-    bearer tokens. WebView apps often leak keys in JavaScript assets.
-    """
-    from apk_agent.tools.deep_analysis import scan_assets_for_secrets
-
-    def _run():
-        result = scan_assets_for_secrets(_project.apktool_dir)
-        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
-    return _safe_call(_run, "scan_assets_secrets")
-
-
-@tool
-def diff_patched_file(original_backup: str, current_file: str) -> str:
-    """Show exact changes between original and patched smali files.
-    Use after patching to verify changes are correct before building.
-
-    Args:
-        original_backup: Path to the backup/original file.
-        current_file: Path to the current (patched) file.
-    """
-    from apk_agent.tools.deep_analysis import diff_smali_files
-
-    orig = _resolve_file(original_backup)
-    curr = _resolve_file(current_file)
-
-    def _run():
-        result = diff_smali_files(orig, curr)
-        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
-    return _safe_call(_run, "diff_patched_file")
-
-
-# ---------------------------------------------------------------------------
 # NEW: Certificate analyzer
 # ---------------------------------------------------------------------------
 
@@ -1533,564 +1273,6 @@ def get_evidence_summary() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Working memory — scratchpad (survives context compaction)
-# ---------------------------------------------------------------------------
-
-# Module-level scratchpad shared across tool calls (injected into state via graph)
-_scratchpad: dict[str, str] = {}
-_task_plan: list[dict] = []
-
-
-@tool
-def update_scratchpad(key: str, value: str) -> str:
-    """Store a key-value pair in persistent working memory (scratchpad).
-    Use this to remember important findings, file paths, color values,
-    decisions, or intermediate results that you'll need later.
-    Scratchpad survives context compaction — your regular memory doesn't.
-
-    Args:
-        key: Short descriptive key (e.g., "ooredoo_red_color", "ssl_bypass_status").
-        value: Value to store (e.g., "#FFE11C22", "DONE — 3 files patched").
-    """
-    _scratchpad[key] = value
-    return json.dumps({
-        "success": True,
-        "stored": {key: value},
-        "total_entries": len(_scratchpad),
-    })
-
-
-@tool
-def read_scratchpad(key: Optional[str] = None) -> str:
-    """Read from persistent working memory (scratchpad).
-    If key is provided, returns that specific entry.
-    If key is None, returns all stored entries.
-
-    Args:
-        key: Optional key to look up. If omitted, returns everything.
-    """
-    if key:
-        val = _scratchpad.get(key)
-        if val is None:
-            return json.dumps({"success": False, "error": f"Key '{key}' not found in scratchpad."})
-        return json.dumps({"success": True, "key": key, "value": val})
-    return json.dumps({
-        "success": True,
-        "entries": dict(_scratchpad),
-        "total_entries": len(_scratchpad),
-    })
-
-
-@tool
-def update_task_plan(plan_json: str) -> str:
-    """Create or update the task plan for multi-objective work.
-    Call this EARLY when you receive a complex request with multiple goals.
-    Each task should be a small, independently completable objective.
-
-    Args:
-        plan_json: JSON array of task objects, e.g.:
-            [{"id": 1, "desc": "Bypass SSL pinning", "status": "pending"},
-             {"id": 2, "desc": "Change colors red to blue", "status": "pending"},
-             {"id": 3, "desc": "Build and sign APK", "status": "pending"}]
-            Status can be: "pending", "in_progress", "done"
-    """
-    try:
-        plan = json.loads(plan_json)
-        if not isinstance(plan, list):
-            return json.dumps({"success": False, "error": "plan_json must be a JSON array"})
-        _task_plan.clear()
-        _task_plan.extend(plan)
-        return json.dumps({"success": True, "tasks": len(plan), "plan": plan})
-    except json.JSONDecodeError as e:
-        return json.dumps({"success": False, "error": f"Invalid JSON: {e}"})
-
-
-@tool
-def mark_task_done(task_id: int) -> str:
-    """Mark a specific task in the task plan as completed.
-
-    Args:
-        task_id: The id of the task to mark as done.
-    """
-    for t in _task_plan:
-        if t.get("id") == task_id:
-            t["status"] = "done"
-            return json.dumps({"success": True, "marked_done": task_id, "plan": _task_plan})
-    return json.dumps({"success": False, "error": f"Task {task_id} not found"})
-
-
-@tool
-def edit_task_plan(action: str, task_id: int = 0, new_desc: str = "", new_status: str = "", position: int = 0) -> str:
-    """Edit the task plan dynamically — add, remove, modify, or reorder tasks.
-    Use this when you encounter problems and need to adapt your plan.
-
-    Args:
-        action: One of:
-            - "add": Add a new task (provide new_desc, optional position)
-            - "remove": Remove a task by id (provide task_id)
-            - "modify": Change a task's description and/or status (provide task_id + new_desc/new_status)
-            - "reorder": Move a task to a new position (provide task_id + position)
-            - "add_before": Insert a new task before task_id (provide task_id + new_desc)
-            - "add_after": Insert a new task after task_id (provide task_id + new_desc)
-        task_id: The id of the task to modify/remove/reorder (not needed for "add").
-        new_desc: New description for add/modify operations.
-        new_status: New status for modify: "pending", "in_progress", "done", "blocked", "skipped".
-        position: Target position for reorder (1-based), or position for add.
-    """
-    action = action.strip().lower()
-
-    if action == "add":
-        # Generate next id
-        max_id = max((t.get("id", 0) for t in _task_plan), default=0)
-        new_task = {"id": max_id + 1, "desc": new_desc or "New task", "status": "pending"}
-        if position and 1 <= position <= len(_task_plan) + 1:
-            _task_plan.insert(position - 1, new_task)
-        else:
-            _task_plan.append(new_task)
-        return json.dumps({"success": True, "action": "added", "task": new_task, "plan": _task_plan})
-
-    elif action == "remove":
-        for i, t in enumerate(_task_plan):
-            if t.get("id") == task_id:
-                removed = _task_plan.pop(i)
-                return json.dumps({"success": True, "action": "removed", "removed": removed, "plan": _task_plan})
-        return json.dumps({"success": False, "error": f"Task {task_id} not found"})
-
-    elif action == "modify":
-        for t in _task_plan:
-            if t.get("id") == task_id:
-                if new_desc:
-                    t["desc"] = new_desc
-                if new_status:
-                    t["status"] = new_status
-                return json.dumps({"success": True, "action": "modified", "task": t, "plan": _task_plan})
-        return json.dumps({"success": False, "error": f"Task {task_id} not found"})
-
-    elif action == "reorder":
-        for i, t in enumerate(_task_plan):
-            if t.get("id") == task_id:
-                task = _task_plan.pop(i)
-                pos = max(0, min(len(_task_plan), position - 1))
-                _task_plan.insert(pos, task)
-                return json.dumps({"success": True, "action": "reordered", "task": task, "plan": _task_plan})
-        return json.dumps({"success": False, "error": f"Task {task_id} not found"})
-
-    elif action in ("add_before", "add_after"):
-        for i, t in enumerate(_task_plan):
-            if t.get("id") == task_id:
-                max_id = max((t2.get("id", 0) for t2 in _task_plan), default=0)
-                new_task = {"id": max_id + 1, "desc": new_desc or "New task", "status": "pending"}
-                insert_pos = i if action == "add_before" else i + 1
-                _task_plan.insert(insert_pos, new_task)
-                return json.dumps({"success": True, "action": action, "task": new_task, "plan": _task_plan})
-        return json.dumps({"success": False, "error": f"Task {task_id} not found"})
-
-    else:
-        return json.dumps({"success": False, "error": f"Unknown action: '{action}'. Use: add, remove, modify, reorder, add_before, add_after"})
-
-
-# ---------------------------------------------------------------------------
-# Human Interaction — ask_user (interrupt-based)
-# ---------------------------------------------------------------------------
-
-@tool
-def ask_user(question: str, options: str = "") -> str:
-    """Ask the user a question and wait for their response.
-    Use this when you encounter a difficult situation and need human guidance.
-
-    WHEN TO USE:
-    - You're unsure which of multiple approaches to take for a tricky patch
-    - A patch failed and you need the user to decide: retry, skip, or try alternative
-    - You found multiple potential targets and need the user to pick one
-    - You need clarification about what the user actually wants
-    - The health check shows critical issues and you need user decision
-
-    WHEN NOT TO USE:
-    - For routine operations you can handle autonomously
-    - For approval before patching (that's automatic via human_review)
-    - When you can make a reasonable decision on your own
-
-    Args:
-        question: Clear, concise question for the user. Include context about what happened.
-        options: Optional comma-separated list of choices (e.g., "retry,skip,alternative").
-            If empty, user gives free-form response.
-    """
-    # In auto mode, skip the interrupt entirely — return immediately
-    if _auto_mode:
-        return json.dumps({
-            "success": True,
-            "question": question,
-            "user_response": "Proceed with your best judgment — auto mode is ON.",
-            "auto_mode": True,
-        }, ensure_ascii=False)
-
-    from langgraph.types import interrupt
-
-    # Build the prompt
-    prompt_parts = ["❓ **Agent Question**", "", question, ""]
-
-    if options.strip():
-        option_list = [o.strip() for o in options.split(",") if o.strip()]
-        prompt_parts.append("Options:")
-        for i, opt in enumerate(option_list, 1):
-            prompt_parts.append(f"  {i}. {opt}")
-        prompt_parts.append("")
-        prompt_parts.append(f"Reply with your choice (1-{len(option_list)}) or type your own answer:")
-    else:
-        prompt_parts.append("Type your answer:")
-
-    prompt_text = "\n".join(prompt_parts)
-
-    # Interrupt — pauses the graph, CLI collects user input, resumes
-    user_response = interrupt(prompt_text)
-
-    response_str = str(user_response).strip()
-
-    # If numbered options were provided, try to resolve by number
-    if options.strip():
-        option_list = [o.strip() for o in options.split(",") if o.strip()]
-        try:
-            idx = int(response_str) - 1
-            if 0 <= idx < len(option_list):
-                response_str = option_list[idx]
-        except ValueError:
-            pass  # User typed a free-form answer
-
-    return json.dumps({
-        "success": True,
-        "question": question,
-        "user_response": response_str,
-    }, ensure_ascii=False)
-
-
-def _get_scratchpad() -> dict:
-    """Return current scratchpad (for state injection in graph.py)."""
-    return dict(_scratchpad)
-
-
-def _get_task_plan() -> list[dict]:
-    """Return current task plan (for state injection in graph.py)."""
-    return list(_task_plan)
-
-
-# ---------------------------------------------------------------------------
-# Custom Code Execution — advanced escape hatch for truly custom operations
-# ---------------------------------------------------------------------------
-
-# Blocked operations (patterns checked against CODE ONLY, not comments/strings)
-_CUSTOM_CODE_BLOCKED_PATTERNS = [
-    r"\bsubprocess\b", r"\bos\.system\b", r"\bos\.popen\b",
-    r"\bos\.exec\b", r"\bos\.spawn\b", r"\bos\.remove\b",
-    r"\bos\.unlink\b", r"\bos\.rmdir\b", r"\bos\.rename\b",
-    r"\bshutil\.rmtree\b", r"\bshutil\.move\b",
-    r"\bglobals\b", r"\bsocket\b",
-    r"\burllib\b", r"\brequests\b", r"\bhttp\.client\b",
-]
-
-# Modules the sandbox is allowed to import
-_CUSTOM_CODE_SAFE_MODULES = {
-    "re", "json", "math", "string", "base64", "hashlib", "hmac",
-    "binascii", "struct", "io", "collections", "itertools", "functools",
-    "operator", "textwrap", "difflib", "copy", "pprint", "dataclasses",
-    "typing", "enum", "abc", "contextlib", "decimal", "fractions",
-    "statistics", "unicodedata", "codecs", "fnmatch", "glob",
-    "xml", "xml.etree", "xml.etree.ElementTree",
-    "pathlib", "posixpath", "ntpath",
-    "csv", "configparser", "html", "html.parser",
-}
-
-
-def _strip_comments_and_strings(code: str) -> str:
-    """Remove comments and string literals so blocked-pattern checks
-    don't false-positive on words inside comments/strings."""
-    # Remove single-line comments
-    stripped = re.sub(r'#[^\n]*', '', code)
-    # Remove triple-quoted strings (both kinds)
-    stripped = re.sub(r'"""[\s\S]*?"""', '""', stripped)
-    stripped = re.sub(r"'''[\s\S]*?'''", "''", stripped)
-    # Remove regular strings
-    stripped = re.sub(r'"(?:[^"\\]|\\.)*"', '""', stripped)
-    stripped = re.sub(r"'(?:[^'\\]|\\.)*'", "''", stripped)
-    return stripped
-
-
-def _make_safe_import(safe_modules: set[str], sandbox_overrides: dict | None = None):
-    """Create a restricted __import__ that only allows whitelisted modules.
-
-    Args:
-        safe_modules: Set of module names allowed for import.
-        sandbox_overrides: Optional dict mapping module name to a sandboxed
-            replacement object.  When the code does ``import os``, the sandbox
-            stub is returned instead of the real ``os`` module.
-    """
-    _real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
-    _overrides = sandbox_overrides or {}
-
-    def safe_import(name, *args, **kwargs):
-        # Return sandbox stub if one exists for this module
-        if name in _overrides:
-            return _overrides[name]
-        # Allow the module itself or any sub-module of an allowed parent
-        top = name.split(".")[0]
-        if name not in safe_modules and top not in safe_modules:
-            raise ImportError(
-                f"Module '{name}' is not allowed in the sandbox. "
-                f"Allowed: {', '.join(sorted(safe_modules | set(_overrides)))}"
-            )
-        return _real_import(name, *args, **kwargs)
-
-    return safe_import
-
-
-@tool
-def execute_custom_code(code: str, description: str) -> str:
-    """Execute custom Python code in a sandbox. USE ONLY WHEN NO EXISTING TOOL WORKS.
-
-    IMPORTANT: Keep code SHORT and SIMPLE to avoid JSON serialization errors.
-    Use semicolons to join statements. Avoid triple-quotes and backslashes.
-
-    Sandbox rules:
-    - No subprocess, network, or file deletion
-    - Writes only under workspace
-    - Set `result = ...` for output
-    - Max 5000 chars code, 10000 chars output
-
-    Args:
-        code: Short Python code. Pre-imported: os.path, re, json, Path, ET.
-              Can import: hashlib, base64, struct, math, collections, itertools, io, csv, etc.
-              Variables: workspace_path, apktool_dir, jadx_dir (Path objects).
-              KEEP IT SIMPLE — prefer one-liners joined with semicolons.
-        description: What this code does and why no existing tool works.
-    """
-    import traceback
-
-    def _run():
-        # --- Safety checks (strip comments/strings first to avoid false positives) ---
-        code_only = _strip_comments_and_strings(code)
-        for pattern in _CUSTOM_CODE_BLOCKED_PATTERNS:
-            if re.search(pattern, code_only):
-                return json.dumps({
-                    "success": False,
-                    "error": f"Blocked operation detected: {pattern}. "
-                             "Custom code cannot use subprocess, network, file deletion, or write files outside workspace."
-                })
-
-        if len(code) > 5000:
-            return json.dumps({
-                "success": False,
-                "error": "Code too long (max 5000 chars). Break into smaller operations."
-            })
-
-        # --- Build restricted globals ---
-        import xml.etree.ElementTree as ET
-        import os as _os
-
-        workspace_path = Path(_project.workspace_path)
-        apktool_dir = _project.apktool_dir
-        jadx_dir = _project.jadx_dir
-
-        # Build a sandboxed 'os' module — safe subset only (no remove/exec/etc.)
-        # Implements __fspath__/__str__ so if agent accidentally passes `os`
-        # where a path is expected, it degrades to the workspace path.
-        _ws_str = str(workspace_path)
-        _safe_os = type("SafeOS", (), {
-            "path": _os.path,
-            "walk": _os.walk,
-            "listdir": _os.listdir,
-            "getcwd": _os.getcwd,
-            "sep": _os.sep,
-            "linesep": _os.linesep,
-            "makedirs": _os.makedirs,
-            "__fspath__": lambda self: _ws_str,
-            "__str__": lambda self: _ws_str,
-            "__repr__": lambda self: f"<SafeOS workspace={_ws_str}>",
-        })()
-
-        safe_import = _make_safe_import(
-            _CUSTOM_CODE_SAFE_MODULES,
-            sandbox_overrides={"os": _safe_os, "os.path": _os.path},
-        )
-
-        restricted_globals = {
-            "__builtins__": {
-                "__import__": safe_import,
-                "__name__": "__main__",
-                "__build_class__": __build_class__,
-                "len": len, "range": range, "enumerate": enumerate,
-                "zip": zip, "map": map, "filter": filter, "sorted": sorted,
-                "reversed": reversed, "list": list, "dict": dict, "set": set,
-                "tuple": tuple, "str": str, "int": int, "float": float,
-                "bool": bool, "bytes": bytes, "bytearray": bytearray,
-                "isinstance": isinstance, "issubclass": issubclass,
-                "hasattr": hasattr, "getattr": getattr, "setattr": setattr,
-                "print": print, "repr": repr, "type": type,
-                "min": min, "max": max, "sum": sum, "abs": abs,
-                "any": any, "all": all, "ord": ord, "chr": chr,
-                "hex": hex, "bin": bin, "oct": oct,
-                "round": round, "pow": pow, "divmod": divmod,
-                "format": format, "id": id, "hash": hash,
-                "callable": callable, "iter": iter, "next": next,
-                "slice": slice, "property": property, "staticmethod": staticmethod,
-                "classmethod": classmethod, "super": super,
-                "frozenset": frozenset, "memoryview": memoryview,
-                "complex": complex,
-                "open": _make_safe_open(workspace_path),
-                "ValueError": ValueError, "KeyError": KeyError,
-                "TypeError": TypeError, "IndexError": IndexError,
-                "AttributeError": AttributeError, "RuntimeError": RuntimeError,
-                "FileNotFoundError": FileNotFoundError, "OSError": OSError,
-                "PermissionError": PermissionError, "NotImplementedError": NotImplementedError,
-                "StopIteration": StopIteration, "Exception": Exception,
-                "ImportError": ImportError, "ModuleNotFoundError": ModuleNotFoundError,
-                "UnicodeDecodeError": UnicodeDecodeError, "UnicodeEncodeError": UnicodeEncodeError,
-                "IOError": IOError, "EOFError": EOFError,
-                "ZeroDivisionError": ZeroDivisionError, "OverflowError": OverflowError,
-                "True": True, "False": False, "None": None,
-            },
-            "os": _safe_os,
-            "re": re,
-            "json": json,
-            "Path": Path,
-            "ET": ET,
-            "workspace_path": workspace_path,
-            "apktool_dir": apktool_dir,
-            "jadx_dir": jadx_dir,
-        }
-
-        restricted_locals: dict = {}
-
-        try:
-            compiled_code = compile(code, "<custom_code>", "exec")
-            exec(compiled_code, restricted_globals, restricted_locals)  # noqa: S102
-        except Exception as e:
-            tb = traceback.format_exc()
-            return json.dumps({
-                "success": False,
-                "error": f"{type(e).__name__}: {e}",
-                "traceback": tb[-2000:],
-            })
-
-        # Extract result
-        result = restricted_locals.get("result", None)
-        if result is None:
-            for key in reversed(list(restricted_locals)):
-                if not key.startswith("_"):
-                    result = restricted_locals[key]
-                    break
-
-        output = str(result) if result is not None else "(no result)"
-        if len(output) > 10000:
-            output = output[:5000] + f"\n\n... [{len(output) - 10000} chars truncated] ...\n\n" + output[-5000:]
-
-        return json.dumps({
-            "success": True,
-            "description": description,
-            "result": output,
-        })
-
-    return _safe_call(_run, "execute_custom_code")
-
-
-def _make_safe_open(workspace_path: Path):
-    """Create a restricted open() that only allows reading files,
-    or writing ONLY under the workspace path."""
-    _real_open = open
-
-    def safe_open(file, mode="r", *args, **kwargs):
-        file_path = Path(file).resolve()
-        if "w" in mode or "a" in mode or "x" in mode:
-            if not str(file_path).startswith(str(workspace_path.resolve())):
-                raise PermissionError(
-                    f"Write access denied: {file_path} is outside workspace. "
-                    f"Only files under {workspace_path} can be written."
-                )
-        if "b" in mode and ("w" in mode or "a" in mode):
-            raise PermissionError("Binary write mode not allowed in custom code.")
-        return _real_open(file, mode, *args, **kwargs)
-
-    return safe_open
-
-
-# ---------------------------------------------------------------------------
-# Android Resource Tools — structured color/style/theme operations
-# ---------------------------------------------------------------------------
-
-@tool
-def find_app_colors(color_family: Optional[str] = None) -> str:
-    """Find all color definitions in the app's res/values*/colors.xml files.
-    Returns structured name→hex mappings. Use this INSTEAD of searching for colors
-    with smart_search/grep — it understands Android's color resource system.
-
-    Args:
-        color_family: Optional filter — "red", "blue", "green", "purple", "orange",
-                      "yellow", "cyan", "pink". Only returns colors in that hue range.
-                      Leave empty to get ALL app colors.
-    """
-    from apk_agent.tools.resource_tools import find_app_colors as _find
-
-    def _run():
-        result = _find(_project.apktool_dir, color_family=color_family)
-        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
-    return _safe_call(_run, "find_app_colors")
-
-
-@tool
-def find_app_styles() -> str:
-    """Find all theme/style definitions that reference colors (colorPrimary, colorAccent, etc.).
-    Parses styles.xml and themes.xml. Use this to understand which colors are used
-    at the theme level — these affect the entire app's appearance.
-    """
-    from apk_agent.tools.resource_tools import find_app_styles as _find
-
-    def _run():
-        result = _find(_project.apktool_dir)
-        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
-    return _safe_call(_run, "find_app_styles")
-
-
-@tool
-def replace_colors(color_map_json: str) -> str:
-    """Bulk replace color hex values across ALL resource XML files (colors.xml, styles.xml,
-    layouts, drawables). This is the correct way to change app colors — it handles
-    ALL resource files at once, not just colors.xml.
-
-    Args:
-        color_map_json: JSON object mapping old hex → new hex colors, e.g.:
-            {"#FFE11C22": "#FF1C22E1", "#FF0000": "#0000FF"}
-            Include '#' prefix. Both 6-digit and 8-digit (with alpha) formats supported.
-    """
-    from apk_agent.tools.resource_tools import replace_colors as _replace
-
-    def _run():
-        try:
-            cmap = json.loads(color_map_json)
-        except json.JSONDecodeError as e:
-            return json.dumps({"success": False, "error": f"Invalid JSON: {e}"})
-        if not isinstance(cmap, dict):
-            return json.dumps({"success": False, "error": "color_map_json must be a JSON object"})
-        result = _replace(_project.apktool_dir, cmap)
-        return json.dumps(result, ensure_ascii=False, indent=2)
-    return _safe_call(_run, "replace_colors")
-
-
-@tool
-def list_drawables(color_filter: Optional[str] = None) -> str:
-    """List drawable XML files that contain hardcoded colors.
-    Optionally filter by a specific hex color to find all drawables using that color.
-
-    Args:
-        color_filter: Optional hex color to filter by (e.g., "#FF0000").
-                      Only returns drawables containing this exact color.
-    """
-    from apk_agent.tools.resource_tools import list_drawables as _list
-
-    def _run():
-        result = _list(_project.apktool_dir, color_filter=color_filter)
-        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
-    return _safe_call(_run, "list_drawables")
-
-
-# ---------------------------------------------------------------------------
 # NEW: Deep smali analysis (professional reversing)
 # ---------------------------------------------------------------------------
 
@@ -2219,14 +1401,7 @@ def batch_read_smali_methods(
             pairs = json.loads(file_method_pairs_json)
         except json.JSONDecodeError:
             return json.dumps({"success": False, "error": "Invalid JSON in file_method_pairs_json"})
-        # Pre-resolve each file path through centralized resolver
-        for pair in pairs:
-            raw_path = pair.get("file", "")
-            if raw_path:
-                resolved = _resolve_file(raw_path)
-                if resolved.is_file():
-                    pair["file"] = str(resolved)  # absolute path, no base_dir needed
-        result = batch_read_methods(pairs, base_dir="")
+        result = batch_read_methods(pairs, base_dir=str(_project.apktool_dir))
         return json.dumps(result, ensure_ascii=False, indent=2)[:20000]
     return _safe_call(_run, "batch_read_smali_methods")
 
@@ -2281,10 +1456,11 @@ def smart_search(
 # Module-level graph + index holders (loaded once per session)
 _code_graph = None
 _code_index = None
+_smali_index = None  # SmaliIndex IR (from smali_ir module)
 
 
 def _ensure_graph():
-    """Load or build the code graph. Returns the graph or None."""
+    """Load or build the code graph. Returns the graph."""
     global _code_graph
     if _code_graph is not None:
         return _code_graph
@@ -2294,12 +1470,8 @@ def _ensure_graph():
     graph_path = Path(_project.outputs_dir) / "call_graph.pickle"
     G = load_graph(graph_path)
     if G is not None:
-        if G.number_of_nodes() == 0:
-            # Stale empty graph on disk — discard and rebuild
-            G = None
-        else:
-            _code_graph = G
-            return G
+        _code_graph = G
+        return G
 
     # Need to build it
     smali_dirs = _get_all_smali_dirs()
@@ -2308,15 +1480,13 @@ def _ensure_graph():
 
     from apk_agent.progress import report_progress
     G = build_code_graph(smali_dirs, progress_callback=report_progress)
-    if G.number_of_nodes() == 0:
-        return None  # Don't cache empty graphs
     save_graph(G, graph_path)
     _code_graph = G
     return G
 
 
 def _ensure_index():
-    """Load or build the code index. Returns the index dict or None."""
+    """Load or build the code index. Returns the index dict."""
     global _code_index
     if _code_index is not None:
         return _code_index
@@ -2326,12 +1496,8 @@ def _ensure_index():
     index_path = Path(_project.outputs_dir) / "code_index.json"
     idx = load_index(index_path)
     if idx is not None:
-        if idx.get("stats", {}).get("total_classes", 0) == 0:
-            # Stale empty index on disk — discard and rebuild
-            idx = None
-        else:
-            _code_index = idx
-            return idx
+        _code_index = idx
+        return idx
 
     # Need to build it
     smali_dirs = _get_all_smali_dirs()
@@ -2341,10 +1507,34 @@ def _ensure_index():
     from apk_agent.progress import report_progress
     idx = build_code_index(smali_dirs, jadx_dir=_project.jadx_dir,
                            progress_callback=report_progress)
-    if idx.get("stats", {}).get("total_classes", 0) == 0:
-        return None  # Don't cache empty indexes
     save_index(idx, index_path)
     _code_index = idx
+    return idx
+
+
+def _ensure_smali_index():
+    """Load or build the SmaliIndex IR. Returns the SmaliIndex."""
+    global _smali_index
+    if _smali_index is not None:
+        return _smali_index
+
+    from apk_agent.tools.smali_ir import load_index as load_smali_index, build_index as build_smali_idx, save_index as save_smali_index
+
+    index_path = Path(_project.outputs_dir) / "smali_index.pickle"
+    idx = load_smali_index(index_path)
+    if idx is not None:
+        _smali_index = idx
+        return idx
+
+    # Need to build it
+    smali_dirs = _get_all_smali_dirs()
+    if not smali_dirs:
+        return None
+
+    from apk_agent.progress import report_progress
+    idx = build_smali_idx(smali_dirs, progress_callback=report_progress)
+    save_smali_index(idx, index_path)
+    _smali_index = idx
     return idx
 
 
@@ -2628,11 +1818,13 @@ def auto_patch_bypass(
                     valid = [pc.value for pc in PatchCategory]
                     return json.dumps({"success": False, "error": f"Unknown category '{c}'. Valid: {valid}"})
 
+        from apk_agent.progress import report_progress
         stats = run_smali_patches(
             smali_dirs=smali_dirs,
             categories=cats,
             backup_dir=_project.patch_backup_dir,
             custom_device_id=custom_device_id,
+            progress_callback=report_progress,
         )
         return json.dumps(stats.to_dict(), ensure_ascii=False, indent=2)[:20000]
     return _safe_call(_run, "auto_patch_bypass")
@@ -2728,10 +1920,12 @@ def remove_ads() -> str:
         if not smali_dirs:
             return json.dumps({"success": False, "error": "No smali directories found. Run apktool_decompile first."})
 
+        from apk_agent.progress import report_progress
         stats = run_smali_patches(
             smali_dirs=smali_dirs,
             categories=[PatchCategory.ADS_REMOVAL, PatchCategory.LICENSE_BYPASS],
             backup_dir=_project.patch_backup_dir,
+            progress_callback=report_progress,
         )
         return json.dumps(stats.to_dict(), ensure_ascii=False, indent=2)[:20000]
     return _safe_call(_run, "remove_ads")
@@ -2749,54 +1943,234 @@ def list_bypass_categories() -> str:
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
+    result = list_patch_categories()
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
 # ---------------------------------------------------------------------------
-# APK Health Check — comprehensive pre-build validation
+# SOTA Analysis tools (SmaliIndex IR, Unified Scanner, Data Flow, etc.)
 # ---------------------------------------------------------------------------
+
 
 @tool
-def apk_health_check(patched_files_json: str = "[]") -> str:
-    """Run comprehensive health check on the decompiled APK BEFORE building.
-    Detects issues that would cause the APK to crash or fail to build.
-
-    Checks performed:
-      - Smali syntax: unclosed methods, nested .method, missing .end method
-      - Return-type consistency: void methods using return instead of return-void
-      - Register overflow: using vN registers beyond .registers declaration
-      - Label integrity: goto/if-* jumping to undefined labels
-      - Missing return statements: non-abstract methods without return
-      - AndroidManifest.xml well-formedness
-      - Resource XML validation (all res/*.xml files)
-
-    ALWAYS run this after patching and BEFORE apktool_build.
-
-    Args:
-        patched_files_json: Optional JSON array of file paths to check.
-            If empty/[], checks ALL smali files (slower but thorough).
-            Example: ["smali_classes3/com/example/Foo.smali"]
+def build_smali_index() -> str:
+    """Build (or rebuild) the SmaliIndex — a full IR (Intermediate Representation)
+    of every smali class, method, instruction, field, and annotation.
+    Enables instant API caller lookup, string constant search, class hierarchy
+    queries, and method-category classification.
+    Must have run apktool_decompile first. Build this BEFORE unified_scan or taint analysis.
     """
-    from apk_agent.tools.deep_analysis import apk_health_check as _check
+    global _smali_index
+    from apk_agent.tools.smali_ir import build_index as build_smali_idx, save_index as save_smali_idx, index_stats
+
+    smali_dirs = _get_all_smali_dirs()
+    if not smali_dirs:
+        return json.dumps({"success": False, "error": "No smali directories found. Run apktool_decompile first."})
 
     def _run():
-        # Parse optional patched files list
-        patched_files = None
-        try:
-            paths = json.loads(patched_files_json) if patched_files_json.strip() else []
-            if paths:
-                patched_files = []
-                for p in paths:
-                    resolved = _resolve_file(p)
-                    if resolved.is_file():
-                        patched_files.append(resolved)
-        except (json.JSONDecodeError, TypeError):
-            pass
+        global _smali_index
+        from apk_agent.progress import report_progress
+        idx = build_smali_idx(smali_dirs, progress_callback=report_progress)
+        out_path = Path(_project.outputs_dir) / "smali_index.pickle"
+        save_smali_idx(idx, out_path)
+        _smali_index = idx
+        stats = index_stats(idx)
+        stats["success"] = True
+        return json.dumps(stats, indent=2)
+    return _safe_call(_run, "build_smali_index")
 
-        result = _check(
-            apktool_dir=_project.apktool_dir,
-            smali_dirs=_get_all_smali_dirs(),
-            patched_files=patched_files,
-        )
+
+@tool
+def smali_index_stats() -> str:
+    """Get SmaliIndex statistics — total classes, methods, strings, API calls indexed.
+    Useful to confirm the index is built and see its scope.
+    """
+    from apk_agent.tools.smali_ir import index_stats
+
+    def _run():
+        idx = _ensure_smali_index()
+        if idx is None:
+            return json.dumps({"success": False, "error": "No SmaliIndex. Run build_smali_index first."})
+        stats = index_stats(idx)
+        stats["success"] = True
+        return json.dumps(stats, indent=2)
+    return _safe_call(_run, "smali_index_stats")
+
+
+@tool
+def unified_scan(severity_filter: Optional[str] = None, max_findings: int = 500) -> str:
+    """Run the unified security scanner on the SmaliIndex IR.
+    Replaces and improves upon scan_vulnerabilities, detect_protections, etc.
+    Checks 35+ detection rules across SSL, root, crypto, storage, WebView,
+    IPC, SQL injection, dynamic class loading, reflection, cloud secrets, and more.
+    Returns deduplicated, severity-ranked findings with evidence chains.
+
+    Args:
+        severity_filter: Optional — only return findings of this severity ("critical", "high", "medium", "low", "info").
+        max_findings: Maximum findings to return (default 500).
+    """
+    from apk_agent.tools.unified_scanner import scan
+
+    def _run():
+        idx = _ensure_smali_index()
+        if idx is None:
+            return json.dumps({"success": False, "error": "No SmaliIndex. Run build_smali_index first."})
+        result = scan(idx, severity_filter=severity_filter, max_findings=max_findings)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:30000]
+    return _safe_call(_run, "unified_scan")
+
+
+@tool
+def analyze_data_flow(class_name: str, method_name: str) -> str:
+    """Analyze register-level data flow within a specific method.
+    Tracks const-string values, object types, field accesses, and method return values
+    through registers. Shows what each register holds at every instruction.
+
+    Args:
+        class_name: Full smali class name (e.g., "Lcom/example/CryptoHelper;").
+        method_name: Method name (e.g., "encrypt", "doFinal"). First match in the class is used.
+    """
+    from apk_agent.tools.data_flow import analyze_method_flow
+
+    def _run():
+        idx = _ensure_smali_index()
+        if idx is None:
+            return json.dumps({"success": False, "error": "No SmaliIndex. Run build_smali_index first."})
+        cls = idx.get_class(class_name)
+        if cls is None:
+            # Try partial match
+            matches = idx.search_classes(class_name)
+            if not matches:
+                return json.dumps({"success": False, "error": f"Class not found: {class_name}"})
+            cls = matches[0]
+        target = None
+        for m in cls.methods:
+            if method_name in m.name:
+                target = m
+                break
+        if target is None:
+            return json.dumps({"success": False, "error": f"Method '{method_name}' not found in {cls.name}"})
+        result = analyze_method_flow(target)
+        result["class"] = cls.name
         return json.dumps(result, ensure_ascii=False, indent=2)[:20000]
-    return _safe_call(_run, "apk_health_check")
+    return _safe_call(_run, "analyze_data_flow")
+
+
+@tool
+def run_taint_analysis(max_depth: int = 5, max_flows: int = 200) -> str:
+    """Run inter-procedural taint analysis across the entire codebase.
+    Traces data from sensitive SOURCES (device IDs, location, credentials,
+    user input) to dangerous SINKS (logging, network, IPC, storage, SMS).
+    Returns taint flows ranked by severity with full call chains.
+
+    Args:
+        max_depth: BFS depth for tracing flows (default 5).
+        max_flows: Maximum taint flows to return (default 200).
+    """
+    from apk_agent.tools.data_flow import run_taint_analysis as _run_taint
+
+    def _run():
+        idx = _ensure_smali_index()
+        if idx is None:
+            return json.dumps({"success": False, "error": "No SmaliIndex. Run build_smali_index first."})
+        result = _run_taint(idx, max_depth=max_depth, max_flows=max_flows)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
+    return _safe_call(_run, "run_taint_analysis")
+
+
+@tool
+def find_hardcoded_crypto() -> str:
+    """Scan all crypto-related methods for hardcoded keys, IVs, and secrets.
+    Uses register-level data flow to detect const-string values passed to
+    SecretKeySpec, Cipher.init, IvParameterSpec, MessageDigest, etc.
+    """
+    from apk_agent.tools.data_flow import find_hardcoded_crypto as _find_crypto
+
+    def _run():
+        idx = _ensure_smali_index()
+        if idx is None:
+            return json.dumps({"success": False, "error": "No SmaliIndex. Run build_smali_index first."})
+        result = _find_crypto(idx)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:20000]
+    return _safe_call(_run, "find_hardcoded_crypto")
+
+
+@tool
+def generate_bypass_plans(max_bypasses: int = 50) -> str:
+    """Generate automated bypass plans (smali patches + Frida scripts) for
+    detected security protections. Runs unified_scan first, then generates
+    bypasses for: root detection, emulator detection, debug detection,
+    SSL pinning, certificate pinning, SafetyNet, signature verification.
+
+    Returns a list of BypassPlans with difficulty ratings, ready-to-apply
+    smali patches, and Frida hook scripts.
+
+    Args:
+        max_bypasses: Maximum bypass plans to generate (default 50).
+    """
+    from apk_agent.tools.unified_scanner import scan
+    from apk_agent.tools.auto_bypass import generate_bypasses
+
+    def _run():
+        idx = _ensure_smali_index()
+        if idx is None:
+            return json.dumps({"success": False, "error": "No SmaliIndex. Run build_smali_index first."})
+        # First run the scanner to get findings
+        scan_result = scan(idx)
+        findings = scan_result.get("findings", [])
+        if not findings:
+            return json.dumps({"success": True, "bypasses": [], "message": "No security protections detected to bypass."})
+        result = generate_bypasses(idx, findings, max_bypasses=max_bypasses)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:30000]
+    return _safe_call(_run, "generate_bypass_plans")
+
+
+@tool
+def analyze_manifest_deep() -> str:
+    """Deep semantic analysis of AndroidManifest.xml with code cross-referencing.
+    Goes beyond basic parsing — checks for:
+    - Backup/debuggable/cleartext misconfigurations
+    - Dangerous permission combinations
+    - Exported components without protection (cross-refs code for input validation)
+    - Deep link attack surfaces
+    - Content provider path traversal risks
+    - SDK version security implications
+    """
+    from apk_agent.tools.manifest_analyzer import analyze_manifest
+
+    def _run():
+        manifest_path = _project.apktool_dir / "AndroidManifest.xml"
+        if not manifest_path.exists():
+            return json.dumps({"success": False, "error": "AndroidManifest.xml not found. Run apktool_decompile first."})
+        # Optionally pass the SmaliIndex for code cross-referencing
+        idx = _ensure_smali_index()  # May return None — that's OK
+        result = analyze_manifest(str(manifest_path), index=idx)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
+    return _safe_call(_run, "analyze_manifest_deep")
+
+
+@tool
+def scan_cloud_secrets() -> str:
+    """Scan for hardcoded cloud credentials and API keys in the codebase.
+    Detects: Firebase (RTDB, Storage, API key), AWS (access key, secret, S3),
+    GCP (API key, OAuth), Azure connection strings, Slack/Telegram/Discord webhooks,
+    PEM private keys, hardcoded JWTs, and generic API secrets.
+    Values are auto-redacted in output for safe reporting.
+    """
+    from apk_agent.tools.cloud_scanner import scan_cloud_config, scan_cloud_config_files
+
+    def _run():
+        idx = _ensure_smali_index()
+        if idx is not None:
+            result = scan_cloud_config(idx)
+        else:
+            # Fallback to file-based scanning
+            apk_dir = _project.apktool_dir
+            if not apk_dir.is_dir():
+                return json.dumps({"success": False, "error": "No decompiled directory. Run apktool_decompile first."})
+            result = scan_cloud_config_files(str(apk_dir))
+        return json.dumps(result, ensure_ascii=False, indent=2)[:20000]
+    return _safe_call(_run, "scan_cloud_secrets")
 
 
 # ---------------------------------------------------------------------------
@@ -2868,21 +2242,6 @@ ALL_TOOLS = [
     load_evidence,
     search_evidence,
     get_evidence_summary,
-    # Working memory / task planning
-    update_scratchpad,
-    read_scratchpad,
-    update_task_plan,
-    mark_task_done,
-    edit_task_plan,
-    # Human interaction (ask user for guidance)
-    ask_user,
-    # Android resource tools (colors, styles, themes, drawables)
-    find_app_colors,
-    find_app_styles,
-    replace_colors,
-    list_drawables,
-    # Custom code execution (advanced escape hatch)
-    execute_custom_code,
     # Patching
     apply_smali_patch,
     preview_smali_patch,
@@ -2893,20 +2252,20 @@ ALL_TOOLS = [
     patch_manifest_security,
     remove_ads,
     list_bypass_categories,
-    # Deep Analysis
-    validate_patch,
-    find_entry_points,
-    map_hierarchy,
-    analyze_shared_prefs,
-    extract_native_strings,
-    scan_assets_secrets,
-    diff_patched_file,
-    # APK Health Check (pre-build validation)
-    apk_health_check,
     # Build & Sign
     apktool_build,
     zipalign_apk_tool,
     sign_apk,
     # Reporting
     generate_report,
+    # SOTA Analysis (SmaliIndex IR, Unified Scanner, Taint, Bypass, Cloud)
+    build_smali_index,
+    smali_index_stats,
+    unified_scan,
+    analyze_data_flow,
+    run_taint_analysis,
+    find_hardcoded_crypto,
+    generate_bypass_plans,
+    analyze_manifest_deep,
+    scan_cloud_secrets,
 ]

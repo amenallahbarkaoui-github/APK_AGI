@@ -1,7 +1,8 @@
-"""Rich console UI helpers for the chat CLI — v3 with live progress tracking."""
+"""Rich console UI helpers for the chat CLI — v4 with live status bar + token tracking."""
 
 from __future__ import annotations
 
+import threading
 import time
 from typing import Optional
 
@@ -40,17 +41,17 @@ def print_welcome(project_id: str | None = None, apk_name: str | None = None) ->
     banner = Table(show_header=False, show_edge=False, padding=(0, 1), expand=False)
     banner.add_column(style="bold cyan", justify="center")
     banner.add_row("╔════════════════════════════════════════════════════╗")
-    banner.add_row("║     🔬 APK Agent v2.0.0 — Orchestrator Edition   ║")
+    banner.add_row("║     🔬 APK Agent v4.0.0 — SOTA Analysis Engine   ║")
     banner.add_row("║     Interactive APK Reverse Engineering           ║")
-    banner.add_row("║     40+ tools • Sub-agents • Parallel execution   ║")
+    banner.add_row("║     72 tools • Taint Analysis • Auto-Bypass      ║")
     banner.add_row("╚════════════════════════════════════════════════════╝")
     console.print(banner)
 
     if project_id and apk_name:
         console.print(f"  📦 Project: [bold]{project_id}[/]  APK: [bold]{apk_name}[/]")
     console.print()
-    console.print("[dim]Modes: normal chat | /orchestrator (parallel sub-agents)[/]")
-    console.print("[dim]Commands: /status /logs /stop /report /progress /help[/]")
+    console.print("[dim]Modes: normal chat | /orchestrator (parallel sub-agents) | /auto (one-shot)[/]")
+    console.print("[dim]Commands: /status /tokens /progress /plan /help[/]")
     console.print("[dim]Type your task (e.g., 'full security audit', 'bypass SSL pinning')[/]")
     console.print()
 
@@ -370,6 +371,7 @@ def print_help() -> None:
   [cyan]/open <id>[/]         — Open an existing project by ID
   [cyan]/list[/]               — List all projects
   [cyan]/status[/]             — Show current project status
+  [cyan]/tokens[/]             — Show current context token usage
   [cyan]/logs[/]               — Show recent tool logs
   [cyan]/report[/]             — Generate/show the report
   [cyan]/progress[/]           — Show task progress summary
@@ -383,38 +385,155 @@ def print_help() -> None:
 
 [bold]Session Commands:[/]
   [cyan]/session[/]            — Show session info (thread ID, messages, tokens)
-  [cyan]/tokens[/]             — Show current context token usage
   [cyan]/compact[/]            — Show compaction status
   [cyan]/reset[/]              — Delete session history (start fresh)
 
-[bold]Session Persistence:[/]
-  Your conversation is automatically saved to disk. When you restart
-  and open the same project, you'll be asked to resume the session.
-  The full message history and agent state are preserved.
+[bold]SOTA Analysis Tools (NEW):[/]
+  The agent now has 72 tools including:
+  • [cyan]SmaliIndex IR[/]     — Full parsed representation of all smali code
+  • [cyan]Unified Scanner[/]   — 36-rule single-pass security scanner
+  • [cyan]Taint Analysis[/]    — Source→Sink data flow tracing
+  • [cyan]Auto-Bypass[/]       — Smali patches + Frida scripts for 8 protection types
+  • [cyan]Manifest Analyzer[/] — Deep semantic analysis with code cross-referencing
+  • [cyan]Cloud Scanner[/]     — Firebase/AWS/GCP/Azure credential detection
 
-[bold]Auto-Compact:[/]
-  When the conversation exceeds ~200K tokens, old messages are
-  automatically summarized to free up context. All findings, file
-  paths, and analysis results are preserved in the summary.
+[bold]Auto Mode:[/]
+  In auto mode, patches are auto-approved and agent questions are
+  auto-answered. Best for one-shot full analysis runs.
 
 [bold]Orchestrator Mode:[/]
-  In orchestrator mode, complex tasks are automatically broken down
-  into sub-tasks and assigned to specialized sub-agents:
-  • [cyan]Recon Agent[/]     — APK metadata, permissions, strings
-  • [cyan]Vuln Scanner[/]    — 25+ vulnerability patterns
-  • [cyan]Crypto Analyst[/]  — Cryptography deep analysis
-  • [cyan]Patcher Agent[/]   — Smali patching and rebuilding
-  • [cyan]Report Agent[/]    — Security report generation
-  
-  Independent sub-agents run in parallel for faster analysis.
+  Complex tasks are broken into sub-tasks for parallel execution.
 
 [bold]Example Tasks:[/]
   • "full security audit of this APK"
   • "bypass SSL pinning statically"
   • "find hardcoded API keys and secrets"
-  • "remove root detection"
-  • "analyze cryptographic implementations"
-  • "find all exported components and assess attack surface"
+  • "run taint analysis to find data leaks"
+  • "scan for cloud misconfigurations"
+  • "generate Frida scripts for all protections"
 """
     console.print(Panel(help_text, title="📖 Help", border_style="blue"))
+
+
+# ---------------------------------------------------------------------------
+# Token Usage Tracking
+# ---------------------------------------------------------------------------
+
+class TokenTracker:
+    """Thread-safe tracker for LLM token usage across the session."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.total_prompt_tokens: int = 0
+        self.total_completion_tokens: int = 0
+        self.total_calls: int = 0
+        self.turn_prompt_tokens: int = 0
+        self.turn_completion_tokens: int = 0
+        self.turn_calls: int = 0
+        self.turn_start: float = 0.0
+        self._active_tool: str = ""
+        self._active_tool_start: float = 0.0
+
+    def start_turn(self) -> None:
+        with self._lock:
+            self.turn_prompt_tokens = 0
+            self.turn_completion_tokens = 0
+            self.turn_calls = 0
+            self.turn_start = time.time()
+
+    def record_call(self, prompt_tokens: int = 0, completion_tokens: int = 0) -> None:
+        with self._lock:
+            self.total_prompt_tokens += prompt_tokens
+            self.total_completion_tokens += completion_tokens
+            self.total_calls += 1
+            self.turn_prompt_tokens += prompt_tokens
+            self.turn_completion_tokens += completion_tokens
+            self.turn_calls += 1
+
+    def set_active_tool(self, name: str) -> None:
+        with self._lock:
+            self._active_tool = name
+            self._active_tool_start = time.time()
+
+    def clear_active_tool(self) -> None:
+        with self._lock:
+            self._active_tool = ""
+
+    @property
+    def active_tool(self) -> str:
+        return self._active_tool
+
+    @property
+    def active_tool_elapsed(self) -> float:
+        if not self._active_tool:
+            return 0
+        return time.time() - self._active_tool_start
+
+    @property
+    def turn_elapsed(self) -> float:
+        if not self.turn_start:
+            return 0
+        return time.time() - self.turn_start
+
+    @property
+    def total_tokens(self) -> int:
+        return self.total_prompt_tokens + self.total_completion_tokens
+
+    def format_status_line(self) -> str:
+        """Build a compact status line for display at the bottom."""
+        parts = []
+        # Active tool
+        if self._active_tool:
+            elapsed = self.active_tool_elapsed
+            parts.append(f"🔧 {self._active_tool} ({elapsed:.1f}s)")
+        # Turn stats
+        if self.turn_start:
+            turn_t = self.turn_elapsed
+            parts.append(f"⏱ {turn_t:.0f}s")
+            if self.turn_calls:
+                parts.append(f"📡 {self.turn_calls} calls")
+        # Total tokens
+        if self.total_tokens:
+            total_k = self.total_tokens / 1000
+            parts.append(f"🪙 {total_k:.1f}k tokens")
+        return " │ ".join(parts) if parts else ""
+
+
+# Global token tracker
+token_tracker = TokenTracker()
+
+
+def print_status_bar() -> None:
+    """Print a compact status bar with current token usage and tool state."""
+    line = token_tracker.format_status_line()
+    if line:
+        console.print(f"[dim]─── {line} ───[/]")
+
+
+def print_turn_summary() -> None:
+    """Print a summary at the end of each agent turn."""
+    tt = token_tracker
+    if not tt.turn_start:
+        return
+
+    elapsed = tt.turn_elapsed
+    parts = [f"[dim]── Turn: {elapsed:.1f}s"]
+    if tt.turn_calls:
+        parts.append(f"{tt.turn_calls} LLM calls")
+    if tt.turn_prompt_tokens or tt.turn_completion_tokens:
+        parts.append(f"{tt.turn_prompt_tokens:,}→{tt.turn_completion_tokens:,} tokens")
+    if tt.total_tokens:
+        total_k = tt.total_tokens / 1000
+        parts.append(f"session total: {total_k:.1f}k")
+
+    # Context usage from compactor
+    try:
+        from apk_agent.agent.graph import _compactor
+        if _compactor and _compactor.last_token_count > 0:
+            ctx_pct = (_compactor.last_token_count / _compactor.token_threshold) * 100
+            parts.append(f"context: {ctx_pct:.0f}%")
+    except Exception:
+        pass
+
+    console.print(" │ ".join(parts) + " ──[/]")
 

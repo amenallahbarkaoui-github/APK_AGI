@@ -40,6 +40,9 @@ from apk_agent.ui import (
     print_warning,
     print_welcome,
     enable_live_progress,
+    print_status_bar,
+    print_turn_summary,
+    token_tracker,
 )
 from apk_agent.workspace import Project, ProjectManager
 
@@ -65,9 +68,9 @@ def _print_startup() -> None:
     """Print the full-screen startup banner."""
     console.print()
     console.print("[bold cyan]╔══════════════════════════════════════════════════════╗[/]")
-    console.print("[bold cyan]║[/]     [bold white]🔬 APK Agent v3.0.0[/]                            [bold cyan]║[/]")
+    console.print("[bold cyan]║[/]     [bold white]🔬 APK Agent v4.0.0[/]                            [bold cyan]║[/]")
     console.print("[bold cyan]║[/]     [dim]Interactive APK Reverse Engineering[/]            [bold cyan]║[/]")
-    console.print("[bold cyan]║[/]     [dim]70+ tools • Sub-agents • Parallel execution[/]   [bold cyan]║[/]")
+    console.print("[bold cyan]║[/]     [dim]72 tools • Taint Analysis • Auto-Bypass[/]       [bold cyan]║[/]")
     console.print("[bold cyan]╚══════════════════════════════════════════════════════╝[/]")
     console.print()
 
@@ -580,6 +583,9 @@ def _run_agent_turn(graph, graph_config: dict, user_input: str, project: Project
     from apk_agent.progress import progress_manager
     progress_manager.set_overall_task(user_input)
 
+    # Start turn tracking
+    token_tracker.start_turn()
+
     input_state = {
         "messages": [HumanMessage(content=user_input)],
         "project_id": project.id,
@@ -655,6 +661,10 @@ def _run_agent_turn(graph, graph_config: dict, user_input: str, project: Project
     except Exception:
         pass
 
+    # Print turn summary with token usage
+    token_tracker.clear_active_tool()
+    print_turn_summary()
+
 
 # ---------------------------------------------------------------------------
 # Session info helpers
@@ -674,18 +684,25 @@ def _show_session_info(session_meta: SessionMeta, project: Project) -> None:
     table.add_row("Last Active", session_meta.last_active_at)
     table.add_row("Messages", str(session_meta.message_count))
     table.add_row("Auto-compacts", str(session_meta.compact_count))
-    table.add_row("Mode", "Orchestrator" if session_meta.orchestrator_mode else "Normal")
+    table.add_row("Mode", "Orchestrator" if session_meta.orchestrator_mode else ("Auto" if session_meta.auto_mode else "Normal"))
     table.add_row("Status", session_meta.status)
 
-    # Check token count
+    # Token usage
+    tt = token_tracker
+    if tt.total_tokens:
+        table.add_row("Total Tokens", f"{tt.total_tokens:,}")
+        table.add_row("LLM Calls", str(tt.total_calls))
+
+    # Context window
     try:
         from apk_agent.compactor import count_message_tokens, DEFAULT_TOKEN_THRESHOLD
         from apk_agent.agent.graph import _compactor
-        if _compactor:
-            token_pct = (_compactor.last_token_count / DEFAULT_TOKEN_THRESHOLD) * 100
+        if _compactor and _compactor.last_token_count > 0:
+            token_pct = (_compactor.last_token_count / _compactor.token_threshold) * 100
+            color = "green" if token_pct < 60 else ("yellow" if token_pct < 85 else "red")
             table.add_row(
                 "Context Usage",
-                f"~{_compactor.last_token_count:,} tokens ({token_pct:.0f}% of {DEFAULT_TOKEN_THRESHOLD:,} limit)",
+                f"[{color}]~{_compactor.last_token_count:,} tokens ({token_pct:.0f}%)[/]",
             )
     except Exception:
         pass
@@ -711,18 +728,35 @@ def _manual_compact(session_meta: SessionMeta) -> None:
 
 def _show_token_count() -> None:
     """Show the current estimated token count."""
+    from rich.table import Table
+
+    table = Table(title="📊 Token Usage", show_header=False, padding=(0, 2))
+    table.add_column("Key", style="bold cyan")
+    table.add_column("Value")
+
+    # Session totals from token tracker
+    tt = token_tracker
+    table.add_row("Session Prompt Tokens", f"{tt.total_prompt_tokens:,}")
+    table.add_row("Session Completion Tokens", f"{tt.total_completion_tokens:,}")
+    table.add_row("Session Total", f"[bold]{tt.total_tokens:,}[/]")
+    table.add_row("LLM Calls", str(tt.total_calls))
+
+    # Context window usage from compactor
     try:
         from apk_agent.agent.graph import _compactor
-        if _compactor:
-            console.print(
-                f"[bold]📊 Context: ~{_compactor.last_token_count:,} tokens | "
-                f"Limit: {_compactor.token_threshold:,} | "
-                f"Compactions: {_compactor.compact_count}[/]"
-            )
-        else:
-            print_info("Compactor not initialized.")
+        if _compactor and _compactor.last_token_count > 0:
+            ctx_pct = (_compactor.last_token_count / _compactor.token_threshold) * 100
+            bar_len = 20
+            filled = int(ctx_pct / 100 * bar_len)
+            bar = "█" * filled + "░" * (bar_len - filled)
+            color = "green" if ctx_pct < 60 else ("yellow" if ctx_pct < 85 else "red")
+            table.add_row("Context Window", f"[{color}][{bar}] {ctx_pct:.0f}%[/]")
+            table.add_row("Context Tokens", f"~{_compactor.last_token_count:,} / {_compactor.token_threshold:,}")
+            table.add_row("Auto-Compactions", str(_compactor.compact_count))
     except Exception:
-        print_info("Token counting not available.")
+        pass
+
+    console.print(table)
 
 
 # ---------------------------------------------------------------------------
@@ -804,6 +838,14 @@ def _process_stream_event(event: dict, graph, graph_config: dict, *, auto_mode: 
             messages = node_output.get("messages", [])
             for msg in messages:
                 if isinstance(msg, AIMessage):
+                    # Track token usage from response metadata
+                    usage = getattr(msg, "usage_metadata", None) or getattr(msg, "response_metadata", {}).get("token_usage", {})
+                    if usage:
+                        prompt_t = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
+                        compl_t = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
+                        if prompt_t or compl_t:
+                            token_tracker.record_call(prompt_t, compl_t)
+
                     # Print text content
                     if msg.content and isinstance(msg.content, str) and msg.content.strip():
                         print_ai_message(msg.content)
@@ -822,12 +864,14 @@ def _process_stream_event(event: dict, graph, graph_config: dict, *, auto_mode: 
                                     parts.append(f"{k}={v_str}")
                                 arg_summary = ", ".join(parts)
                             print_tool_start(tc['name'], arg_summary)
+                            token_tracker.set_active_tool(tc['name'])
 
         elif node_name == "tools":
             # Tool node produced results
             messages = node_output.get("messages", [])
             for msg in messages:
                 if isinstance(msg, ToolMessage):
+                    token_tracker.clear_active_tool()
                     # Better success detection
                     content_start = msg.content[:100].lower()
                     success = (
