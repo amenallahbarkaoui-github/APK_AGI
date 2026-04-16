@@ -638,6 +638,9 @@ def read_file(file_path: str, start_line: int = 0, end_line: int = 0) -> str:
     """Read the contents of a file from the decompiled project.
     Use this to examine Java source, smali code, AndroidManifest.xml, etc.
 
+    When to use: When you need to see actual file contents. Use after search tools
+    (index_lookup_*, search_in_code, smart_search) locate a file of interest.
+
     Args:
         file_path: Absolute path or path relative to the project workspace.
                    Partial paths like 'com/example/Foo.java' are also resolved
@@ -893,6 +896,9 @@ def apply_smali_patch(patch_plan_json: str) -> str:
 def preview_smali_patch(patch_plan_json: str) -> str:
     """Preview what a smali patch would change WITHOUT actually modifying files.
     Use this to validate a patch plan before applying it.
+
+    When to use: ALWAYS preview before apply_smali_patch to verify the patch
+    targets the right code and makes the intended change.
 
     IMPORTANT: You MUST pass the full JSON plan as the patch_plan_json argument.
     Do NOT call this tool with empty arguments.
@@ -1259,6 +1265,9 @@ def directory_overview(directory: Optional[str] = None) -> str:
     """Get statistics about a directory — file counts, sizes, types.
     Use this to decide which directories to search for analysis.
 
+    When to use: For orientation — understand the project structure, find
+    where code lives, and decide which directories to focus on.
+
     Args:
         directory: Directory to analyze. Defaults to project root.
 
@@ -1290,7 +1299,8 @@ def search_interceptors(directory: Optional[str] = None) -> str:
     chain.proceed(, RequestBody, ResponseBody, addInterceptor(), and
     crypto imports co-located with network code.
 
-    Use this FIRST when investigating encrypted API payloads/responses.
+    When to use: FIRST tool when investigating encrypted API payloads/responses.
+    Finds interceptor classes and crypto-in-network patterns.
 
     Args:
         directory: Directory to search. Defaults to JADX sources.
@@ -1377,6 +1387,9 @@ def analyze_network_config() -> str:
     certificate pinning configs, and domain-specific rules.
     Requires apktool_decompile to have been run first.
 
+    When to use: Specifically for understanding the app’s network security posture.
+    Shows pinning, trust anchors, and cleartext settings before deciding on patches.
+
     Returns: JSON with keys: success, found (bool), manifest_references_config (bool),
     path (file path if found), base_config (trust settings), domain_configs
     (array of per-domain rules), findings (array of security issues found).
@@ -1398,6 +1411,9 @@ def analyze_native_libs() -> str:
     """Analyze native .so libraries in the APK's lib/ directory.
     Detects: architectures, JNI methods, embedded strings (URLs, keys, crypto),
     and library sizes. Requires apktool_decompile to have been run first.
+
+    When to use: When the APK contains native libraries. Check for JNI bridges,
+    hardcoded strings, and determine if security checks are in native code.
 
     Returns: JSON with keys: success, has_native_libs (bool), architectures (list),
     libraries (array of {name, arch, size_kb}), total_size_mb, jni_methods
@@ -1606,6 +1622,9 @@ def analyze_method_deep(smali_file: str, method_name: str) -> str:
     Returns full disassembly, register usage, API calls, string constants,
     branches, try/catch blocks, field access, object allocations.
     Use this for detailed understanding of how a method works.
+
+    When to use: After locating a suspicious method (via graph tools, search, or
+    unified_scan), use this for full bytecode-level analysis of that specific method.
 
     Args:
         smali_file: path to .smali file (relative to apktool dir or absolute)
@@ -2466,6 +2485,10 @@ def smali_index_stats() -> str:
     """Get SmaliIndex statistics — total classes, methods, strings, API calls indexed.
     Useful to confirm the index is built and see its scope.
 
+    When to use: Quick check after build_smali_index to verify it completed
+    and see what’s indexed. Also useful to confirm index availability before
+    running unified_scan or taint analysis.
+
     Returns: JSON with keys: success, total_classes, total_methods,
     total_instructions, total_strings, total_api_targets,
     method_categories (dict of category→count), hierarchy_roots (int), built_at (timestamp).
@@ -2489,6 +2512,9 @@ def unified_scan(severity_filter: Optional[str] = None, max_findings: int = 500)
     Checks 35+ detection rules across SSL, root, crypto, storage, WebView,
     IPC, SQL injection, dynamic class loading, reflection, cloud secrets, and more.
     Returns deduplicated, severity-ranked findings with evidence chains.
+
+    When to use: Primary vulnerability scanner. Prefer over scan_vulnerabilities
+    and detect_protections (which are legacy). Requires build_smali_index first.
 
     Args:
         severity_filter: Optional — only return findings of this severity ("critical", "high", "medium", "low", "info").
@@ -2515,6 +2541,10 @@ def analyze_data_flow(class_name: str, method_name: str) -> str:
     """Analyze register-level data flow within a specific method.
     Tracks const-string values, object types, field accesses, and method return values
     through registers. Shows what each register holds at every instruction.
+
+    When to use: When you need to understand exactly what values flow through
+    a crypto, auth, or security method. Use after finding a suspicious method
+    via unified_scan or graph tools.
 
     Args:
         class_name: Full smali class name (e.g., "Lcom/example/CryptoHelper;").
@@ -2558,6 +2588,10 @@ def run_taint_analysis(max_depth: int = 5, max_flows: int = 200) -> str:
     user input) to dangerous SINKS (logging, network, IPC, storage, SMS).
     Returns taint flows ranked by severity with full call chains.
 
+    When to use: For finding data leaks and privacy violations. Run after
+    build_smali_index. Best for identifying source→sink flows (e.g., device ID
+    being sent to a server, credentials logged to logcat).
+
     Args:
         max_depth: BFS depth for tracing flows (default 5).
         max_flows: Maximum taint flows to return (default 200).
@@ -2584,6 +2618,9 @@ def find_hardcoded_crypto() -> str:
     Uses register-level data flow to detect const-string values passed to
     SecretKeySpec, Cipher.init, IvParameterSpec, MessageDigest, etc.
 
+    When to use: When investigating cryptographic implementations. Specifically
+    finds hardcoded keys/IVs that are security vulnerabilities.
+
     Returns: JSON with keys: success, total_crypto_methods (scanned count),
     methods_with_hardcoded (count), findings (array of {class, method, crypto_api,
     hardcoded_value, register, value_type, severity}).
@@ -2605,6 +2642,10 @@ def generate_bypass_plans(max_bypasses: int = 50) -> str:
     detected security protections. Runs unified_scan first, then generates
     bypasses for: root detection, emulator detection, debug detection,
     SSL pinning, certificate pinning, SafetyNet, signature verification.
+
+    When to use: After unified_scan identifies protections, use this to get
+    ready-to-apply smali patches and Frida scripts. Fully automated — just
+    apply the generated patches via apply_smali_patch.
 
     Args:
         max_bypasses: Maximum bypass plans to generate (default 50).
@@ -2642,6 +2683,10 @@ def analyze_manifest_deep() -> str:
     - Content provider path traversal risks
     - SDK version security implications
 
+    When to use: For thorough manifest security analysis. Prefer over parse_manifest
+    which only extracts data without security analysis. Optionally uses SmaliIndex
+    for cross-referencing if available.
+
     Returns: JSON with keys: success, package, total_findings, severity_summary
     (dict of level→count), findings (array of security issues), config_analysis,
     attack_surface (exported components/deep links), deep_links, component_summary.
@@ -2666,6 +2711,9 @@ def scan_cloud_secrets() -> str:
     GCP (API key, OAuth), Azure connection strings, Slack/Telegram/Discord webhooks,
     PEM private keys, hardcoded JWTs, and generic API secrets.
     Values are auto-redacted in output for safe reporting.
+
+    When to use: For finding leaked API keys and cloud credentials. Uses SmaliIndex
+    if available for deeper analysis; falls back to file-based scanning otherwise.
 
     Returns: JSON with keys: success, total_findings, severity_summary (dict),
     category_summary (dict of cloud_provider→count), strings_searched (count),
