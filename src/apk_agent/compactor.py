@@ -451,6 +451,27 @@ def _fallback_trim(
                     for err in errors[:3]:
                         parts.append(f"  - Error: {err}")
 
+        # Patch registry — full journal of every patch attempt
+        patch_reg = agent_state.get("patch_registry") or []
+        if patch_reg:
+            parts.append(f"\n## Patch Registry ({len(patch_reg)} entries)")
+            parts.append("DO NOT re-apply patches that already succeeded.")
+            for entry in patch_reg:
+                pid = entry.get('id', '?')
+                tool = entry.get('tool', '?')
+                target = entry.get('target', '?')
+                pattern_desc = entry.get('pattern', '')[:120]
+                status = entry.get('status', '?')
+                feedback = entry.get('user_feedback', '')
+                icon = {'applied': '✅', 'failed': '❌', 'user_rejected': '🔄', 'retrying': '🔄', 'verified': '✔️'}.get(status, '❓')
+                line = f"- {icon} #{pid} [{tool}] {target} — {pattern_desc}"
+                if feedback:
+                    line += f" | USER FEEDBACK: {feedback[:80]}"
+                parts.append(line)
+            rejected = [e for e in patch_reg if e.get('status') in ('user_rejected', 'retrying')]
+            if rejected:
+                parts.append(f"\n⚠️ {len(rejected)} patch(es) need re-work based on user feedback!")
+
         if scratchpad:
             parts.append("\n## Working Memory (Scratchpad)")
             for k, v in list(scratchpad.items())[:20]:

@@ -458,6 +458,7 @@ def run_sub_agent(
             "task": task,
             "findings": [],
             "patch_results": [],
+            "patch_registry": [],
             "patch_plans": [],
             "tool_history": [],
             "current_plan": "",

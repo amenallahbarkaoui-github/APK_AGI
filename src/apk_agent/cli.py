@@ -506,6 +506,7 @@ def main(apk_path: str | None, verbose: bool, project_id: str | None,
                                     {"messages": state_update},
                                 )
                             tok_after = _compactor.estimate_tokens(compacted)
+                            _compactor.last_token_count = tok_after  # update so status bar shows correct %
                             session_meta.compact_count = _compactor.compact_count
                             save_session_meta(session_meta, project.workspace_path)
                             print_success(
@@ -827,6 +828,7 @@ def _run_agent_turn(graph, graph_config: dict, user_input: str, project: Project
         input_state.update({
             "findings": [],
             "patch_results": [],
+            "patch_registry": [],
             "patch_plans": [],
             "tool_history": [],
             "current_plan": "",
@@ -840,6 +842,8 @@ def _run_agent_turn(graph, graph_config: dict, user_input: str, project: Project
 
     max_consecutive_errors = 3
     error_count = 0
+    auto_continue_count = 0
+    _MAX_AUTO_CONTINUES = 30  # safety limit for auto mode loops
 
     try:
         # Start the live status bar
@@ -894,7 +898,55 @@ def _run_agent_turn(graph, graph_config: dict, user_input: str, project: Project
                 break
 
             if interrupt_info is None:
-                break  # no interrupt — turn finished normally
+                # No interrupt — turn finished normally.
+                # In auto mode: check if the agent is truly done or just
+                # stopped to ask a question / announce next steps.
+                # If not done, auto-feed a continue message.
+                if auto_mode and auto_continue_count < _MAX_AUTO_CONTINUES:
+                    try:
+                        ckpt = graph.get_state(graph_config)
+                        last_msgs = (ckpt.values or {}).get("messages", [])
+                        if last_msgs:
+                            last_ai = None
+                            for m in reversed(last_msgs):
+                                if isinstance(m, AIMessage):
+                                    last_ai = m
+                                    break
+                            if last_ai:
+                                content = (last_ai.content or "").strip().lower() if isinstance(last_ai.content, str) else ""
+                                # Detect if the agent is truly done (final report,
+                                # explicit completion, or empty response)
+                                is_done = (
+                                    not content
+                                    or any(phrase in content for phrase in [
+                                        "task is complete", "task complete",
+                                        "all done", "analysis complete",
+                                        "report has been generated", "report generated",
+                                        "final report", "work is complete",
+                                        "successfully completed", "all patches applied",
+                                        "patched apk", "signed apk",
+                                        "here is the final", "here's the final",
+                                        "summary of all", "completed successfully",
+                                    ])
+                                )
+                                if not is_done:
+                                    auto_continue_count += 1
+                                    console.print(
+                                        f"[dim]⚡ Auto-mode: continuing "
+                                        f"({auto_continue_count}/{_MAX_AUTO_CONTINUES})...[/]"
+                                    )
+                                    # Feed a continue message as new input
+                                    stream_input = {
+                                        "messages": [HumanMessage(
+                                            content="Continue. Proceed with the task without asking questions."
+                                        )]
+                                    }
+                                    is_resume = False
+                                    live_bar.start()
+                                    continue  # loop back to stream again
+                    except Exception:
+                        pass  # fall through to break
+                break  # truly done or not auto mode
 
             # Resume with user's response
             stream_input = interrupt_info["response"]

@@ -137,6 +137,37 @@ def agent_node(state: AgentState) -> dict:
     _pre_compact_ids: list[str] = []
     _compact_summary_msgs: list[BaseMessage] = []
 
+    # ── User feedback → patch registry updates ─────────────────────
+    # Scan the latest user message for patch-failure keywords and update
+    # the registry accordingly.  This lets the agent learn from user
+    # feedback even after compaction.
+    registry = list(state.get("patch_registry") or [])
+    _registry_dirty = False
+    if registry:
+        # Find the latest HumanMessage (the one the user just sent)
+        _latest_human = None
+        for _m in reversed(messages):
+            if isinstance(_m, HumanMessage):
+                _latest_human = _m
+                break
+        if _latest_human:
+            _htxt = (str(_latest_human.content) or "").lower()
+            _REJECT_KW = (
+                "didn't work", "لم تنجح", "لم تعمل", "ما زال", "لا يزال",
+                "still ", "not working", "failed", "doesn't work",
+                "patch failed", "ads still", "لا تزال", "ما نجح",
+                "redo", "re-do", "try again", "أعد", "جرب مرة",
+                "broken", "crash", "لم ينجح", "not fixed", "ما اشتغل",
+            )
+            if any(kw in _htxt for kw in _REJECT_KW):
+                # Mark the most recent 'applied' patches as user_rejected
+                for _entry in reversed(registry):
+                    if _entry.get("status") == "applied":
+                        _entry["status"] = "user_rejected"
+                        _entry["user_feedback"] = str(_latest_human.content)[:200]
+                        _registry_dirty = True
+                        break  # Only reject the latest one per message
+
     # Inject system prompt if not already present
     if not messages or not isinstance(messages[0], SystemMessage):
         messages.insert(0, SystemMessage(content=SYSTEM_PROMPT))
@@ -182,6 +213,32 @@ def agent_node(state: AgentState) -> dict:
     if patches:
         ok = sum(1 for p in patches if p.get("success"))
         summary_parts.append(f"🔧 Patches applied: {ok}/{len(patches)}")
+
+    # Patch registry — full journal of every patch attempt (survives compaction)
+    # (uses local `registry` which may have user-feedback updates from above)
+    if registry:
+        summary_parts.append(f"\n🗂️ PATCH REGISTRY ({len(registry)} entries) — DO NOT re-apply patches that already succeeded:")
+        for entry in registry:
+            pid = entry.get("id", "?")
+            tool = entry.get("tool", "?")
+            target = entry.get("target", "?")
+            pattern_desc = entry.get("pattern", "")[:80]
+            status = entry.get("status", "?")
+            tool_ok = "✅" if entry.get("tool_success") else "❌"
+            feedback = entry.get("user_feedback", "")
+
+            status_icon = {"applied": "✅", "failed": "❌", "user_rejected": "🔄", "retrying": "🔄", "verified": "✔️"}.get(status, "❓")
+            line = f"  {status_icon} #{pid} [{tool}] {target} — {pattern_desc}"
+            if feedback:
+                line += f" | USER: {feedback[:60]}"
+            summary_parts.append(line)
+
+        # Highlight patches the user rejected (need re-doing)
+        rejected = [e for e in registry if e.get("status") in ("user_rejected", "retrying")]
+        if rejected:
+            summary_parts.append(f"\n  ⚠️ {len(rejected)} patch(es) need re-work based on user feedback!")
+            for e in rejected:
+                summary_parts.append(f"    → #{e['id']} {e['target']}: {e.get('user_feedback', '')[:100]}")
 
     # Scratchpad — persistent working memory that survives compaction
     scratchpad = state.get("scratchpad") or {}
@@ -442,7 +499,10 @@ def agent_node(state: AgentState) -> dict:
             # Order: removals first, then compact summary msgs, then LLM response
             result_messages = removals + _compact_summary_msgs + result_messages
 
-    return {"messages": result_messages}
+    result = {"messages": result_messages}
+    if _registry_dirty:
+        result["patch_registry"] = registry
+    return result
 
 
 # Track consecutive text-only (no tool calls) responses for nudge logic
@@ -515,7 +575,7 @@ def human_review_node(state: AgentState) -> dict:
     The CLI will collect user input and resume with a Command.
     In auto mode, patches are approved instantly without interrupt.
     """
-    from apk_agent.agent.tools_def import _auto_mode
+    import apk_agent.agent.tools_def as _td
 
     last_msg = state["messages"][-1]
 
@@ -563,7 +623,7 @@ def human_review_node(state: AgentState) -> dict:
         return {"messages": reject_msgs, "human_feedback": "rejected"}
 
     # Auto mode: approve immediately without interrupt — saves API requests
-    if _auto_mode:
+    if getattr(_td, '_auto_mode', False):
         return {"messages": [], "human_feedback": "approved"}
 
     prompt_parts = [

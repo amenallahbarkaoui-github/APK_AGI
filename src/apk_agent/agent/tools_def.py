@@ -1871,6 +1871,7 @@ def smart_search(
 _code_graph = None
 _code_index = None
 _smali_index = None  # SmaliIndex IR (from smali_ir module)
+_auto_mode = False   # Set by CLI when /auto is active
 
 
 def _ensure_graph():

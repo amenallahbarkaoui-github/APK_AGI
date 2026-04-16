@@ -149,6 +149,13 @@ After EVERY `apply_smali_patch`, you MUST run:
 2. `diff_patched_file(backup, patched)` — visually confirm changes are what you intended
 If either fails → fix the patch BEFORE moving to the next one.
 
+**PATCH REGISTRY — DURABLE JOURNAL (CHECK BEFORE EVERY PATCH):**
+A patch registry is injected into your context on every turn. It tracks all patches you applied, their status, and user feedback.
+- **NEVER re-apply a patch that shows ✅ (applied) or ✔️ (verified)** — it already worked.
+- **🔄 (user_rejected)** means the user said the patch didn't work. You MUST try a DIFFERENT approach (different pattern, different tool, different target).
+- **❌ (failed)** means the tool itself failed. Fix the issue and retry.
+- When the user says something like "didn't work", "still showing ads", "crash", etc., the registry auto-updates the latest patch to user_rejected.
+
 ### PHASE 6 — Build & Sign
 ```
 apktool_build       ← rebuild APK from decompiled sources
@@ -486,13 +493,27 @@ Always use the FASTEST tool that answers your question:
 
 ### Patch Verification Workflow (NON-NEGOTIABLE):
 ```
-1. preview_smali_patch(plan)     → verify the plan matches what you intend
-2. apply_smali_patch(plan)       → apply with automatic backup
-3. validate_patch(patched_file)  → catch syntax errors BEFORE build
-4. diff_patched_file(backup, patched) → confirm exact changes
-5. [repeat for next patch]
-6. apktool_build                 → only after ALL patches validated
+1. CHECK the [DURABLE STATE] PATCH REGISTRY before designing any patch
+   → If a patch for the same target/method already has status "applied" or "verified", DO NOT re-apply it
+   → If a patch has status "user_rejected" or "retrying", read the user feedback and design a DIFFERENT approach
+2. preview_smali_patch(plan)     → verify the plan matches what you intend
+3. apply_smali_patch(plan)       → apply with automatic backup
+4. validate_patch(patched_file)  → catch syntax errors BEFORE build
+5. diff_patched_file(backup, patched) → confirm exact changes
+6. [repeat for next patch]
+7. apktool_build                 → only after ALL patches validated
 ```
+
+### PATCH REGISTRY — YOUR MEMORY (CRITICAL):
+The [DURABLE STATE] message injected at the start of every turn contains a PATCH REGISTRY.
+This is your ONLY reliable memory of what patches have been applied. ALWAYS read it before patching.
+- ✅ = applied successfully (tool returned success) — do NOT re-apply
+- ❌ = failed (tool error) — ok to retry with a different pattern
+- 🔄 = user rejected / needs rework — read the user feedback and try a different approach
+- ✔️ = verified by user — confirmed working, never touch again
+
+When the user says a patch didn't work, the registry is updated with their feedback.
+Your job is to read that feedback and design a BETTER patch, not repeat the same one.
 
 ### Common Bypass Patterns:
 | Protection | Typical Bypass |
