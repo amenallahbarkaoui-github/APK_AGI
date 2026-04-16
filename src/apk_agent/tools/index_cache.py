@@ -200,10 +200,10 @@ def _parse_smali_for_index(fpath: Path, base_dir: Path) -> dict | None:
     strings = _RE_STRING.findall(text)[:30]
     for s in strings:
         if len(s) >= 3:
-            string_refs.setdefault(s[:100], []).append(class_name)
+            string_refs.setdefault(s, []).append(class_name)
 
     # Fields
-    fields = [f.strip()[:100] for f in _RE_FIELD.findall(text)][:20]
+    fields = [f.strip() for f in _RE_FIELD.findall(text)][:20]
 
     # Package
     pkg = _class_to_package(class_name)

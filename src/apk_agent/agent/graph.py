@@ -49,10 +49,37 @@ _compactor: Compactor | None = None
 # ---------------------------------------------------------------------------
 # Tool call loop detector — prevents infinite repeated tool calls
 # ---------------------------------------------------------------------------
-# Maps (tool_name, args_hash) → call_count.  Reset per build_graph().
-_tool_call_tracker: dict[str, int] = defaultdict(int)
+# Per-session tracking.  Keyed by thread_id so sessions don't interfere.
+_session_tool_trackers: dict[str, dict[str, int]] = {}
+_session_nudge_counts: dict[str, int] = {}
 _LOOP_WARN_THRESHOLD = 3   # inject warning after this many repetitions
 _LOOP_BLOCK_THRESHOLD = 5  # force different approach after this many
+
+# The active thread_id, set by build_graph / the CLI before each run
+_active_thread_id: str = "__default__"
+
+
+def set_active_thread(thread_id: str) -> None:
+    """Set the active thread/session id for loop tracking."""
+    global _active_thread_id
+    _active_thread_id = thread_id
+
+
+def _get_tool_tracker() -> dict[str, int]:
+    """Return the tool-call tracker for the active session."""
+    if _active_thread_id not in _session_tool_trackers:
+        _session_tool_trackers[_active_thread_id] = defaultdict(int)
+    return _session_tool_trackers[_active_thread_id]
+
+
+def _get_nudge_count() -> int:
+    """Return the consecutive-no-tool count for the active session."""
+    return _session_nudge_counts.get(_active_thread_id, 0)
+
+
+def _set_nudge_count(n: int) -> None:
+    """Set the consecutive-no-tool count for the active session."""
+    _session_nudge_counts[_active_thread_id] = n
 
 
 def _hash_tool_args(args: dict) -> str:
@@ -63,13 +90,14 @@ def _hash_tool_args(args: dict) -> str:
 
 def _check_tool_loops(tool_calls: list[dict]) -> str | None:
     """Track tool calls and return a warning message if loops detected."""
+    tracker = _get_tool_tracker()
     warnings = []
     for tc in tool_calls:
         name = tc.get("name", "")
         args_hash = _hash_tool_args(tc.get("args", {}))
         key = f"{name}:{args_hash}"
-        _tool_call_tracker[key] += 1
-        count = _tool_call_tracker[key]
+        tracker[key] += 1
+        count = tracker[key]
 
         if count >= _LOOP_BLOCK_THRESHOLD:
             warnings.append(
@@ -184,7 +212,7 @@ def agent_node(state: AgentState) -> dict:
         # Get the raw LLM (without tools) for compaction
         from apk_agent.agent.graph import _raw_llm
 
-        compacted = _compactor.compact(messages, _raw_llm)
+        compacted = _compactor.compact(messages, _raw_llm, agent_state=state)
         if compacted is not messages:
             messages = compacted
             logger.info(
@@ -352,11 +380,12 @@ def agent_node(state: AgentState) -> dict:
                 content=f"[SYSTEM — LOOP DETECTOR]\n{loop_warning}"
             ))
             # If any tool is at block threshold, strip those tool_calls entirely
+            tracker = _get_tool_tracker()
             filtered_calls = []
             for tc in response.tool_calls:
                 args_hash = _hash_tool_args(tc.get("args", {}))
                 key = f"{tc.get('name', '')}:{args_hash}"
-                if _tool_call_tracker.get(key, 0) < _LOOP_BLOCK_THRESHOLD:
+                if tracker.get(key, 0) < _LOOP_BLOCK_THRESHOLD:
                     filtered_calls.append(tc)
             if not filtered_calls:
                 # All calls blocked — strip tool_calls, force agent to rethink
@@ -373,27 +402,25 @@ def agent_node(state: AgentState) -> dict:
 
 
 # Track consecutive text-only (no tool calls) responses for nudge logic
-_consecutive_no_tool_count = 0
 _MAX_NUDGES = 2  # max times we'll nudge the agent to call tools before allowing __end__
 
 
 def should_continue(state: AgentState) -> Literal["tools", "human_review", "nudge", "__end__"]:
     """Route after agent node: tool call → tools, text-only → nudge or end."""
-    global _consecutive_no_tool_count
 
     if not state["messages"]:
-        _consecutive_no_tool_count = 0
+        _set_nudge_count(0)
         return "__end__"
 
     last_msg = state["messages"][-1]
 
     if not isinstance(last_msg, AIMessage):
-        _consecutive_no_tool_count = 0
+        _set_nudge_count(0)
         return "__end__"
 
     # If the LLM wants to call tools
     if last_msg.tool_calls:
-        _consecutive_no_tool_count = 0
+        _set_nudge_count(0)
         # Check if any tool call is a high-risk patch (apply_smali_patch)
         for tc in last_msg.tool_calls:
             if tc["name"] == "apply_smali_patch":
@@ -411,12 +438,13 @@ def should_continue(state: AgentState) -> Literal["tools", "human_review", "nudg
         "going to ", "begin by", "start by", "proceed to", "kick off",
     ])
 
-    if is_announcing and _consecutive_no_tool_count < _MAX_NUDGES:
-        _consecutive_no_tool_count += 1
+    nudge_count = _get_nudge_count()
+    if is_announcing and nudge_count < _MAX_NUDGES:
+        _set_nudge_count(nudge_count + 1)
         return "nudge"
 
     # Genuine final answer or max nudges reached
-    _consecutive_no_tool_count = 0
+    _set_nudge_count(0)
     return "__end__"
 
 
@@ -760,9 +788,11 @@ def build_graph(config: AppConfig, project: Project, checkpointer=None):
     global _llm_with_tools, _raw_llm, _compactor
 
     # Reset loop detector for fresh session
-    _tool_call_tracker.clear()
-    global _consecutive_no_tool_count
-    _consecutive_no_tool_count = 0
+    thread_id = project.project_id or "__default__"
+    set_active_thread(thread_id)
+    # Clear trackers for this specific thread
+    _session_tool_trackers.pop(thread_id, None)
+    _session_nudge_counts.pop(thread_id, None)
 
     # Set tool context
     set_tool_context(config, project)
@@ -772,8 +802,8 @@ def build_graph(config: AppConfig, project: Project, checkpointer=None):
     _raw_llm = llm  # keep a reference without tools for compaction
     _llm_with_tools = llm.bind_tools(ALL_TOOLS)
 
-    # Initialize compactor
-    _compactor = Compactor(token_threshold=90_000, keep_recent=20)
+    # Initialize compactor (GLM-5.1: 204k context window)
+    _compactor = Compactor(token_threshold=160_000, keep_recent=40)
 
     # Build tool node
     tool_node = ToolNode(ALL_TOOLS)

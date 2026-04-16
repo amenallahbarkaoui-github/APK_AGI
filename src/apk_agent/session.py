@@ -34,6 +34,7 @@ class SessionMeta:
     last_user_input: str = ""
     orchestrator_mode: bool = False
     auto_mode: bool = False
+    thinking_mode: bool = True  # whether LLM deep thinking is enabled
     status: str = "active"  # active | paused | completed
 
     def touch(self) -> None:
@@ -105,6 +106,101 @@ def delete_session(project_path: str | Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+class _RetryConnection:
+    """Wrapper around sqlite3.Connection that retries on WinError 32.
+
+    On Windows, antivirus / file indexer / VSCode can briefly lock the
+    .db / .db-wal files.  SQLite's ``busy_timeout`` only handles
+    SQLite-level locks, not OS-level ``ERROR_SHARING_VIOLATION`` (32).
+    This wrapper intercepts ``execute``, ``executemany``, and ``commit``
+    and retries with back-off on that specific error.
+    """
+
+    _MAX_RETRIES = 5
+    _BASE_DELAY = 0.15  # seconds
+
+    def __init__(self, conn: sqlite3.Connection):
+        self._conn = conn
+
+    # Forward all attribute access to the real connection
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    # ── Context manager must return *self* (the wrapper), not the real conn ──
+    def __enter__(self):
+        self._conn.__enter__()
+        return self  # critical: keeps wrapper in scope for execute/commit
+
+    def __exit__(self, *args):
+        return self._conn.__exit__(*args)
+
+    def _retry(self, method, *args, **kwargs):
+        import time
+        for attempt in range(self._MAX_RETRIES):
+            try:
+                return method(*args, **kwargs)
+            except OSError as e:
+                if getattr(e, "winerror", 0) == 32 and attempt < self._MAX_RETRIES - 1:
+                    time.sleep(self._BASE_DELAY * (attempt + 1))
+                else:
+                    raise
+
+    def execute(self, *args, **kwargs):
+        return self._retry(self._conn.execute, *args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        return self._retry(self._conn.executemany, *args, **kwargs)
+
+    def executescript(self, *args, **kwargs):
+        return self._retry(self._conn.executescript, *args, **kwargs)
+
+    def commit(self):
+        return self._retry(self._conn.commit)
+
+    def rollback(self):
+        return self._retry(self._conn.rollback)
+
+    def close(self):
+        return self._conn.close()
+
+    def cursor(self):
+        """Return a cursor whose execute/executemany also retry."""
+        real_cursor = self._conn.cursor()
+        return _RetryCursor(real_cursor, self._MAX_RETRIES, self._BASE_DELAY)
+
+
+class _RetryCursor:
+    """Cursor wrapper that retries execute calls on WinError 32."""
+
+    def __init__(self, cursor, max_retries: int, base_delay: float):
+        self._cursor = cursor
+        self._max = max_retries
+        self._delay = base_delay
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+    def __iter__(self):
+        return iter(self._cursor)
+
+    def _retry(self, method, *args, **kwargs):
+        import time
+        for attempt in range(self._max):
+            try:
+                return method(*args, **kwargs)
+            except OSError as e:
+                if getattr(e, "winerror", 0) == 32 and attempt < self._max - 1:
+                    time.sleep(self._delay * (attempt + 1))
+                else:
+                    raise
+
+    def execute(self, *args, **kwargs):
+        return self._retry(self._cursor.execute, *args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        return self._retry(self._cursor.executemany, *args, **kwargs)
+
+
 def get_sqlite_checkpointer(project_path: str | Path):
     """Create a LangGraph SqliteSaver backed by the project's session DB.
 
@@ -119,8 +215,14 @@ def get_sqlite_checkpointer(project_path: str | Path):
     sdir.mkdir(parents=True, exist_ok=True)
     db_file = str(_db_path(project_path))
 
-    conn = sqlite3.connect(db_file, check_same_thread=False)
-    saver = SqliteSaver(conn)
+    conn = sqlite3.connect(db_file, check_same_thread=False, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")       # WAL mode prevents WinError 32 file locks
+    conn.execute("PRAGMA busy_timeout=5000")      # wait up to 5s if DB is locked
+    conn.execute("PRAGMA synchronous=NORMAL")     # safe with WAL, reduces fsync contention
+
+    # Wrap with retry logic for OS-level file locks (Windows antivirus/indexer)
+    wrapped = _RetryConnection(conn)
+    saver = SqliteSaver(wrapped)
     saver.setup()  # create tables if needed
     return saver
 

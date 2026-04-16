@@ -27,6 +27,7 @@ from apk_agent.session import (
 )
 from apk_agent.ui import (
     console,
+    live_bar,
     print_ai_message,
     print_error,
     print_help,
@@ -65,18 +66,21 @@ def _setup_logging(verbose: bool = False) -> None:
 # ---------------------------------------------------------------------------
 
 def _print_startup() -> None:
-    """Print the full-screen startup banner."""
+    """Print the full-screen startup banner with gradient style."""
     console.print()
-    console.print("[bold cyan]╔══════════════════════════════════════════════════════╗[/]")
-    console.print("[bold cyan]║[/]     [bold white]🔬 APK Agent v4.0.0[/]                            [bold cyan]║[/]")
-    console.print("[bold cyan]║[/]     [dim]Interactive APK Reverse Engineering[/]            [bold cyan]║[/]")
-    console.print("[bold cyan]║[/]     [dim]72 tools • Taint Analysis • Auto-Bypass[/]       [bold cyan]║[/]")
-    console.print("[bold cyan]╚══════════════════════════════════════════════════════╝[/]")
+    console.print("[bold bright_cyan]╔══════════════════════════════════════════════════════════╗[/]")
+    console.print("[bold bright_cyan]║[/]                                                          [bold bright_cyan]║[/]")
+    console.print("[bold bright_cyan]║[/]   [bold white]🔬  A P K   A G E N T[/]   [dim]v4.0[/]                         [bold bright_cyan]║[/]")
+    console.print("[bold bright_cyan]║[/]   [bold bright_white]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/]                     [bold bright_cyan]║[/]")
+    console.print("[bold bright_cyan]║[/]   [dim italic]AI-Powered Android APK Reverse Engineering[/]          [bold bright_cyan]║[/]")
+    console.print("[bold bright_cyan]║[/]   [dim]72 Tools • Taint Analysis • Auto-Bypass • Patching[/] [bold bright_cyan]║[/]")
+    console.print("[bold bright_cyan]║[/]                                                          [bold bright_cyan]║[/]")
+    console.print("[bold bright_cyan]╚══════════════════════════════════════════════════════════╝[/]")
     console.print()
 
 
 def _print_tools_status(config: AppConfig) -> None:
-    """Show which tools are available."""
+    """Show which tools are available in a compact grid."""
     tools = {
         "apktool": config.get_tool_path("apktool"),
         "jadx": config.get_tool_path("jadx"),
@@ -85,12 +89,36 @@ def _print_tools_status(config: AppConfig) -> None:
         "zipalign": config.get_tool_path("zipalign"),
         "apksigner": config.get_tool_path("apksigner"),
     }
-    console.print("[bold]🔧 External tools:[/]")
-    for name, path in tools.items():
-        if path:
-            console.print(f"  [green]✅ {name:12s}[/] [dim]{Path(path).name}[/]")
-        else:
-            console.print(f"  [yellow]⚠️  {name:12s}[/] [dim]not found[/]")
+    from rich.table import Table
+    table = Table(
+        show_header=False, show_edge=False, padding=(0, 1),
+        expand=False, border_style="dim",
+    )
+    table.add_column(style="bold", width=14)
+    table.add_column(width=14)
+    table.add_column(width=14)
+
+    # Arrange tools in 3 columns
+    tool_items = list(tools.items())
+    rows = [tool_items[i:i+3] for i in range(0, len(tool_items), 3)]
+    for row in rows:
+        cells = []
+        for name, path in row:
+            if path:
+                cells.append(f"[green]● {name}[/]")
+            else:
+                cells.append(f"[yellow]○ {name}[/]")
+        while len(cells) < 3:
+            cells.append("")
+        table.add_row(*cells)
+
+    console.print("[bold dim]Tools:[/]")
+    console.print(table)
+
+    # Show thinking mode and model
+    model_display = config.model_name.split("/")[-1] if "/" in config.model_name else config.model_name
+    thinking_icon = "[bold green]●[/] ON" if config.thinking_enabled else "[bold red]○[/] OFF"
+    console.print(f"[dim]Model:[/] [bold]{model_display}[/]  │  [dim]Thinking:[/] {thinking_icon}")
     console.print()
 
 
@@ -121,12 +149,25 @@ def _pick_or_create_project(pm: ProjectManager, config: AppConfig, apk_path: str
 
     if projects:
         console.print("[bold]📦 Your projects:[/]\n")
+        from rich.table import Table
+        table = Table(show_header=True, header_style="bold cyan", border_style="dim",
+                      padding=(0, 1), expand=False)
+        table.add_column("#", style="bold cyan", width=4, justify="center")
+        table.add_column("APK Name", min_width=30)
+        table.add_column("ID", style="dim", width=10)
+        table.add_column("Status", width=12)
+
         for i, p in enumerate(projects, 1):
-            status_icon = "🟢" if p.status == "active" else "⚪"
-            console.print(
-                f"  [bold cyan][{i}][/] {status_icon} {p.apk_name:35s} "
-                f"[dim]{p.id[:8]}… | {p.status}[/]"
+            status_style = "green" if p.status == "active" else "dim"
+            status_icon = "●" if p.status == "active" else "○"
+            table.add_row(
+                str(i),
+                p.apk_name,
+                f"{p.id[:8]}…",
+                f"[{status_style}]{status_icon} {p.status}[/]",
             )
+
+        console.print(table)
         console.print(f"\n  [bold cyan][0][/] 📁 Load a new APK file\n")
 
         choice = console.input("[bold green]➜ Select a project (number): [/]").strip()
@@ -205,12 +246,19 @@ def _ask_for_apk(pm: ProjectManager, config: AppConfig) -> Project | None:
             continue
 
     if found_apks:
-        console.print("[bold]📱 APK files found:[/]\n")
+        console.print("[bold]📱 APK files detected:[/]\n")
+        from rich.table import Table
+        table = Table(show_header=True, header_style="bold cyan", border_style="dim",
+                      padding=(0, 1), expand=False)
+        table.add_column("#", style="bold cyan", width=4, justify="center")
+        table.add_column("File Name", min_width=35)
+        table.add_column("Size", style="dim", width=10, justify="right")
+
         for i, apk in enumerate(found_apks, 1):
             size_mb = apk.stat().st_size / (1024 * 1024)
-            console.print(
-                f"  [bold cyan][{i}][/] {apk.name:45s} [dim]({size_mb:.1f} MB)[/]"
-            )
+            table.add_row(str(i), apk.name, f"{size_mb:.1f} MB")
+
+        console.print(table)
         console.print(f"\n  [bold cyan][0][/] 📂 Enter a custom path\n")
 
         choice = console.input("[bold green]➜ Select APK (number): [/]").strip()
@@ -272,7 +320,13 @@ def _ask_for_apk(pm: ProjectManager, config: AppConfig) -> Project | None:
 @click.argument("apk_path", required=False, default=None)
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
 @click.option("--project", "-p", "project_id", default=None, help="Open project by ID")
-def main(apk_path: str | None, verbose: bool, project_id: str | None) -> None:
+@click.option("--thinking/--no-thinking", "thinking_enabled", default=None,
+              help="Enable/disable LLM deep thinking mode (default: from .env or ON)")
+@click.option("--model", "-m", "model_name", default=None,
+              help="Override model name (e.g. 'anthropic/claude-sonnet-4-6-20260218')")
+@click.option("--auto", "auto_mode", is_flag=True, help="Start in auto mode (no confirmations)")
+def main(apk_path: str | None, verbose: bool, project_id: str | None,
+         thinking_enabled: bool | None, model_name: str | None, auto_mode: bool) -> None:
     """🔬 APK Agent — Interactive Static Android APK Reverse Engineering
 
     Run without arguments for the interactive menu.
@@ -284,6 +338,13 @@ def main(apk_path: str | None, verbose: bool, project_id: str | None) -> None:
 
     # Load config
     config = AppConfig.load()
+
+    # CLI overrides
+    if thinking_enabled is not None:
+        config.thinking_enabled = thinking_enabled
+    if model_name is not None:
+        config.model_name = model_name
+
     warnings = config.validate()
 
     # Startup
@@ -323,12 +384,17 @@ def main(apk_path: str | None, verbose: bool, project_id: str | None) -> None:
         session_meta = load_session_meta(project.workspace_path)
         if session_meta and session_meta.status == "active":
             console.print()
-            console.print("[bold yellow]📂 Previous session found![/]")
-            console.print(f"  [dim]Thread: {session_meta.thread_id[:12]}…[/]")
-            console.print(f"  [dim]Messages: {session_meta.message_count}[/]")
-            console.print(f"  [dim]Last active: {session_meta.last_active_at}[/]")
+            console.print("[bold yellow]📂 Previous session found[/]")
+            from rich.table import Table
+            tbl = Table(show_header=False, padding=(0, 1), border_style="dim", expand=False)
+            tbl.add_column(style="dim", width=14)
+            tbl.add_column()
+            tbl.add_row("Thread", f"{session_meta.thread_id[:12]}…")
+            tbl.add_row("Messages", str(session_meta.message_count))
+            tbl.add_row("Last active", session_meta.last_active_at[:19] if session_meta.last_active_at else "—")
             if session_meta.last_user_input:
-                console.print(f"  [dim]Last input: {session_meta.last_user_input[:80]}…[/]")
+                tbl.add_row("Last input", f"{session_meta.last_user_input[:60]}…")
+            console.print(tbl)
             console.print()
             choice = console.input(
                 "[bold green]➜ Resume session? (yes/no): [/]"
@@ -350,8 +416,13 @@ def main(apk_path: str | None, verbose: bool, project_id: str | None) -> None:
             project_id=project.id,
             created_at=datetime.now(timezone.utc).isoformat(),
             last_active_at=datetime.now(timezone.utc).isoformat(),
+            thinking_mode=config.thinking_enabled,
+            auto_mode=auto_mode,
         )
         save_session_meta(session_meta, project.workspace_path)
+    else:
+        # Sync thinking mode from session to config (in case user toggled last time)
+        config.thinking_enabled = session_meta.thinking_mode
 
     # Build the agent graph with SQLite checkpointer for persistence
     console.print()
@@ -373,20 +444,80 @@ def main(apk_path: str | None, verbose: bool, project_id: str | None) -> None:
 
     print_welcome(project.id, project.apk_name)
 
-    if resumed:
-        console.print(
-            f"[bold cyan]🔄 Session resumed — {session_meta.message_count} messages in history. "
-            f"Compacted {session_meta.compact_count} time(s).[/]"
-        )
-        console.print("[dim]Type your next message to continue, or /help for commands.[/]")
-        console.print()
-
     # Thread config for LangGraph (uses persistent thread_id)
     thread_id = session_meta.thread_id
     graph_config = {"configurable": {"thread_id": thread_id}}
 
+    # Ensure loop/nudge trackers are scoped to this session
+    from apk_agent.agent.graph import set_active_thread
+    set_active_thread(thread_id)
+
+    if resumed:
+        # Sync message count from checkpoint (more accurate than metadata counter)
+        try:
+            ckpt = graph.get_state(graph_config)
+            if ckpt and ckpt.values and ckpt.values.get("messages"):
+                actual_count = len(ckpt.values["messages"])
+                session_meta.message_count = actual_count
+
+                # Show restored state summary
+                findings = ckpt.values.get("findings") or []
+                patches = ckpt.values.get("patch_results") or []
+                scratchpad = ckpt.values.get("scratchpad") or {}
+                task_plan = ckpt.values.get("task_plan") or []
+                graph_ready = ckpt.values.get("graph_ready", False)
+                target_pkgs = ckpt.values.get("target_packages") or []
+
+                parts = [f"{actual_count} messages"]
+                if findings:
+                    parts.append(f"{len(findings)} findings")
+                if patches:
+                    ok = sum(1 for p in patches if p.get("success"))
+                    parts.append(f"{ok}/{len(patches)} patches")
+                if scratchpad:
+                    parts.append(f"{len(scratchpad)} scratchpad entries")
+                if task_plan:
+                    done = sum(1 for t in task_plan if t.get("status") == "done")
+                    parts.append(f"plan {done}/{len(task_plan)} done")
+                if target_pkgs:
+                    parts.append(f"scope: {', '.join(target_pkgs[:3])}")
+                if graph_ready:
+                    parts.append("graph ✓")
+
+                console.print(
+                    f"[bold cyan]🔄 Session restored — {' │ '.join(parts)}. "
+                    f"Compacted {session_meta.compact_count} time(s).[/]"
+                )
+        except Exception:
+            console.print(
+                f"[bold cyan]🔄 Session resumed — {session_meta.message_count} messages in history.[/]"
+            )
+        console.print("[dim]Type your next message to continue, or /help for commands.[/]")
+        console.print()
+
     # Chat loop
     _chat_loop(graph, graph_config, project, pm, config, session_meta)
+
+
+# ---------------------------------------------------------------------------
+# Hot-reload LLM with new thinking setting
+# ---------------------------------------------------------------------------
+
+def _rebuild_llm_if_needed(graph, config: AppConfig, project) -> None:
+    """Rebuild the LLM instance when thinking mode is toggled mid-session."""
+    try:
+        import apk_agent.agent.graph as _graph_mod
+        from apk_agent.llm.provider import get_llm
+        from apk_agent.agent.tools_def import ALL_TOOLS
+
+        llm = get_llm(config)
+        _graph_mod._raw_llm = llm
+        _graph_mod._llm_with_tools = llm.bind_tools(ALL_TOOLS)
+
+        status = "[green]ON[/]" if config.thinking_enabled else "[red]OFF[/]"
+        console.print(f"[bold]🧠 Thinking mode: {status}[/] — LLM reconfigured.")
+    except Exception as e:
+        print_error(f"Failed to reconfigure LLM: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -404,12 +535,16 @@ def _chat_loop(
 
     while True:
         try:
+            # Build mode indicator
+            mode_parts = []
             if auto_mode:
-                mode_tag = " [bold yellow](auto)[/]"
-            elif orchestrator_mode:
-                mode_tag = " [bold magenta](orchestrator)[/]"
-            else:
-                mode_tag = ""
+                mode_parts.append("[bold yellow]auto[/]")
+            if orchestrator_mode:
+                mode_parts.append("[bold magenta]orchestrator[/]")
+            if config.thinking_enabled:
+                mode_parts.append("[green]🧠[/]")
+
+            mode_tag = f" [{', '.join(mode_parts)}]" if mode_parts else ""
             user_input = console.input(f"\n[bold green]You{mode_tag} ➜ [/]").strip()
         except (EOFError, KeyboardInterrupt):
             console.print("\n[dim]Goodbye! 👋[/]")
@@ -453,6 +588,18 @@ def _chat_loop(
                 auto_mode = False
                 session_meta.auto_mode = False
                 print_success("Auto mode disabled — back to interactive confirmations.")
+                continue
+            elif result == "thinking_on":
+                config.thinking_enabled = True
+                session_meta.thinking_mode = True
+                # Rebuild LLM with thinking enabled
+                _rebuild_llm_if_needed(graph, config, project)
+                continue
+            elif result == "thinking_off":
+                config.thinking_enabled = False
+                session_meta.thinking_mode = False
+                # Rebuild LLM with thinking disabled
+                _rebuild_llm_if_needed(graph, config, project)
                 continue
             if result is not None:
                 continue
@@ -542,6 +689,10 @@ def _handle_command(
             if session_meta.auto_mode:
                 return "auto_off"
             return "auto_on"
+        case "/thinking":
+            if session_meta.thinking_mode:
+                return "thinking_off"
+            return "thinking_on"
         case "/stop":
             print_info("Operation stopped.")
         case "/quit" | "/exit" | "/q":
@@ -586,43 +737,110 @@ def _run_agent_turn(graph, graph_config: dict, user_input: str, project: Project
     # Start turn tracking
     token_tracker.start_turn()
 
-    input_state = {
+    # ── Build input state ──────────────────────────────────────────────
+    # Only send the new message + task + project context (idempotent).
+    # Do NOT send empty lists/dicts for accumulated state fields like
+    # findings, scratchpad, task_plan, etc. — those must survive across
+    # turns via the checkpointer. Overwriting them with [] would wipe
+    # everything the agent discovered so far.
+    input_state: dict = {
         "messages": [HumanMessage(content=user_input)],
+        "task": user_input,
+        "human_feedback": "",
+        # Project context — always set, idempotent
         "project_id": project.id,
         "project_path": project.workspace_path,
         "apk_name": project.apk_name,
         "apktool_dir": str(project.apktool_dir),
         "jadx_dir": str(project.jadx_dir),
-        "task": user_input,
-        "findings": [],
-        "patch_plans": [],
-        "patch_results": [],
-        "tool_history": [],
-        "current_plan": [],
-        "plan_step_index": 0,
-        "human_feedback": "",
-        "graph_ready": False,
-        "target_packages": [],
-        "excluded_packages": [],
-        "scratchpad": {},
-        "task_plan": [],
     }
+
+    # Only initialize accumulated fields on the very first turn
+    # (no checkpoint yet). On subsequent turns / resumed sessions,
+    # the checkpoint preserves findings, scratchpad, patches, etc.
+    try:
+        existing = graph.get_state(graph_config)
+        is_first_turn = (
+            not existing
+            or not existing.values
+            or not existing.values.get("messages")
+        )
+    except Exception:
+        is_first_turn = True
+
+    if is_first_turn:
+        input_state.update({
+            "findings": [],
+            "patch_results": [],
+            "graph_ready": False,
+            "target_packages": [],
+            "excluded_packages": [],
+            "scratchpad": {},
+            "task_plan": [],
+        })
 
     max_consecutive_errors = 3
     error_count = 0
 
     try:
-        # Stream events from the graph
-        for event in graph.stream(input_state, config=graph_config, stream_mode="updates"):
+        # Start the live status bar
+        live_bar.start()
+
+        # ── Flat interrupt loop ────────────────────────────────────────
+        # Each graph.stream() is fully consumed before starting the next.
+        # This prevents nested SQLite transactions that cause WinError 32.
+        from langgraph.types import Command
+        stream_input = input_state
+        is_resume = False
+
+        while True:
+            interrupt_info = None
+
             try:
-                _process_stream_event(event, graph, graph_config, auto_mode=auto_mode)
-                error_count = 0  # Reset on success
-            except Exception as e:
-                error_count += 1
-                print_warning(f"Stream processing error ({error_count}/{max_consecutive_errors}): {e}")
-                if error_count >= max_consecutive_errors:
-                    print_error("Too many consecutive errors. Stopping this turn.")
-                    break
+                if is_resume:
+                    events = graph.stream(
+                        Command(resume=stream_input),
+                        config=graph_config,
+                        stream_mode="updates",
+                    )
+                else:
+                    events = graph.stream(
+                        stream_input,
+                        config=graph_config,
+                        stream_mode="updates",
+                    )
+
+                for event in events:
+                    try:
+                        result = _process_stream_event(event, graph, graph_config, auto_mode=auto_mode)
+                        error_count = 0
+                        if result and result.get("interrupt"):
+                            interrupt_info = result
+                            break  # exit for-loop, let generator close
+                    except Exception as e:
+                        error_count += 1
+                        print_warning(f"Stream processing error ({error_count}/{max_consecutive_errors}): {e}")
+                        if error_count >= max_consecutive_errors:
+                            print_error("Too many consecutive errors. Stopping this turn.")
+                            break
+
+            except OSError as oe:
+                if getattr(oe, 'winerror', 0) == 32:
+                    print_warning(f"File lock during checkpoint — retrying: {oe}")
+                    import time as _t; _t.sleep(0.5)
+                    continue  # retry the same stream_input
+                raise
+
+            if error_count >= max_consecutive_errors:
+                break
+
+            if interrupt_info is None:
+                break  # no interrupt — turn finished normally
+
+            # Resume with user's response
+            stream_input = interrupt_info["response"]
+            is_resume = True
+            live_bar.start()  # restart bar after user input
 
     except KeyboardInterrupt:
         print_warning("Operation interrupted by user.")
@@ -661,6 +879,9 @@ def _run_agent_turn(graph, graph_config: dict, user_input: str, project: Project
     except Exception:
         pass
 
+    # Stop the live status bar before printing final summary
+    live_bar.stop()
+
     # Print turn summary with token usage
     token_tracker.clear_active_tool()
     print_turn_summary()
@@ -684,7 +905,16 @@ def _show_session_info(session_meta: SessionMeta, project: Project) -> None:
     table.add_row("Last Active", session_meta.last_active_at)
     table.add_row("Messages", str(session_meta.message_count))
     table.add_row("Auto-compacts", str(session_meta.compact_count))
-    table.add_row("Mode", "Orchestrator" if session_meta.orchestrator_mode else ("Auto" if session_meta.auto_mode else "Normal"))
+    mode_parts = []
+    if session_meta.orchestrator_mode:
+        mode_parts.append("Orchestrator")
+    if session_meta.auto_mode:
+        mode_parts.append("Auto")
+    if not mode_parts:
+        mode_parts.append("Normal")
+    table.add_row("Mode", " + ".join(mode_parts))
+    thinking_str = "[green]● ON[/]" if session_meta.thinking_mode else "[red]○ OFF[/]"
+    table.add_row("Thinking", thinking_str)
     table.add_row("Status", session_meta.status)
 
     # Token usage
@@ -828,8 +1058,13 @@ def _run_orchestrator_turn(user_input: str, project, config) -> None:
             traceback.print_exc()
 
 
-def _process_stream_event(event: dict, graph, graph_config: dict, *, auto_mode: bool = False) -> None:
-    """Process a single stream event from the LangGraph agent."""
+def _process_stream_event(event: dict, graph, graph_config: dict, *, auto_mode: bool = False) -> dict | None:
+    """Process a single stream event from the LangGraph agent.
+
+    Returns None normally, or a dict with interrupt info:
+        {"interrupt": True, "response": "<user response>"}
+    The caller must handle the interrupt by resuming graph.stream().
+    """
     from apk_agent.ui import print_tool_start
 
     for node_name, node_output in event.items():
@@ -843,8 +1078,17 @@ def _process_stream_event(event: dict, graph, graph_config: dict, *, auto_mode: 
                     if usage:
                         prompt_t = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
                         compl_t = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
+                        # Z.AI reports cached tokens in prompt_tokens_details
+                        cached_t = 0
+                        if isinstance(usage, dict):
+                            ptd = usage.get("prompt_tokens_details") or {}
+                            cached_t = ptd.get("cached_tokens", 0)
+                        elif hasattr(usage, "get"):
+                            ptd = usage.get("prompt_tokens_details") or {}
+                            cached_t = ptd.get("cached_tokens", 0)
                         if prompt_t or compl_t:
-                            token_tracker.record_call(prompt_t, compl_t)
+                            token_tracker.record_call(prompt_t, compl_t, cached_t)
+                            live_bar.update()
 
                     # Print text content
                     if msg.content and isinstance(msg.content, str) and msg.content.strip():
@@ -865,6 +1109,7 @@ def _process_stream_event(event: dict, graph, graph_config: dict, *, auto_mode: 
                                 arg_summary = ", ".join(parts)
                             print_tool_start(tc['name'], arg_summary)
                             token_tracker.set_active_tool(tc['name'])
+                            live_bar.update()
 
         elif node_name == "tools":
             # Tool node produced results
@@ -872,6 +1117,7 @@ def _process_stream_event(event: dict, graph, graph_config: dict, *, auto_mode: 
             for msg in messages:
                 if isinstance(msg, ToolMessage):
                     token_tracker.clear_active_tool()
+                    live_bar.update()
                     # Better success detection
                     content_start = msg.content[:100].lower()
                     success = (
@@ -900,34 +1146,29 @@ def _process_stream_event(event: dict, graph, graph_config: dict, *, auto_mode: 
             console.print("[dim]⚡ Auto-nudging agent to execute tools...[/]")
 
         elif node_name == "__interrupt__":
-            # Handle LangGraph interrupt
+            # Signal interrupt back to caller — do NOT start graph.stream() here.
+            # The caller handles resume in a flat loop to avoid nested SQLite locks.
+            live_bar.stop()
             interrupts = node_output
             if isinstance(interrupts, (list, tuple)):
                 for intr in interrupts:
                     value = intr.value if hasattr(intr, 'value') else str(intr)
 
                     if auto_mode:
-                        # Auto mode: approve patches, auto-answer questions
                         value_str = str(value)
                         if "❓" in value_str:
-                            # ask_user question — tell agent to decide itself
                             human_response = "Proceed with your best judgment."
                             console.print("[dim]⚡ Auto-mode: agent question auto-answered[/]")
                         else:
-                            # Patch approval — auto-approve
                             human_response = "yes"
                             console.print("[dim]⚡ Auto-mode: patch auto-approved[/]")
                     else:
                         print_hitl_prompt(str(value))
                         human_response = console.input("[bold magenta]Your response: [/]").strip()
 
-                    from langgraph.types import Command
-                    for resume_event in graph.stream(
-                        Command(resume=human_response),
-                        config=graph_config,
-                        stream_mode="updates",
-                    ):
-                        _process_stream_event(resume_event, graph, graph_config, auto_mode=auto_mode)
+                    return {"interrupt": True, "response": human_response}
+
+    return None
 
 
 # ---------------------------------------------------------------------------

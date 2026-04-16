@@ -19,6 +19,21 @@ def _ensure_writable(path: Path) -> None:
         path.chmod(path.stat().st_mode | stat.S_IWRITE)
 
 
+def _write_with_retry(path: Path, content: str, retries: int = 3, delay: float = 0.3) -> None:
+    """Write text to a file with retry on Windows file lock errors (WinError 32)."""
+    import time
+    for attempt in range(retries):
+        try:
+            _ensure_writable(path)
+            path.write_text(content, encoding="utf-8")
+            return
+        except OSError as e:
+            if attempt < retries - 1 and getattr(e, 'winerror', 0) == 32:
+                time.sleep(delay * (attempt + 1))
+            else:
+                raise
+
+
 class PatchOperation(str, Enum):
     REPLACE_LINE = "replace_line"
     REPLACE_BLOCK = "replace_block"
@@ -61,8 +76,29 @@ class PatchPlan:
                 is_regex=s.get("is_regex", False),
                 description=s.get("description", ""),
             ))
+        # Normalise target_file: the LLM sometimes sends absolute paths or
+        # prefixed relative paths. We need a clean relative path within apktool/.
+        tf = data["target_file"].replace("\\", "/")
+
+        # Handle absolute paths: extract everything after "decompiled/apktool/"
+        if "decompiled/apktool/" in tf:
+            tf = tf.split("decompiled/apktool/", 1)[1]
+        elif "decompiled/" in tf:
+            tf = tf.split("decompiled/", 1)[1]
+        else:
+            # Handle relative prefixes
+            for prefix in ("decompiled/apktool/", "decompiled/"):
+                if tf.startswith(prefix):
+                    tf = tf[len(prefix):]
+                    break
+
+        # Strip leading slashes and collapse double slashes
+        tf = tf.lstrip("/")
+        while "//" in tf:
+            tf = tf.replace("//", "/")
+
         return cls(
-            target_file=data["target_file"],
+            target_file=tf,
             description=data.get("description", ""),
             steps=steps,
         )
@@ -92,43 +128,88 @@ class PatchEngine:
         self.backup_dir.mkdir(parents=True, exist_ok=True)
         self.diffs_dir.mkdir(parents=True, exist_ok=True)
 
+    def _find_target(self, target_file: str) -> Path | None:
+        """Resolve target_file to an actual file path, searching all smali dirs.
+
+        Returns the Path if found, None otherwise.
+        """
+        tf = target_file.replace("\\", "/").lstrip("/")
+        while "//" in tf:
+            tf = tf.replace("//", "/")
+
+        # Direct under apktool_dir (covers smali/..., smali_classes2/..., res/..., etc.)
+        candidate = self.apktool_dir / tf
+        if candidate.is_file():
+            return candidate
+
+        # If path starts with "smali/", search smali_classes2/, smali_classes3/, etc.
+        if tf.startswith("smali/"):
+            inner = tf.split("/", 1)[1]
+            for child in sorted(self.apktool_dir.iterdir()):
+                if child.is_dir() and (child.name == "smali" or child.name.startswith("smali_classes")):
+                    test = child / inner
+                    if test.is_file():
+                        return test
+
+        # Bare path (e.g. "B2/g0.smali") — search all smali dirs
+        if not tf.startswith("smali") and tf.endswith(".smali"):
+            for child in sorted(self.apktool_dir.iterdir()):
+                if child.is_dir() and (child.name == "smali" or child.name.startswith("smali_classes")):
+                    test = child / tf
+                    if test.is_file():
+                        return test
+
+        return None
+
     def preview_plan(self, plan: PatchPlan) -> str:
         """Show what a plan would change without actually modifying files."""
-        target = self.apktool_dir / plan.target_file
-        if not target.is_file():
-            return f"❌ Target file not found: {plan.target_file}"
+        target = self._find_target(plan.target_file)
+        if target is None:
+            return f"\u274c Target file not found: {plan.target_file}"
 
         original = target.read_text(encoding="utf-8", errors="replace")
         modified = self._apply_steps(original, plan.steps)
         if modified is None:
-            return "❌ Could not apply one or more steps (pattern not found)."
+            return "\u274c Could not apply one or more steps (pattern not found)."
 
+        clean_path = plan.target_file.lstrip("/").replace("\\", "/")
+        while "//" in clean_path:
+            clean_path = clean_path.replace("//", "/")
         diff = difflib.unified_diff(
             original.splitlines(keepends=True),
             modified.splitlines(keepends=True),
-            fromfile=f"a/{plan.target_file}",
-            tofile=f"b/{plan.target_file}",
+            fromfile=f"a/{clean_path}",
+            tofile=f"b/{clean_path}",
             lineterm="",
         )
         return "".join(diff) or "(no changes)"
 
     def apply_plan(self, plan: PatchPlan) -> PatchResult:
         """Apply a patch plan to the target file. Backs up before modifying."""
-        target = self.apktool_dir / plan.target_file
+        target = self._find_target(plan.target_file)
         result = PatchResult(
             success=False,
             target_file=plan.target_file,
             steps_total=len(plan.steps),
         )
 
-        if not target.is_file():
+        if target is None:
             result.errors.append(f"Target file not found: {plan.target_file}")
             return result
 
-        # Backup
+        # Backup (retry on Windows file locks)
         backup_path = self.backup_dir / plan.target_file
         backup_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(str(target), str(backup_path))
+        import time as _t
+        for _attempt in range(3):
+            try:
+                shutil.copy2(str(target), str(backup_path))
+                break
+            except OSError as _oe:
+                if _attempt < 2 and getattr(_oe, 'winerror', 0) == 32:
+                    _t.sleep(0.3 * (_attempt + 1))
+                else:
+                    raise
         result.backup_path = str(backup_path)
 
         # Read original
@@ -153,9 +234,8 @@ class PatchEngine:
             result.errors.append("No steps were applied — all patterns failed to match.")
             return result
 
-        # Write modified file (clear read-only flag on Windows if needed)
-        _ensure_writable(target)
-        target.write_text(current, encoding="utf-8")
+        # Write modified file with retry for Windows file locks
+        _write_with_retry(target, current)
         result.files_modified.append(str(target))
 
         # Generate diff
@@ -170,7 +250,7 @@ class PatchEngine:
         # Save diff
         diff_file = self.diffs_dir / (plan.target_file.replace("/", "_").replace("\\", "_") + ".diff")
         diff_file.parent.mkdir(parents=True, exist_ok=True)
-        diff_file.write_text(result.diff_text, encoding="utf-8")
+        _write_with_retry(diff_file, result.diff_text)
 
         result.success = result.steps_applied == result.steps_total
         return result

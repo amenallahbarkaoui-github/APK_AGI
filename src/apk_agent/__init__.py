@@ -3,4 +3,4 @@
 import os as _os
 _os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 
-__version__ = "2.0.0"
+__version__ = "4.1.0"

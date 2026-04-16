@@ -14,7 +14,6 @@ import re
 import shutil
 import stat
 import struct
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from enum import Enum
@@ -407,22 +406,36 @@ ALL_PATTERNS: dict[PatchCategory, list[SmaliPattern]] = {
 def _collect_smali_files(dirs: list[Path], extensions: tuple[str, ...] = (".smali",)) -> list[Path]:
     """Recursively collect files matching extensions from multiple directories."""
     files: list[Path] = []
+    # Skip directories that are guaranteed to never contain app code
+    _SKIP_DIRS = frozenset({
+        "android", "androidx", "kotlin", "kotlinx", "dalvik",
+        "java", "javax", "org", "sun", "annotation",
+    })
     for d in dirs:
         if not d.is_dir():
             continue
-        for f in d.rglob("*"):
-            if f.is_file() and f.suffix in extensions:
+        for ext in extensions:
+            for f in d.rglob(f"*{ext}"):
+                # Skip framework/library top-level packages that never need patching
+                try:
+                    rel = f.relative_to(d)
+                    top = rel.parts[0] if rel.parts else ""
+                    if top in _SKIP_DIRS:
+                        continue
+                except ValueError:
+                    pass
                 files.append(f)
     return files
 
 
-def _scan_file(path: Path, compiled_regexes: list[re.Pattern]) -> Optional[Path]:
-    """Check if a file matches any of the compiled regexes. Returns path if match."""
+def _scan_file(path: Path, compiled_regexes: list[re.Pattern]) -> Optional[tuple[Path, str]]:
+    """Check if a file matches any of the compiled regexes.
+    Returns (path, content) tuple if match so we don't have to re-read in Phase 2."""
     try:
         content = path.read_text(encoding="utf-8", errors="ignore")
         for rx in compiled_regexes:
             if rx.search(content):
-                return path
+                return (path, content)
     except Exception:
         pass
     return None
@@ -432,31 +445,22 @@ def _parallel_scan(
     files: list[Path],
     patterns: list[SmaliPattern],
     max_workers: int | None = None,
-    progress_callback: Optional[Callable] = None,
-) -> list[Path]:
-    """Scan files in parallel for any matching pattern. Returns matching file paths."""
+) -> list[tuple[Path, str]]:
+    """Scan files in parallel for any matching pattern.
+    Returns list of (path, content) tuples so we skip re-reading in Phase 2."""
     if not files:
         return []
 
     compiled = [p.compiled() for p in patterns]
     workers = max_workers or min(cpu_count() or 4, 8)
-    matched: list[Path] = []
-    total = len(files)
-    done = 0
+    matched: list[tuple[Path, str]] = []
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_scan_file, f, compiled): f for f in files}
         for fut in as_completed(futures):
-            done += 1
             result = fut.result()
             if result is not None:
                 matched.append(result)
-            if progress_callback and done % 200 == 0:
-                pct = done / total * 50  # scanning is 0-50%
-                progress_callback(pct, f"Scanning {done}/{total} files ({len(matched)} matches)")
-
-    if progress_callback:
-        progress_callback(50, f"Scan complete: {len(matched)}/{total} files match")
 
     return matched
 
@@ -470,18 +474,28 @@ def _apply_patterns_to_file(
     path: Path,
     patterns: list[SmaliPattern],
     backup_dir: Optional[Path] = None,
+    preloaded_content: Optional[str] = None,
+    compiled_cache: Optional[list[re.Pattern]] = None,
 ) -> list[dict]:
-    """Apply all patterns to a single file. Returns list of applied patch details."""
+    """Apply all patterns to a single file. Returns list of applied patch details.
+
+    Args:
+        path: Path to the smali file.
+        patterns: List of SmaliPattern rules.
+        backup_dir: Optional backup directory.
+        preloaded_content: Pre-read file content from scanning phase (avoids re-read).
+        compiled_cache: Pre-compiled regex list (avoids re-compiling per file).
+    """
     applied: list[dict] = []
     try:
-        content = path.read_text(encoding="utf-8", errors="ignore")
+        content = preloaded_content or path.read_text(encoding="utf-8", errors="ignore")
     except Exception as e:
         return [{"error": str(e), "file": str(path)}]
 
     original = content
-    for pat in patterns:
+    for i, pat in enumerate(patterns):
         try:
-            rx = pat.compiled()
+            rx = compiled_cache[i] if compiled_cache else pat.compiled()
             new_content = rx.sub(pat.replacement, content)
             if new_content != content:
                 count = len(rx.findall(content))
@@ -525,7 +539,6 @@ def run_smali_patches(
     backup_dir: Optional[Path] = None,
     max_workers: int | None = None,
     custom_device_id: str | None = None,
-    progress_callback: Optional[Callable] = None,
 ) -> PatchStats:
     """Run automated smali patching across all smali directories.
 
@@ -535,7 +548,6 @@ def run_smali_patches(
         backup_dir: Where to backup files before patching.
         max_workers: Thread pool size.
         custom_device_id: If set, patches android_id to this value.
-        progress_callback: Optional (pct, detail) callback for progress updates.
 
     Returns:
         PatchStats with full details.
@@ -559,9 +571,6 @@ def run_smali_patches(
         stats.errors.append("No patterns match the requested categories")
         return stats
 
-    if progress_callback:
-        progress_callback(0, f"Collecting smali files from {len(smali_dirs)} directories...")
-
     # Collect files
     files = _collect_smali_files(smali_dirs)
     stats.files_scanned = len(files)
@@ -570,54 +579,26 @@ def run_smali_patches(
         stats.errors.append("No .smali files found in the given directories")
         return stats
 
-    if progress_callback:
-        progress_callback(2, f"Found {len(files)} smali files. Scanning with {len(patterns)} patterns...")
-
     # Phase 1: parallel scan to find matching files
-    matched = _parallel_scan(files, patterns, max_workers=max_workers,
-                             progress_callback=progress_callback)
+    matched = _parallel_scan(files, patterns, max_workers=max_workers)
     stats.files_matched = len(matched)
 
     if not matched:
-        if progress_callback:
-            progress_callback(100, "No matching files found — nothing to patch.")
         return stats
 
-    if progress_callback:
-        progress_callback(55, f"Patching {len(matched)} files with {len(patterns)} patterns...")
-
-    # Phase 2: apply patches in parallel (thread-safe per-file)
-    workers = max_workers or min(cpu_count() or 4, 8)
-    patch_done = 0
-    total_matched = len(matched)
-    _patch_lock = threading.Lock()
-
-    def _patch_one(path: Path) -> list[dict]:
-        return _apply_patterns_to_file(path, patterns, backup_dir=backup_dir)
-
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_patch_one, p): p for p in matched}
-        for fut in as_completed(futures):
-            results = fut.result()
-            actual_patches = [r for r in results if "matches" in r]
-            with _patch_lock:
-                patch_done += 1
-                if actual_patches:
-                    stats.files_patched += 1
-                    stats.patterns_applied += sum(r.get("matches", 0) for r in actual_patches)
-                    stats.applied_details.extend(actual_patches)
-                    for r in actual_patches:
-                        stats.categories_hit.add(r["category"])
-                errors = [r for r in results if "error" in r and "matches" not in r]
-                for e in errors:
-                    stats.errors.append(f"{e.get('file', '?')}: {e.get('error', '?')}")
-
-            if progress_callback and patch_done % 20 == 0:
-                pct = 55 + (patch_done / total_matched * 45)
-                progress_callback(pct, f"Patched {patch_done}/{total_matched} files ({stats.patterns_applied} patches applied)")
-
-    if progress_callback:
-        progress_callback(100, f"Done: {stats.files_patched} files patched, {stats.patterns_applied} patches applied")
+    # Phase 2: apply patches (sequential for file safety)
+    for path in matched:
+        results = _apply_patterns_to_file(path, patterns, backup_dir=backup_dir)
+        actual_patches = [r for r in results if "matches" in r]
+        if actual_patches:
+            stats.files_patched += 1
+            stats.patterns_applied += sum(r.get("matches", 0) for r in actual_patches)
+            stats.applied_details.extend(actual_patches)
+            for r in actual_patches:
+                stats.categories_hit.add(r["category"])
+        errors = [r for r in results if "error" in r and "matches" not in r]
+        for e in errors:
+            stats.errors.append(f"{e.get('file', '?')}: {e.get('error', '?')}")
 
     return stats
 

@@ -1,7 +1,7 @@
 """Auto-compact — summarize conversation context when it grows too large.
 
-When the message history exceeds a token threshold (default 200 000 tokens),
-the compactor:
+When the message history exceeds a token threshold (default 160 000 tokens,
+tuned for the GLM-5.1 204k context window), the compactor:
 
 1. Extracts the full conversation history
 2. Sends it to the LLM with a compact/summary prompt
@@ -162,10 +162,10 @@ Produce a structured summary following the format described in your instructions
 # Compactor
 # ---------------------------------------------------------------------------
 
-# Configurable thresholds
-DEFAULT_TOKEN_THRESHOLD = 90_000  # Start compacting when conversation exceeds this many tokens
-KEEP_RECENT_MESSAGES = 30  # Keep the last N messages for immediate context
-MIN_MESSAGES_TO_COMPACT = 40  # Don't compact if fewer messages than this
+# Configurable thresholds (GLM-5.1 context window: 204,800 tokens, max output: 131,072)
+DEFAULT_TOKEN_THRESHOLD = 160_000  # Start compacting — leaves ~45k headroom for response + state injection
+KEEP_RECENT_MESSAGES = 40  # Keep the last N messages for immediate context
+MIN_MESSAGES_TO_COMPACT = 50  # Don't compact if fewer messages than this
 
 
 class Compactor:
@@ -193,12 +193,13 @@ class Compactor:
         """Estimate token count without storing it."""
         return count_message_tokens(messages)
 
-    def compact(self, messages: list[BaseMessage], llm) -> list[BaseMessage]:
+    def compact(self, messages: list[BaseMessage], llm, *, agent_state: dict | None = None) -> list[BaseMessage]:
         """Compact the conversation by summarizing old messages.
 
         Args:
             messages: Full message list from the agent state
             llm: The LLM instance to use for summarization
+            agent_state: Optional agent state dict with findings/patches for fallback
 
         Returns:
             New message list: [SystemPrompt, CompactSummary, ...recent_messages]
@@ -255,7 +256,8 @@ class Compactor:
             if not summary_text:
                 logger.warning("Compactor returned empty summary after retries. Using fallback trim.")
                 return _sanitize_compacted(
-                    _fallback_trim(messages, system_msg, recent_messages, old_messages)
+                    _fallback_trim(messages, system_msg, recent_messages, old_messages,
+                                   agent_state=agent_state)
                 )
 
             self.compact_count += 1
@@ -298,7 +300,8 @@ class Compactor:
             logger.error("Auto-compact failed: %s", e)
             # Fallback: just trim old messages without LLM summary
             return _sanitize_compacted(
-                _fallback_trim(messages, system_msg, recent_messages, old_messages)
+                _fallback_trim(messages, system_msg, recent_messages, old_messages,
+                               agent_state=agent_state)
             )
 
     def get_stats(self) -> dict[str, Any]:
@@ -355,31 +358,95 @@ def _fallback_trim(
     system_msg: SystemMessage | None,
     recent: list[BaseMessage],
     old: list[BaseMessage],
+    *,
+    agent_state: dict | None = None,
 ) -> list[BaseMessage]:
-    """Fallback when LLM compaction fails — trim with a basic text summary."""
+    """Fallback when LLM compaction fails — build a structured summary from agent state."""
     logger.warning("Using fallback trim (no LLM summary).")
 
     # Count findings mentioned in old messages
-    finding_count = 0
     tool_names: set[str] = set()
     for msg in old:
         if isinstance(msg, ToolMessage):
             tool_names.add(msg.name or "unknown")
-        content = str(msg.content).lower()
-        if "vulnerability" in content or "finding" in content or "critical" in content:
-            finding_count += 1
 
-    fallback_summary = HumanMessage(
-        content=(
-            f"📋 **[Context Trimmed — Fallback]**\n\n"
-            f"The conversation was trimmed to stay within context limits.\n"
-            f"- {len(old)} older messages were removed\n"
-            f"- Tools used: {', '.join(sorted(tool_names)) or 'none'}\n"
-            f"- Approximate findings mentioned: {finding_count}\n\n"
-            f"Recent context preserved below. Review the project files and "
-            f"tool outputs if you need to recall earlier analysis results."
-        )
+    parts: list[str] = [
+        "📋 **[Context Trimmed — Fallback]**\n",
+        f"The conversation was trimmed to stay within context limits.",
+        f"- {len(old)} older messages were removed",
+        f"- Tools used: {', '.join(sorted(tool_names)) or 'none'}",
+    ]
+
+    # Preserve actual findings from agent state
+    if agent_state:
+        findings = agent_state.get("findings") or []
+        patches = agent_state.get("patch_results") or []
+        task = agent_state.get("task") or ""
+        target_pkgs = agent_state.get("target_packages") or []
+        scratchpad = agent_state.get("scratchpad") or {}
+        task_plan = agent_state.get("task_plan") or []
+
+        if task:
+            parts.append(f"\n## Original Task\n{task}")
+
+        if target_pkgs:
+            parts.append(f"\n## Target Packages\n{', '.join(target_pkgs)}")
+
+        if findings:
+            parts.append(f"\n## Vulnerability Findings ({len(findings)} total)")
+            by_sev: dict[str, list[dict]] = {}
+            for f in findings:
+                sev = f.get("severity", "info").upper()
+                by_sev.setdefault(sev, []).append(f)
+            for sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"):
+                items = by_sev.get(sev, [])
+                if items:
+                    parts.append(f"\n### {sev} ({len(items)})")
+                    for item in items[:20]:
+                        name = item.get("name", "unknown")
+                        fpath = item.get("file", "")
+                        cat = item.get("category", "")
+                        parts.append(f"- **{name}** ({cat}) — `{fpath}`")
+
+        if patches:
+            ok = sum(1 for p in patches if p.get("success"))
+            parts.append(f"\n## Patches Applied ({ok}/{len(patches)} successful)")
+            for p in patches:
+                status = "✅" if p.get("success") else "❌"
+                target = p.get("target_file", "unknown")
+                errors = p.get("errors", [])
+                parts.append(f"- {status} `{target}` — {p.get('steps_applied', 0)} steps")
+                if errors:
+                    for err in errors[:3]:
+                        parts.append(f"  - Error: {err}")
+
+        if scratchpad:
+            parts.append("\n## Working Memory (Scratchpad)")
+            for k, v in list(scratchpad.items())[:20]:
+                parts.append(f"- **{k}**: {str(v)[:300]}")
+
+        if task_plan:
+            parts.append("\n## Task Plan")
+            for t in task_plan:
+                status = t.get("status", "pending")
+                icon = "✅" if status == "done" else "🔄" if status == "in_progress" else "⬜"
+                parts.append(f"- {icon} [{t.get('id', '?')}] {t.get('desc', '')}")
+    else:
+        # No state available — fall back to counting message mentions
+        finding_count = 0
+        for msg in old:
+            content = str(msg.content).lower()
+            if "vulnerability" in content or "finding" in content or "critical" in content:
+                finding_count += 1
+        parts.append(f"- Approximate findings mentioned: {finding_count}")
+
+    parts.append(
+        "\n⚡ **AUTO-CONTINUE**: Review the findings and patches above, "
+        "then continue working on the original task. Do NOT re-run tools "
+        "whose results are already listed."
     )
+
+    fallback_summary = HumanMessage(content="\n".join(parts))
 
     result: list[BaseMessage] = []
     if system_msg:

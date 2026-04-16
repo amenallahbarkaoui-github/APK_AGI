@@ -1,4 +1,4 @@
-"""Rich console UI helpers for the chat CLI — v4 with live status bar + token tracking."""
+"""Rich console UI helpers for the chat CLI — v4 with real-time live status bar."""
 
 from __future__ import annotations
 
@@ -6,7 +6,8 @@ import threading
 import time
 from typing import Optional
 
-from rich.console import Console
+from rich.columns import Columns
+from rich.console import Console, Group
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -38,20 +39,11 @@ console = Console(theme=APK_THEME)
 
 def print_welcome(project_id: str | None = None, apk_name: str | None = None) -> None:
     """Print the welcome banner with project info."""
-    banner = Table(show_header=False, show_edge=False, padding=(0, 1), expand=False)
-    banner.add_column(style="bold cyan", justify="center")
-    banner.add_row("╔════════════════════════════════════════════════════╗")
-    banner.add_row("║     🔬 APK Agent v4.0.0 — SOTA Analysis Engine   ║")
-    banner.add_row("║     Interactive APK Reverse Engineering           ║")
-    banner.add_row("║     72 tools • Taint Analysis • Auto-Bypass      ║")
-    banner.add_row("╚════════════════════════════════════════════════════╝")
-    console.print(banner)
-
     if project_id and apk_name:
-        console.print(f"  📦 Project: [bold]{project_id}[/]  APK: [bold]{apk_name}[/]")
+        console.print(f"  [bold bright_cyan]📦[/] [bold]{apk_name}[/]  [dim]({project_id[:12]}…)[/]")
     console.print()
-    console.print("[dim]Modes: normal chat | /orchestrator (parallel sub-agents) | /auto (one-shot)[/]")
-    console.print("[dim]Commands: /status /tokens /progress /plan /help[/]")
+    console.print("[dim]Modes: normal chat │ /orchestrator (parallel) │ /auto (one-shot) │ /thinking (toggle reasoning)[/]")
+    console.print("[dim]Commands: /status /tokens /progress /plan /session /help[/]")
     console.print("[dim]Type your task (e.g., 'full security audit', 'bypass SSL pinning')[/]")
     console.print()
 
@@ -64,9 +56,9 @@ def print_ai_message(content: str) -> None:
     """Render an AI response as a styled panel with Markdown."""
     try:
         md = Markdown(content)
-        console.print(Panel(md, title="🤖 AI Agent", border_style="cyan", padding=(0, 1)))
+        console.print(Panel(md, title="[bold bright_cyan]🤖 AI Agent[/]", border_style="bright_cyan", padding=(0, 1)))
     except Exception:
-        console.print(Panel(content, title="🤖 AI Agent", border_style="cyan", padding=(0, 1)))
+        console.print(Panel(content, title="[bold bright_cyan]🤖 AI Agent[/]", border_style="bright_cyan", padding=(0, 1)))
 
 
 def print_tool_output(tool_name: str, content: str, success: bool = True) -> None:
@@ -75,15 +67,16 @@ def print_tool_output(tool_name: str, content: str, success: bool = True) -> Non
     style = "green" if success else "red"
     title = f"{icon} {tool_name}"
 
-    # Smart truncation — preserve start and end
+    # Smart truncation — preserve start and end for context
     if len(content) > 3000:
         lines = content.splitlines()
         if len(lines) > 40:
-            head = "\n".join(lines[:20])
-            tail = "\n".join(lines[-15:])
-            content = f"{head}\n\n... ({len(lines) - 35} lines omitted) ...\n\n{tail}"
+            head = "\n".join(lines[:18])
+            tail = "\n".join(lines[-12:])
+            omitted = len(lines) - 30
+            content = f"{head}\n\n[dim]  ··· {omitted} lines omitted ···[/dim]\n\n{tail}"
         else:
-            content = content[:3000] + "\n... (truncated)"
+            content = content[:2800] + "\n[dim]  ··· truncated ···[/dim]"
 
     console.print(
         Panel(content, title=title, border_style=style, padding=(0, 1), expand=False)
@@ -91,48 +84,264 @@ def print_tool_output(tool_name: str, content: str, success: bool = True) -> Non
 
 
 def print_tool_start(tool_name: str, args_summary: str = "") -> None:
-    """Show that a tool is starting execution."""
-    args_text = f" ({args_summary})" if args_summary else ""
-    console.print(f"  [dim]🔧 Running: [bold]{tool_name}[/]{args_text}...[/]")
+    """Show that a tool is starting execution — compact inline format."""
+    args_text = f" [dim]({args_summary})[/]" if args_summary else ""
+    console.print(f"  [dim]🔧[/] [bold dim]{tool_name}[/]{args_text}[dim]...[/]")
 
 
 # ---------------------------------------------------------------------------
-# Live progress listener — prints real-time updates during tool execution
+# Real-time Live Status Bar — always-visible at bottom during agent turns
 # ---------------------------------------------------------------------------
 
-_last_progress_print: dict[str, float] = {}
-_MIN_PRINT_INTERVAL = 1.5  # seconds between progress prints per task
+
+class TokenTracker:
+    """Thread-safe tracker for LLM token usage across the session."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.total_prompt_tokens: int = 0
+        self.total_completion_tokens: int = 0
+        self.total_cached_tokens: int = 0
+        self.total_calls: int = 0
+        self.turn_prompt_tokens: int = 0
+        self.turn_completion_tokens: int = 0
+        self.turn_cached_tokens: int = 0
+        self.turn_calls: int = 0
+        self.turn_start: float = 0.0
+        self._active_tool: str = ""
+        self._active_tool_start: float = 0.0
+        self._tool_progress_pct: float = 0.0
+        self._tool_progress_detail: str = ""
+        self._tools_completed_this_turn: int = 0
+        self._last_tool_completed: str = ""
+
+    def start_turn(self) -> None:
+        with self._lock:
+            self.turn_prompt_tokens = 0
+            self.turn_completion_tokens = 0
+            self.turn_cached_tokens = 0
+            self.turn_calls = 0
+            self.turn_start = time.time()
+            self._tools_completed_this_turn = 0
+            self._last_tool_completed = ""
+
+    def record_call(self, prompt_tokens: int = 0, completion_tokens: int = 0, cached_tokens: int = 0) -> None:
+        with self._lock:
+            self.total_prompt_tokens += prompt_tokens
+            self.total_completion_tokens += completion_tokens
+            self.total_cached_tokens += cached_tokens
+            self.total_calls += 1
+            self.turn_prompt_tokens += prompt_tokens
+            self.turn_completion_tokens += completion_tokens
+            self.turn_cached_tokens += cached_tokens
+            self.turn_calls += 1
+
+    def set_active_tool(self, name: str) -> None:
+        with self._lock:
+            self._active_tool = name
+            self._active_tool_start = time.time()
+            self._tool_progress_pct = 0.0
+            self._tool_progress_detail = ""
+
+    def update_tool_progress(self, pct: float, detail: str = "") -> None:
+        with self._lock:
+            self._tool_progress_pct = pct
+            if detail:
+                self._tool_progress_detail = detail
+
+    def clear_active_tool(self) -> None:
+        with self._lock:
+            if self._active_tool:
+                self._last_tool_completed = self._active_tool
+                self._tools_completed_this_turn += 1
+            self._active_tool = ""
+            self._tool_progress_pct = 0.0
+            self._tool_progress_detail = ""
+
+    @property
+    def active_tool(self) -> str:
+        return self._active_tool
+
+    @property
+    def active_tool_elapsed(self) -> float:
+        if not self._active_tool:
+            return 0
+        return time.time() - self._active_tool_start
+
+    @property
+    def turn_elapsed(self) -> float:
+        if not self.turn_start:
+            return 0
+        return time.time() - self.turn_start
+
+    @property
+    def total_tokens(self) -> int:
+        return self.total_prompt_tokens + self.total_completion_tokens
+
+
+# Global token tracker
+token_tracker = TokenTracker()
+
+
+class LiveStatusBar:
+    """A real-time status bar rendered at the bottom of the terminal.
+
+    Uses Rich Live display to continuously update a compact bar showing:
+    - Active tool name + spinner + elapsed time
+    - Tool progress bar (when tools report progress)
+    - Turn elapsed time + LLM call count
+    - Session token usage
+    - Context window usage %
+
+    The bar appears automatically when a tool starts and stays visible
+    throughout the agent turn, refreshing every 0.3s.
+    """
+
+    def __init__(self):
+        self._live: Live | None = None
+        self._active = False
+        self._lock = threading.Lock()
+        self._spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        self._frame_idx = 0
+
+    def start(self) -> None:
+        """Start the live status bar display."""
+        with self._lock:
+            if self._active:
+                return
+            self._active = True
+            self._live = Live(
+                self,
+                console=console,
+                refresh_per_second=4,
+                transient=True,  # bar disappears when stopped — clean output
+            )
+            self._live.start()
+
+    def stop(self) -> None:
+        """Stop the live status bar."""
+        with self._lock:
+            if not self._active:
+                return
+            self._active = False
+            if self._live:
+                try:
+                    self._live.stop()
+                except Exception:
+                    pass
+                self._live = None
+
+    def update(self) -> None:
+        """Force a refresh of the status bar content."""
+        with self._lock:
+            if self._active and self._live:
+                try:
+                    self._live.refresh()
+                except Exception:
+                    pass
+
+    def __rich_console__(self, console, options):
+        """Rich protocol — called by Live's background thread on every refresh tick."""
+        yield self._render()
+
+    def _render(self) -> Text:
+        """Build the status bar content as a Rich Text object."""
+        tt = token_tracker
+        self._frame_idx = (self._frame_idx + 1) % len(self._spinner_frames)
+        spinner = self._spinner_frames[self._frame_idx]
+
+        parts: list[str] = []
+
+        # ── Active tool with spinner + progress ──
+        if tt._active_tool:
+            elapsed = tt.active_tool_elapsed
+            tool_str = f"{spinner} [bold cyan]{tt._active_tool}[/bold cyan]"
+            if tt._tool_progress_pct > 0:
+                pct = tt._tool_progress_pct
+                bar_width = 15
+                filled = int(pct / 100 * bar_width)
+                bar = "━" * filled + "[dim]━[/dim]" * (bar_width - filled)
+                tool_str += f" [{bar}] {pct:.0f}%"
+            tool_str += f" {elapsed:.1f}s"
+            if tt._tool_progress_detail:
+                detail = tt._tool_progress_detail
+                if len(detail) > 40:
+                    detail = detail[:37] + "..."
+                tool_str += f" [dim]│ {detail}[/dim]"
+            parts.append(tool_str)
+        elif tt._tools_completed_this_turn > 0:
+            parts.append(f"[green]✓[/green] {tt._tools_completed_this_turn} tools done")
+
+        # ── Turn timing ──
+        if tt.turn_start:
+            turn_t = tt.turn_elapsed
+            parts.append(f"[dim]⏱[/dim] {turn_t:.0f}s")
+
+        # ── LLM calls this turn ──
+        if tt.turn_calls:
+            parts.append(f"[dim]📡[/dim] {tt.turn_calls}")
+
+        # ── Token usage ──
+        if tt.total_tokens:
+            in_k = tt.turn_prompt_tokens / 1000
+            out_k = tt.turn_completion_tokens / 1000
+            token_str = f"[dim]🪙[/dim] ↑{in_k:.1f}k ↓{out_k:.1f}k"
+            if tt.total_calls > 1:
+                total_k = tt.total_tokens / 1000
+                token_str += f" [dim]Σ{total_k:.0f}k[/dim]"
+            if tt.turn_cached_tokens > 0:
+                cache_pct = (tt.turn_cached_tokens / max(tt.turn_prompt_tokens, 1)) * 100
+                token_str += f" [green]⚡{cache_pct:.0f}%cache[/green]"
+            parts.append(token_str)
+
+        # ── Context window % ──
+        try:
+            from apk_agent.agent.graph import _compactor
+            if _compactor and _compactor.last_token_count > 0:
+                ctx_pct = (_compactor.last_token_count / _compactor.token_threshold) * 100
+                if ctx_pct < 60:
+                    color = "green"
+                elif ctx_pct < 85:
+                    color = "yellow"
+                else:
+                    color = "red"
+                parts.append(f"[{color}]ctx {ctx_pct:.0f}%[/{color}]")
+        except Exception:
+            pass
+
+        if not parts:
+            return Text("")
+
+        separator = " │ "
+        line = separator.join(parts)
+        return Text.from_markup(f"[dim]───[/dim] {line} [dim]───[/dim]")
+
+    @property
+    def is_active(self) -> bool:
+        return self._active
+
+
+# Global live status bar
+live_bar = LiveStatusBar()
 
 
 def _live_progress_listener(event: str, task) -> None:
-    """Listener registered on ProgressManager to print live updates.
+    """Listener on ProgressManager — feeds tool progress into the live bar.
 
-    Prints intermediate progress from long-running tools like
-    scan_smali_classes, scan_vulnerabilities, detect_protections, etc.
-    Throttled to max one print every 1.5 seconds per task.
+    Replaces old print-based listener. Now updates the token_tracker's
+    tool progress and triggers a bar refresh.
     """
-    if event != "update":
-        return
-
-    detail = task.metadata.get("detail", "")
-    if not detail:
-        return
-
-    now = time.time()
-    last = _last_progress_print.get(task.id, 0)
-    if now - last < _MIN_PRINT_INTERVAL:
-        return
-    _last_progress_print[task.id] = now
-
-    pct = task.progress_pct
-    # Build a mini progress bar
-    filled = int(pct / 5)  # 20 chars wide
-    bar = "█" * filled + "░" * (20 - filled)
-    elapsed = task.elapsed
-
-    console.print(
-        f"    [dim]⏳ {task.name}: [{bar}] {pct:.0f}% — {detail} ({elapsed:.1f}s)[/]"
-    )
+    if event == "start":
+        token_tracker.set_active_tool(task.name)
+        live_bar.update()
+    elif event == "update":
+        pct = task.progress_pct
+        detail = task.metadata.get("detail", "")
+        token_tracker.update_tool_progress(pct, detail)
+        live_bar.update()
+    elif event == "complete":
+        token_tracker.clear_active_tool()
+        live_bar.update()
 
 
 def enable_live_progress() -> None:
@@ -145,23 +354,24 @@ def enable_live_progress() -> None:
 
 
 def print_hitl_prompt(prompt_text: str) -> None:
-    """Render a human-in-the-loop prompt."""
-    # Detect if this is a question from ask_user or a patch approval
+    """Render a human-in-the-loop prompt with distinct styling."""
     if prompt_text.startswith("❓"):
         title = "❓ Agent Needs Your Input"
+        style = "bright_magenta"
     else:
         title = "🔒 Human Review Required"
+        style = "yellow"
     console.print(Panel(
         prompt_text,
-        title=title,
-        border_style="magenta",
+        title=f"[bold]{title}[/]",
+        border_style=style,
         padding=(1, 2),
     ))
 
 
 def print_user_message(content: str) -> None:
     """Render a user message."""
-    console.print(f"\n[bold green]You:[/] {content}")
+    console.print(f"\n[bold green]▶ You:[/] {content}")
 
 
 def print_error(message: str) -> None:
@@ -366,174 +576,159 @@ def print_sub_agent_result(result: dict) -> None:
 def print_help() -> None:
     """Print help text for available commands."""
     help_text = """
-[bold]Available Commands:[/]
+[bold cyan]━━━ Project ━━━[/]
   [cyan]/new <apk_path>[/]    — Create a new project from an APK/XAPK file
   [cyan]/open <id>[/]         — Open an existing project by ID
   [cyan]/list[/]               — List all projects
+
+[bold cyan]━━━ Info ━━━[/]
   [cyan]/status[/]             — Show current project status
-  [cyan]/tokens[/]             — Show current context token usage
+  [cyan]/session[/]            — Show session info (thread ID, messages, tokens)
+  [cyan]/tokens[/]             — Show current context & token usage
   [cyan]/logs[/]               — Show recent tool logs
-  [cyan]/report[/]             — Generate/show the report
+  [cyan]/report[/]             — Show the generated report
   [cyan]/progress[/]           — Show task progress summary
   [cyan]/plan[/]               — Show the agent's current task plan
-  [cyan]/auto[/]               — Full auto mode (no confirmations, one-shot deep run)
+
+[bold cyan]━━━ Modes ━━━[/]
+  [cyan]/thinking[/]           — Toggle LLM deep thinking/reasoning mode [bold](🧠)[/]
+  [cyan]/auto[/]               — Toggle auto mode (no confirmations, one-shot)
   [cyan]/orchestrator[/]       — Switch to orchestrator mode (parallel sub-agents)
   [cyan]/normal[/]             — Switch back to normal chat mode
-  [cyan]/stop[/]               — Stop the current operation
-  [cyan]/help[/]               — Show this help text
-  [cyan]/quit[/]               — Exit APK Agent
 
-[bold]Session Commands:[/]
-  [cyan]/session[/]            — Show session info (thread ID, messages, tokens)
+[bold cyan]━━━ Control ━━━[/]
   [cyan]/compact[/]            — Show compaction status
   [cyan]/reset[/]              — Delete session history (start fresh)
+  [cyan]/stop[/]               — Stop the current operation
+  [cyan]/quit[/]               — Exit APK Agent
 
-[bold]SOTA Analysis Tools (NEW):[/]
-  The agent now has 72 tools including:
-  • [cyan]SmaliIndex IR[/]     — Full parsed representation of all smali code
-  • [cyan]Unified Scanner[/]   — 36-rule single-pass security scanner
-  • [cyan]Taint Analysis[/]    — Source→Sink data flow tracing
-  • [cyan]Auto-Bypass[/]       — Smali patches + Frida scripts for 8 protection types
-  • [cyan]Manifest Analyzer[/] — Deep semantic analysis with code cross-referencing
-  • [cyan]Cloud Scanner[/]     — Firebase/AWS/GCP/Azure credential detection
+[bold cyan]━━━ CLI Flags ━━━[/]
+  [dim]--thinking / --no-thinking[/]  — Enable/disable thinking at launch
+  [dim]--model / -m MODEL[/]         — Override LLM model name
+  [dim]--auto[/]                      — Start in auto mode
+  [dim]--verbose / -v[/]             — Enable debug logging
 
-[bold]Auto Mode:[/]
-  In auto mode, patches are auto-approved and agent questions are
-  auto-answered. Best for one-shot full analysis runs.
-
-[bold]Orchestrator Mode:[/]
-  Complex tasks are broken into sub-tasks for parallel execution.
+[bold]SOTA Analysis Tools:[/]
+  [dim]SmaliIndex IR · Unified Scanner · Taint Analysis · Auto-Bypass
+  Manifest Analyzer · Cloud Scanner · Code Graph · 72 tools total[/]
 
 [bold]Example Tasks:[/]
-  • "full security audit of this APK"
-  • "bypass SSL pinning statically"
-  • "find hardcoded API keys and secrets"
-  • "run taint analysis to find data leaks"
-  • "scan for cloud misconfigurations"
-  • "generate Frida scripts for all protections"
+  • [dim]"full security audit of this APK"[/]
+  • [dim]"bypass SSL pinning statically"[/]
+  • [dim]"find hardcoded API keys and secrets"[/]
+  • [dim]"run taint analysis to find data leaks"[/]
 """
-    console.print(Panel(help_text, title="📖 Help", border_style="blue"))
+    console.print(Panel(help_text.strip(), title="📖 Help", border_style="bright_cyan", padding=(0, 1)))
 
 
 # ---------------------------------------------------------------------------
-# Token Usage Tracking
+# Print helpers that use the new TokenTracker / LiveStatusBar
 # ---------------------------------------------------------------------------
-
-class TokenTracker:
-    """Thread-safe tracker for LLM token usage across the session."""
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        self.total_prompt_tokens: int = 0
-        self.total_completion_tokens: int = 0
-        self.total_calls: int = 0
-        self.turn_prompt_tokens: int = 0
-        self.turn_completion_tokens: int = 0
-        self.turn_calls: int = 0
-        self.turn_start: float = 0.0
-        self._active_tool: str = ""
-        self._active_tool_start: float = 0.0
-
-    def start_turn(self) -> None:
-        with self._lock:
-            self.turn_prompt_tokens = 0
-            self.turn_completion_tokens = 0
-            self.turn_calls = 0
-            self.turn_start = time.time()
-
-    def record_call(self, prompt_tokens: int = 0, completion_tokens: int = 0) -> None:
-        with self._lock:
-            self.total_prompt_tokens += prompt_tokens
-            self.total_completion_tokens += completion_tokens
-            self.total_calls += 1
-            self.turn_prompt_tokens += prompt_tokens
-            self.turn_completion_tokens += completion_tokens
-            self.turn_calls += 1
-
-    def set_active_tool(self, name: str) -> None:
-        with self._lock:
-            self._active_tool = name
-            self._active_tool_start = time.time()
-
-    def clear_active_tool(self) -> None:
-        with self._lock:
-            self._active_tool = ""
-
-    @property
-    def active_tool(self) -> str:
-        return self._active_tool
-
-    @property
-    def active_tool_elapsed(self) -> float:
-        if not self._active_tool:
-            return 0
-        return time.time() - self._active_tool_start
-
-    @property
-    def turn_elapsed(self) -> float:
-        if not self.turn_start:
-            return 0
-        return time.time() - self.turn_start
-
-    @property
-    def total_tokens(self) -> int:
-        return self.total_prompt_tokens + self.total_completion_tokens
-
-    def format_status_line(self) -> str:
-        """Build a compact status line for display at the bottom."""
-        parts = []
-        # Active tool
-        if self._active_tool:
-            elapsed = self.active_tool_elapsed
-            parts.append(f"🔧 {self._active_tool} ({elapsed:.1f}s)")
-        # Turn stats
-        if self.turn_start:
-            turn_t = self.turn_elapsed
-            parts.append(f"⏱ {turn_t:.0f}s")
-            if self.turn_calls:
-                parts.append(f"📡 {self.turn_calls} calls")
-        # Total tokens
-        if self.total_tokens:
-            total_k = self.total_tokens / 1000
-            parts.append(f"🪙 {total_k:.1f}k tokens")
-        return " │ ".join(parts) if parts else ""
-
-
-# Global token tracker
-token_tracker = TokenTracker()
 
 
 def print_status_bar() -> None:
-    """Print a compact status bar with current token usage and tool state."""
-    line = token_tracker.format_status_line()
-    if line:
-        console.print(f"[dim]─── {line} ───[/]")
+    """Print a one-shot snapshot of the current token/tool state.
+
+    For the `/tokens` command — NOT the persistent bar.
+    """
+    tt = token_tracker
+    table = Table(
+        title="🪙 Token Usage",
+        show_header=True,
+        header_style="bold cyan",
+        border_style="dim",
+        padding=(0, 1),
+    )
+    table.add_column("Metric", style="bold")
+    table.add_column("This Turn", justify="right")
+    table.add_column("Session", justify="right")
+
+    table.add_row(
+        "Prompt tokens",
+        f"{tt.turn_prompt_tokens:,}",
+        f"{tt.total_prompt_tokens:,}",
+    )
+    table.add_row(
+        "Completion tokens",
+        f"{tt.turn_completion_tokens:,}",
+        f"{tt.total_completion_tokens:,}",
+    )
+    table.add_row(
+        "Total tokens",
+        f"{tt.turn_prompt_tokens + tt.turn_completion_tokens:,}",
+        f"{tt.total_tokens:,}",
+    )
+    table.add_row(
+        "LLM calls",
+        str(tt.turn_calls),
+        str(tt.total_calls),
+    )
+    table.add_row(
+        "Cached tokens",
+        f"{tt.turn_cached_tokens:,}",
+        f"{tt.total_cached_tokens:,}",
+    )
+    if tt.total_cached_tokens > 0:
+        save_pct = (tt.total_cached_tokens / max(tt.total_prompt_tokens, 1)) * 100
+        table.add_row(
+            "Cache hit rate",
+            "",
+            f"[green]⚡ {save_pct:.0f}%[/green]",
+        )
+
+    console.print(table)
+
+    # Context window
+    try:
+        from apk_agent.agent.graph import _compactor
+        if _compactor and _compactor.last_token_count > 0:
+            ctx_pct = (_compactor.last_token_count / _compactor.token_threshold) * 100
+            bar_w = 30
+            filled = int(ctx_pct / 100 * bar_w)
+            color = "green" if ctx_pct < 60 else ("yellow" if ctx_pct < 85 else "red")
+            bar_str = f"[{color}]{'━' * filled}[/{color}][dim]{'━' * (bar_w - filled)}[/dim]"
+            console.print(
+                f"  Context window: [{bar_str}] [{color}]{ctx_pct:.0f}%[/{color}]"
+            )
+    except Exception:
+        pass
 
 
 def print_turn_summary() -> None:
-    """Print a summary at the end of each agent turn."""
+    """Print a compact summary line at the end of an agent turn."""
     tt = token_tracker
     if not tt.turn_start:
         return
 
     elapsed = tt.turn_elapsed
-    parts = [f"[dim]── Turn: {elapsed:.1f}s"]
+    parts = []
+    parts.append(f"{elapsed:.1f}s")
     if tt.turn_calls:
-        parts.append(f"{tt.turn_calls} LLM calls")
+        parts.append(f"{tt.turn_calls} calls")
     if tt.turn_prompt_tokens or tt.turn_completion_tokens:
-        parts.append(f"{tt.turn_prompt_tokens:,}→{tt.turn_completion_tokens:,} tokens")
-    if tt.total_tokens:
-        total_k = tt.total_tokens / 1000
-        parts.append(f"session total: {total_k:.1f}k")
+        in_k = tt.turn_prompt_tokens / 1000
+        out_k = tt.turn_completion_tokens / 1000
+        parts.append(f"↑{in_k:.1f}k ↓{out_k:.1f}k")
+    if tt.turn_cached_tokens:
+        cache_pct = (tt.turn_cached_tokens / max(tt.turn_prompt_tokens, 1)) * 100
+        parts.append(f"⚡{cache_pct:.0f}%")
+    if tt._tools_completed_this_turn:
+        parts.append(f"{tt._tools_completed_this_turn} tools")
 
-    # Context usage from compactor
+    # Context usage
     try:
         from apk_agent.agent.graph import _compactor
         if _compactor and _compactor.last_token_count > 0:
             ctx_pct = (_compactor.last_token_count / _compactor.token_threshold) * 100
-            parts.append(f"context: {ctx_pct:.0f}%")
+            color = "green" if ctx_pct < 60 else ("yellow" if ctx_pct < 85 else "red")
+            parts.append(f"[{color}]ctx {ctx_pct:.0f}%[/{color}]")
     except Exception:
         pass
 
-    console.print(" │ ".join(parts) + " ──[/]")
+    if tt.total_tokens:
+        total_k = tt.total_tokens / 1000
+        parts.append(f"Σ{total_k:.1f}k")
+
+    separator = " │ "
+    console.print(f"[dim]╰── {separator.join(parts)} ──╯[/]")
 

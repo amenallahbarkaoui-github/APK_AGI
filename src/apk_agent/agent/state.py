@@ -40,15 +40,7 @@ class AgentState(TypedDict):
     findings: list[dict[str, Any]]
 
     # ---- patch tracking ----
-    patch_plans: list[dict[str, Any]]
     patch_results: list[dict[str, Any]]
-
-    # ---- tool history (for reporting & awareness) ----
-    tool_history: list[dict[str, Any]]
-
-    # ---- dynamic plan ----
-    current_plan: list[str]  # LLM can rewrite this after each observation
-    plan_step_index: int
 
     # ---- HITL ----
     human_feedback: str  # populated when resuming from an interrupt

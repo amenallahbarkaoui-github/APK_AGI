@@ -39,7 +39,12 @@ _oai_base._convert_message_to_dict = _patched_convert_message_to_dict
 
 # -- Fix 2 --------------------------------------------------------------------
 class _PatchedHttpClient(httpx.Client):
-    """Injects ``reasoning_content`` into assistant messages at send()-time."""
+    """Patches outgoing requests for Z.AI / AIML API compatibility:
+    1. Injects ``reasoning_content`` on assistant messages (required by proxy)
+    2. Injects ``thinking`` parameter for deep thinking models
+    """
+
+    _enable_thinking: bool = False
 
     def send(self, request, **kwargs):
         if (
@@ -59,6 +64,10 @@ class _PatchedHttpClient(httpx.Client):
                         ):
                             msg["reasoning_content"] = "."
                             modified = True
+                    # Inject thinking parameter into the request body
+                    if self._enable_thinking and "thinking" not in body:
+                        body["thinking"] = {"type": "enabled"}
+                        modified = True
                     if modified:
                         new_bytes = _json.dumps(
                             body, ensure_ascii=False
@@ -85,11 +94,24 @@ def get_llm(config: "AppConfig", temperature: float = 1.0) -> ChatOpenAI:
             "Set your AIML API key or other provider key."
         )
 
+    # GLM-5.1 supports 204k context, 131k max output, deep thinking, and auto-caching
+    # Enable deep thinking for complex reasoning (GLM-5.x / GLM-4.x)
+    model_lower = config.model_name.lower()
+    model_supports_thinking = any(
+        tag in model_lower for tag in ("glm-5", "glm-4.7", "glm-4.6", "glm-4.5")
+    )
+
+    # Thinking is enabled only if the model supports it AND the user hasn't disabled it
+    enable_thinking = model_supports_thinking and getattr(config, "thinking_enabled", True)
+
+    http_client = _PatchedHttpClient()
+    http_client._enable_thinking = enable_thinking
+
     return ChatOpenAI(
         model=config.model_name,
         api_key=config.api_key,
         base_url=config.api_base_url,
-        temperature=temperature,
-        max_tokens=4096,
-        http_client=_PatchedHttpClient(),
+        temperature=1.0 if enable_thinking else temperature,
+        max_tokens=16384,
+        http_client=http_client,
     )

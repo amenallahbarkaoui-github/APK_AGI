@@ -48,6 +48,9 @@ class AppConfig:
     # Limits
     max_apk_size_mb: int = 200
 
+    # Thinking / reasoning mode
+    thinking_enabled: bool = True  # user-toggleable deep thinking for the LLM
+
     # --- resolved tool paths (filled by validate) ---
     _resolved_tools: dict[str, str] = field(default_factory=dict, repr=False)
 
@@ -80,6 +83,7 @@ class AppConfig:
                 key_password=os.getenv("KEY_PASSWORD", "android"),
             ),
             max_apk_size_mb=int(os.getenv("MAX_APK_SIZE_MB", "200")),
+            thinking_enabled=os.getenv("THINKING_ENABLED", "true").lower() in ("true", "1", "yes"),
         )
         return cfg
 
