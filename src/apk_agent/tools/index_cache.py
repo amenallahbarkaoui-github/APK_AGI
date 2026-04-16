@@ -338,23 +338,94 @@ def lookup_method(index: dict, method_name: str) -> dict:
 
 
 def lookup_string(index: dict, query: str) -> dict:
-    """Find classes that use a specific string constant."""
-    query_lower = query.lower()
-    matches = []
-    for s, classes in index.get("strings", {}).items():
-        if query_lower in s.lower():
-            matches.append({
-                "string": s,
-                "used_by": classes,
-            })
+    """Unified index search — searches string constants, method names, class names, and fields.
 
-    matches.sort(key=lambda m: len(m["used_by"]), reverse=True)
-    return {
+    Automatically detects query type:
+    - Smali references (;-> or L...;) → searches classes + methods
+    - Otherwise → searches strings first, then methods + classes if no results
+    """
+    query_lower = query.lower()
+    is_smali_ref = ";->" in query or (query.startswith("L") and ";" in query)
+
+    # --- String constant search ---
+    string_matches = []
+    if not is_smali_ref:
+        for s, classes in index.get("strings", {}).items():
+            if query_lower in s.lower():
+                string_matches.append({
+                    "string": s,
+                    "used_by": classes,
+                })
+        string_matches.sort(key=lambda m: len(m["used_by"]), reverse=True)
+
+    # --- Method reference search ---
+    method_matches = []
+    # Extract method name from smali references: "Lm0$e;->e" → "e", "m0$e;->g" → "g"
+    method_query = query
+    class_hint = ""
+    if ";->" in query:
+        parts = query.split(";->")
+        class_hint = parts[0].lstrip("L").replace("/", ".").replace("$", "$")
+        method_query = parts[1].split("(")[0] if len(parts) > 1 else ""
+
+    if method_query:
+        mq_lower = method_query.lower()
+        for name, refs in index.get("method_index", {}).items():
+            if mq_lower == name.lower() or (len(mq_lower) > 2 and mq_lower in name.lower()):
+                for ref in refs:
+                    # If we have a class hint, filter to matching classes
+                    if class_hint:
+                        ref_class = ref.split(";->")[0].lstrip("L").replace("/", ".")
+                        if class_hint.lower() not in ref_class.lower():
+                            continue
+                    cls = ref.split(";->")[0] + ";" if ";->" in ref else ""
+                    cls_info = index.get("classes", {}).get(cls, {})
+                    method_matches.append({
+                        "full_name": ref,
+                        "class": cls,
+                        "file": cls_info.get("file", ""),
+                        "package": cls_info.get("package", ""),
+                    })
+
+    # --- Class name search (for smali-style queries) ---
+    class_matches = []
+    if is_smali_ref or not string_matches:
+        # Clean up query for class matching
+        class_query = query.split(";->")[0] if ";->" in query else query
+        class_query = class_query.lstrip("L").rstrip(";")
+        cq_lower = class_query.lower()
+        for cls, info in index.get("classes", {}).items():
+            cls_clean = cls.lstrip("L").rstrip(";").lower()
+            if cq_lower in cls_clean:
+                class_matches.append({
+                    "class": cls,
+                    "file": info.get("file", ""),
+                    "package": info.get("package", ""),
+                    "method_count": info.get("method_count", 0),
+                    "methods": [m["name"] for m in info.get("methods", [])][:15],
+                })
+
+    total = len(string_matches) + len(method_matches) + len(class_matches)
+    result: dict = {
         "success": True,
         "query": query,
-        "total_matches": len(matches),
-        "results": matches[:30],
+        "total_matches": total,
     }
+    if string_matches:
+        result["string_results"] = string_matches[:20]
+    if method_matches:
+        result["method_results"] = method_matches[:20]
+    if class_matches:
+        result["class_results"] = class_matches[:20]
+    if total == 0:
+        result["results"] = []
+        result["hint"] = (
+            "No matches in the index. Try: "
+            "search_in_code for grep-style search, "
+            "xref_search for cross-references, "
+            "or smart_search for semantic search."
+        )
+    return result
 
 
 def lookup_package(index: dict, package_name: str) -> dict:

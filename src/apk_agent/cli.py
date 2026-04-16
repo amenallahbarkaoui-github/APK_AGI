@@ -460,6 +460,61 @@ def main(apk_path: str | None, verbose: bool, project_id: str | None,
                 actual_count = len(ckpt.values["messages"])
                 session_meta.message_count = actual_count
 
+                # ── Pre-compact on resume if context is already over threshold ──
+                # Without this, the first LLM call would fail or produce
+                # degraded output because there's no headroom for a response.
+                from apk_agent.agent.graph import _compactor, _raw_llm
+                if _compactor is not None:
+                    cur_messages = list(ckpt.values["messages"])
+                    if _compactor.should_compact(cur_messages):
+                        tok_before = _compactor.last_token_count
+                        print_warning(
+                            f"Context at {tok_before:,} tokens "
+                            f"({tok_before * 100 // _compactor.token_threshold}%) — "
+                            f"auto-compacting before resume..."
+                        )
+                        compacted = _compactor.compact(
+                            cur_messages, _raw_llm, agent_state=ckpt.values,
+                        )
+                        if compacted is not cur_messages:
+                            # Persist compaction via RemoveMessage + add new summary.
+                            # update_state with add_messages reducer: RemoveMessage
+                            # removes by id, then new messages are appended.
+                            from langchain_core.messages import RemoveMessage
+                            old_ids = {
+                                m.id for m in cur_messages
+                                if getattr(m, "id", None)
+                            }
+                            survived = {
+                                m.id for m in compacted
+                                if getattr(m, "id", None)
+                            }
+                            removals = [
+                                RemoveMessage(id=mid)
+                                for mid in old_ids if mid not in survived
+                            ]
+                            # New messages from compaction (summary etc.)
+                            new_msgs = [
+                                m for m in compacted
+                                if getattr(m, "id", None) is None
+                                or m.id not in old_ids
+                            ]
+                            state_update = removals + new_msgs
+                            if state_update:
+                                graph.update_state(
+                                    graph_config,
+                                    {"messages": state_update},
+                                )
+                            tok_after = _compactor.estimate_tokens(compacted)
+                            session_meta.compact_count = _compactor.compact_count
+                            save_session_meta(session_meta, project.workspace_path)
+                            print_success(
+                                f"Pre-compacted: {actual_count} → {len(compacted)} messages, "
+                                f"~{tok_before:,} → ~{tok_after:,} tokens"
+                            )
+                            actual_count = len(compacted)
+                            session_meta.message_count = actual_count
+
                 # Show restored state summary
                 findings = ckpt.values.get("findings") or []
                 patches = ckpt.values.get("patch_results") or []
@@ -772,6 +827,10 @@ def _run_agent_turn(graph, graph_config: dict, user_input: str, project: Project
         input_state.update({
             "findings": [],
             "patch_results": [],
+            "patch_plans": [],
+            "tool_history": [],
+            "current_plan": "",
+            "plan_step_index": 0,
             "graph_ready": False,
             "target_packages": [],
             "excluded_packages": [],

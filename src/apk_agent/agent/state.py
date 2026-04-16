@@ -41,6 +41,14 @@ class AgentState(TypedDict):
 
     # ---- patch tracking ----
     patch_results: list[dict[str, Any]]
+    patch_plans: list[dict[str, Any]]  # saved patch plans for replay / auditing
+
+    # ---- execution history ----
+    tool_history: list[dict[str, Any]]  # [{tool, success, duration}, ...]
+
+    # ---- plan execution ----
+    current_plan: str   # name/description of the currently executing plan
+    plan_step_index: int  # current step index within the active plan
 
     # ---- HITL ----
     human_feedback: str  # populated when resuming from an interrupt

@@ -129,8 +129,13 @@ def agent_node(state: AgentState) -> dict:
     """
     from apk_agent.agent.graph import _llm_with_tools, _compactor  # noqa: lazy ref
     from apk_agent.agent.orchestrator import _sanitize_messages
+    from langchain_core.messages import RemoveMessage
 
     messages = list(state["messages"])
+    # Track which message IDs existed before compaction so we can persist
+    # the compaction by emitting RemoveMessage entries for the old ones.
+    _pre_compact_ids: list[str] = []
+    _compact_summary_msgs: list[BaseMessage] = []
 
     # Inject system prompt if not already present
     if not messages or not isinstance(messages[0], SystemMessage):
@@ -212,6 +217,11 @@ def agent_node(state: AgentState) -> dict:
         # Get the raw LLM (without tools) for compaction
         from apk_agent.agent.graph import _raw_llm
 
+        # Remember ALL existing message IDs before compaction
+        _pre_compact_ids = [
+            m.id for m in state["messages"] if getattr(m, "id", None)
+        ]
+
         compacted = _compactor.compact(messages, _raw_llm, agent_state=state)
         if compacted is not messages:
             messages = compacted
@@ -220,14 +230,35 @@ def agent_node(state: AgentState) -> dict:
                 len(messages),
                 count_message_tokens(messages),
             )
+
+            # Collect only the NEW messages created by compaction (compact summary).
+            # These have id=None since they were just created, not from the checkpoint.
+            # Recent messages that survived compaction already have IDs in the checkpoint
+            # and don't need to be re-added.
+            _compact_summary_msgs = [
+                m for m in compacted
+                if getattr(m, "id", None) is None
+                and not isinstance(m, SystemMessage)
+            ]
+
             # Inject auto-continue instruction so the agent doesn't stop
-            messages.append(HumanMessage(
+            auto_continue = HumanMessage(
                 content=(
                     "[SYSTEM] Context was auto-compacted. Read the summary above carefully, "
                     "then CONTINUE working on the original task without asking. "
                     "Do NOT repeat already-completed tool calls. Execute the NEXT step immediately."
                 )
-            ))
+            )
+            messages.append(auto_continue)
+            _compact_summary_msgs.append(auto_continue)
+
+    # Compute survived IDs NOW (before sanitization which may create new
+    # message objects without preserving the original .id attribute).
+    _compacted_survived_ids: set[str] = set()
+    if _pre_compact_ids:
+        _compacted_survived_ids = {
+            m.id for m in messages if getattr(m, "id", None)
+        }
 
     # Sanitize: prevent content block arrays > 5 elements (API proxy limit)
     messages = _sanitize_messages(messages)
@@ -363,10 +394,6 @@ def agent_node(state: AgentState) -> dict:
                 attempt + 1, max_retries, str(e)[:120], wait,
             )
             time.sleep(wait)
-    # If we compacted, return the full new message list + response
-    if _compactor is not None and _compactor.compact_count > 0:
-        # Only replace messages if we actually compacted this turn
-        pass
 
     # --- Tool call loop detection ---
     # Check if the LLM is repeating the same tools with same args
@@ -397,6 +424,23 @@ def agent_node(state: AgentState) -> dict:
                 )]
             else:
                 response.tool_calls = filtered_calls
+
+    # Persist compaction: prepend removals + compact summary before result.
+    # Without this, the checkpoint keeps the full uncompacted history and
+    # every future turn would re-compact (wasting time and tokens).
+    if _pre_compact_ids:
+        removals = [
+            RemoveMessage(id=mid)
+            for mid in _pre_compact_ids
+            if mid not in _compacted_survived_ids
+        ]
+        if removals:
+            logger.info(
+                "Persisting compaction: removing %d old messages, adding %d summary messages",
+                len(removals), len(_compact_summary_msgs),
+            )
+            # Order: removals first, then compact summary msgs, then LLM response
+            result_messages = removals + _compact_summary_msgs + result_messages
 
     return {"messages": result_messages}
 
@@ -788,7 +832,7 @@ def build_graph(config: AppConfig, project: Project, checkpointer=None):
     global _llm_with_tools, _raw_llm, _compactor
 
     # Reset loop detector for fresh session
-    thread_id = project.project_id or "__default__"
+    thread_id = project.id or "__default__"
     set_active_thread(thread_id)
     # Clear trackers for this specific thread
     _session_tool_trackers.pop(thread_id, None)

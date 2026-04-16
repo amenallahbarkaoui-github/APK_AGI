@@ -299,7 +299,12 @@ def _get_all_smali_dirs() -> list[Path]:
 def apktool_decompile() -> str:
     """Decompile the APK using apktool into smali code, resources, and AndroidManifest.
     This must be run before any smali patching or manifest analysis.
-    Returns the output directory path and list of smali directories found.
+
+    When to use: Run this as one of the FIRST steps in any analysis. Required before
+    any smali reading, patching, manifest analysis, or SmaliIndex building.
+
+    Returns: Text summary with the output directory path, list of smali directories found,
+    and any warnings from apktool.
     """
     from apk_agent.tools.apktool import decompile
 
@@ -316,7 +321,12 @@ def apktool_decompile() -> str:
 def jadx_decompile() -> str:
     """Decompile the APK using JADX into readable Java source code.
     This provides human-readable Java code for understanding app logic.
-    Returns the output directory path and discovered packages.
+
+    When to use: Run alongside apktool_decompile for readable Java. JADX output
+    is easier to read than smali; use it for understanding logic before patching.
+
+    Returns: Text summary with the output directory path, discovered Java packages,
+    and total files decompiled.
     """
     from apk_agent.tools.jadx import decompile
 
@@ -361,9 +371,22 @@ def dex2jar_convert() -> str:
 def apktool_build() -> str:
     """Rebuild the APK from the (possibly patched) apktool decompiled project.
     Run this after applying smali patches to produce a new unsigned APK.
-    Returns the path to the rebuilt APK on success.
+
+    When to use: After ALL patches are applied and you are ready to produce
+    the modified APK. Follow with zipalign_apk_tool then sign_apk.
+
+    Returns: Text summary with success/failure status and path to the rebuilt
+    unsigned APK (outputs/patched-unsigned.apk).
     """
+    import shutil as _shutil
     from apk_agent.tools.apktool import build
+
+    # Clear apktool's incremental-build cache so modified smali files
+    # are always recompiled into fresh .dex.  Without this, apktool may
+    # reuse stale .dex from a previous build and silently ignore patches.
+    build_cache = Path(_project.apktool_dir) / "build"
+    if build_cache.is_dir():
+        _shutil.rmtree(build_cache, ignore_errors=True)
 
     output_apk = Path(_project.workspace_path) / "outputs" / "patched-unsigned.apk"
     result = build(
@@ -371,6 +394,7 @@ def apktool_build() -> str:
         project_dir=_project.apktool_dir,
         output_apk=output_apk,
         log_file=_log_file(),
+        force_all=True,
     )
     return result.to_llm_str()
 
@@ -380,6 +404,12 @@ def zipalign_apk_tool() -> str:
     """Zip-align the rebuilt unsigned APK (required before signing with apksigner).
     Aligns uncompressed entries on 4-byte boundaries for better runtime performance.
     Run after apktool_build and before sign_apk.
+
+    When to use: ALWAYS run between apktool_build and sign_apk. Required for
+    apksigner; jarsigner can work without it but alignment improves runtime performance.
+
+    Returns: Text result with success/failure status and path to the aligned APK
+    (outputs/patched-aligned.apk).
     """
     from apk_agent.tools.zipalign import zipalign
 
@@ -398,7 +428,12 @@ def zipalign_apk_tool() -> str:
 def sign_apk() -> str:
     """Sign the rebuilt APK to produce a final installable patched-signed.apk.
     Run this after apktool_build (and optionally zipalign_apk_tool) succeeds.
-    Returns the path to the signed APK.
+
+    When to use: LAST step in the build pipeline (after apktool_build → zipalign_apk_tool).
+    Automatically uses the aligned APK if available, otherwise the unsigned APK.
+
+    Returns: Text summary with success/failure status and path to the signed APK
+    (outputs/patched-signed.apk).
     """
     from apk_agent.tools.signer import sign_apk as _sign
 
@@ -431,6 +466,12 @@ def aapt2_dump() -> str:
     """Dump APK metadata using aapt2: package name, version, SDK info,
     permissions, activities, services, receivers, and providers.
     Does NOT require decompilation — works directly on the APK.
+
+    When to use: Run this BEFORE decompilation for a quick overview of the APK
+    (package name, permissions, components). Faster than apktool_decompile.
+
+    Returns: Text summary with package name, version code/name, SDK versions,
+    permissions list, and declared components (activities, services, receivers, providers).
     """
     from apk_agent.tools.aapt2 import dump_badging
 
@@ -448,6 +489,13 @@ def extract_strings() -> str:
     Automatically classifies findings into URLs, emails, API keys, AWS keys,
     Firebase URLs, bearer tokens, private keys, and base64 blobs.
     Great for finding hardcoded secrets and endpoints.
+
+    When to use: Run early in recon to discover hardcoded secrets, API endpoints,
+    and suspicious strings without decompilation.
+
+    Returns: JSON with keys: total_strings, classified (object with url, email,
+    api_key, aws_key, firebase, bearer_token, private_key, base64 arrays),
+    raw_sample (first N unclassified strings).
     """
     from apk_agent.tools.strings_tool import extract_strings as _extract
 
@@ -486,9 +534,14 @@ def identify_app_packages() -> str:
     """Auto-detect the app's own packages vs third-party SDKs.
     Parses AndroidManifest.xml for the main package name and scans
     component declarations (Activities, Services) to find all app-owned packages.
-    Returns the target packages and a list of detected third-party SDKs.
 
-    Run this EARLY (after apktool_decompile) to focus all searches on app code only.
+    When to use: Run EARLY (right after apktool_decompile) to identify the app's
+    own packages and separate them from third-party SDKs. This focuses subsequent
+    searches on app code only.
+
+    Returns: JSON with keys: success, main_package, target_packages (list of app
+    package prefixes), app_component_packages, app_smali_packages,
+    third_party_detected (list of SDK packages), recommendation (text guidance).
     """
     from apk_agent.tools.manifest_parser import parse_manifest as _parse
     from apk_agent.tools.advanced_search import _is_third_party_path
@@ -636,9 +689,15 @@ def write_file(file_path: str, content: str) -> str:
     """Write or overwrite a file in the decompiled project.
     Use this for direct smali edits, adding new files, or modifying XML configs.
 
+    When to use: For small direct edits to specific files. For structured smali patches
+    with backup/diff tracking, use apply_smali_patch instead.
+
     Args:
         file_path: Absolute path or path relative to the project workspace.
         content: The full file content to write.
+
+    Returns: JSON with keys: success (bool), path (absolute path written),
+    bytes_written (int).
     """
     p = Path(file_path)
     if not p.is_absolute():
@@ -728,11 +787,18 @@ def list_files(
     """List files and directories in the decompiled project.
     Use this to understand the project structure.
 
+    When to use: To explore directory layout, find specific file types, or verify
+    that decompilation produced expected output. Use directory_overview for a
+    high-level summary instead.
+
     Args:
         directory: Directory to list. Defaults to the JADX sources directory.
         max_depth: How deep to recurse (default 2).
         file_extensions: Comma-separated extensions to filter (e.g., ".smali,.java").
             If omitted, all files are shown.
+
+    Returns: JSON with keys: root (base directory), total_files, total_dirs,
+    entries (array of {name, type: file|dir, size, children: [...]}).
     """
     from apk_agent.tools.file_ops import list_directory
 
@@ -757,6 +823,10 @@ def apply_smali_patch(patch_plan_json: str) -> str:
     """Apply a smali patch to modify the APK's behaviour.
     The patch plan is a JSON object specifying the target file and operations.
 
+    When to use: For precise, tracked smali modifications with backup and diff.
+    Use preview_smali_patch first to verify changes. For bulk automated bypasses,
+    use auto_patch_bypass instead.
+
     IMPORTANT: You MUST pass the full JSON plan as the patch_plan_json argument.
     Do NOT call this tool with empty arguments.
 
@@ -776,6 +846,10 @@ def apply_smali_patch(patch_plan_json: str) -> str:
                     }
                 ]
             }
+
+    Returns: JSON with keys: success (bool), target_file, steps_applied (int),
+    steps_total (int), diff_text (unified diff of changes), errors (list),
+    backup_path (path to original file backup).
     """
     from apk_agent.patch_engine import PatchEngine, PatchPlan
 
@@ -868,9 +942,15 @@ def generate_report(
 ) -> str:
     """Generate a Markdown security report summarizing findings and patches.
 
+    When to use: At the END of analysis, after all findings and patches are collected.
+    Pass the complete findings and patch results arrays.
+
     Args:
         findings_json: JSON array of findings, each with: title, severity, category, description, location, evidence.
         patch_results_json: JSON array of patch results (optional).
+
+    Returns: Text with the report file path and a preview of the first 3000 characters
+    of the generated Markdown report. Full report saved to outputs/report.md.
     """
     from apk_agent.reporting import generate_report as _gen
 
@@ -907,8 +987,15 @@ def scan_smali_classes(directory: Optional[str] = None) -> str:
     method counts, and interesting files that use security-related APIs.
     Use this for a quick overview of what the app does.
 
+    When to use: Early recon after decompilation — get class counts, crypto API usage,
+    and security-related files. Prefer index_lookup_* or graph tools for targeted queries.
+
     Args:
         directory: Smali directory to scan. Defaults to apktool smali output.
+
+    Returns: JSON with keys: total_classes, total_methods, crypto_apis (list of
+    classes using crypto), security_apis (list), interesting_files (list of paths
+    with security-related code).
     """
     from apk_agent.tools.smali_analyzer import scan_smali_directory
 
@@ -925,8 +1012,16 @@ def analyze_smali_class(file_path: str) -> str:
     """Deep-analyze a single smali file: parse class info, methods, fields,
     string constants, and crypto/security API findings.
 
+    When to use: After identifying a target file via search/index tools. Gives full
+    structural breakdown of a single class. For method-level analysis, use read_file
+    or batch_read_smali_methods.
+
     Args:
         file_path: Path to the .smali file (absolute or relative to workspace).
+
+    Returns: JSON with keys: class_name, super_class, interfaces, access_flags,
+    methods (array with name, access, params, return_type), fields (array),
+    strings (array of constant values), crypto_findings, security_api_usage.
     """
     from apk_agent.tools.smali_analyzer import parse_smali_class
 
@@ -965,10 +1060,16 @@ def find_method_xrefs(
     """Find all call sites of a specific method across smali files.
     Use this to trace who calls a security-critical method.
 
+    When to use: When you know a method name and need to find every caller.
+    For faster results on large codebases, prefer graph_callers (requires graph to be built).
+
     Args:
         method_signature: Full or partial method signature,
             e.g. "checkServerTrusted", "Landroid/util/Log;->d".
         directory: Smali directory. Defaults to apktool output.
+
+    Returns: JSON with keys: method, total_refs, files (array of {file, line, code}
+    for each call site found).
     """
     from apk_agent.tools.smali_analyzer import find_method_calls
 
@@ -1019,6 +1120,12 @@ def list_vuln_patterns() -> str:
     """List all available vulnerability detection patterns with their IDs,
     names, severity levels, and categories.
     Use this to understand what the scanner can detect.
+
+    When to use: Before running scan_vulnerabilities to understand available patterns,
+    or when the user asks what security checks are supported.
+
+    Returns: JSON array of patterns, each with: id, name, severity (critical/high/medium/low),
+    category, description, and regex pattern used for detection.
     """
     from apk_agent.tools.vuln_scanner import list_patterns
     patterns = list_patterns()
@@ -1041,6 +1148,10 @@ def context_search(
     """Search with surrounding context lines (like grep -C N).
     Shows N lines before and after each match for better understanding.
 
+    When to use: When you need to see code AROUND a match (method body, class structure).
+    For exact matches without context, use search_in_code. For multi-pattern filtering,
+    use multi_search.
+
     Args:
         pattern: Regex pattern to search for.
         directory: Directory to search in. Defaults to JADX sources.
@@ -1048,6 +1159,9 @@ def context_search(
         context_lines: Lines of context before/after match (default 3).
         file_extensions: Comma-separated extensions (e.g., ".java,.smali").
         exclude_dirs: Comma-separated directory names to SKIP (e.g., "build,test,res,original").
+
+    Returns: JSON with keys: pattern, total_matches, files_matched,
+    results (array of {file, matches: [{line, text, context_before, context_after}]}).
     """
     from apk_agent.tools.advanced_search import search_with_context
 
@@ -1079,12 +1193,19 @@ def multi_search(
     """Search for multiple patterns with AND/OR logic.
     AND = file must contain ALL patterns. OR = file must contain at least one.
 
+    When to use: When you need files matching multiple criteria (e.g. find files with
+    BOTH SSL pinning AND certificate validation). For single-pattern search, use
+    search_in_code or context_search.
+
     Args:
         patterns: Comma-separated regex patterns.
             Example: "CertificatePinner,checkServerTrusted,X509"
         logic: "AND" or "OR" (default AND).
         directory: Directory to search. Defaults to JADX sources.
         exclude_dirs: Comma-separated directory names to SKIP (e.g., "build,test,res").
+
+    Returns: JSON with keys: patterns, logic, total_matches, files_matched,
+    results (array of {file, matched_patterns: [pattern1, pattern2, ...]}).
     """
     from apk_agent.tools.advanced_search import multi_pattern_search
 
@@ -1174,6 +1295,10 @@ def search_interceptors(directory: Optional[str] = None) -> str:
     Args:
         directory: Directory to search. Defaults to JADX sources.
             Use "smali" or "apktool" for smali code.
+
+    Returns: JSON with keys: total_interceptors, interceptor_files (array of
+    {file, class_name, type}), crypto_in_network (array of files with both
+    crypto and network imports), request_body_handlers (array).
     """
     from apk_agent.tools.targeted_analysis import search_network_interceptors
 
@@ -1193,8 +1318,15 @@ def search_native_code(directory: Optional[str] = None) -> str:
 
     These indicate crypto or parsing logic hidden in compiled native code.
 
+    When to use: When you suspect crypto/security logic is in native .so libraries
+    rather than Java/Kotlin code. Also useful to detect React Native or Flutter apps.
+
     Args:
         directory: Directory to search. Defaults to apktool output (has lib/).
+
+    Returns: JSON with keys: native_methods (array of {class, method, signature}),
+    load_library_calls (array of {file, library_name}), so_libraries (array of
+    {path, arch, size}), framework_bridges (array of detected RN/Flutter modules).
     """
     from apk_agent.tools.targeted_analysis import search_native_bridges
 
@@ -1214,8 +1346,15 @@ def search_dynamic_loaders(directory: Optional[str] = None) -> str:
 
     Crypto logic may be loaded at runtime and hidden from static analysis.
 
+    When to use: When statically visible code doesn't explain observed behavior,
+    or when you need to find hidden/dynamically loaded modules.
+
     Args:
         directory: Directory to search. Defaults to apktool output.
+
+    Returns: JSON with keys: class_loaders (array of {file, type, pattern}),
+    reflection_calls (array of {file, method}), hidden_dex (array of {path, size}
+    for .dex/.jar files in assets/), total_findings.
     """
     from apk_agent.tools.targeted_analysis import search_dynamic_loading
 
@@ -1281,6 +1420,9 @@ def analyze_certificate() -> str:
     """Analyze the APK's signing certificate — fingerprints, debug detection,
     signature scheme, and digest algorithm. Works directly on the APK file.
 
+    When to use: During recon to check if APK is debug-signed, identify the signer,
+    and detect weak signature schemes.
+
     Returns: JSON with keys: success, signing_files (list), signature_scheme,
     cert_hashes (SHA-1/SHA-256 fingerprints), is_debug_signed (bool),
     digest_algorithm, manifest_entries, findings (security issues with the certificate).
@@ -1301,6 +1443,9 @@ def analyze_certificate() -> str:
 def score_permissions() -> str:
     """Score all APK permissions by risk level (CRITICAL/HIGH/MEDIUM/LOW).
     Uses aapt2 to extract permissions then applies risk scoring.
+
+    When to use: Early in analysis to identify dangerous permissions and assess
+    overall risk level. Run after aapt2_dump or parse_manifest.
 
     Returns: JSON with keys: success, total_permissions, overall_risk (score string),
     risk_counts (dict of CRITICAL/HIGH/MEDIUM/LOW→count), permissions
@@ -1337,6 +1482,9 @@ def analyze_attack_surface() -> str:
     Lists exported components with risk scores, deep links, custom permissions,
     and intent filter mappings. Requires apktool_decompile first.
 
+    When to use: After decompilation to assess external entry points (exported
+    activities, services, receivers, providers, deep links).
+
     Returns: JSON with keys: success, manifest_file, exported_components
     (array of {name, type, intent_filters}), deep_links (array of URI patterns),
     custom_permissions (list), findings (security issues), attack_surface_score
@@ -1362,6 +1510,9 @@ def save_evidence(category: str, title: str, detail: str = "", severity: str = "
     crypto issues, hardcoded secrets, interesting method names — as evidence.
     This ensures nothing is lost even if context is compacted.
 
+    When to use: EVERY TIME you discover something important. Save findings as you go
+    so they survive context compaction and session restarts.
+
     Args:
         category: vuln|crypto|network|permission|component|string|pattern|patch|file|config|behavior|misc
         title: short title for the finding
@@ -1369,6 +1520,9 @@ def save_evidence(category: str, title: str, detail: str = "", severity: str = "
         severity: critical|high|medium|low|info
         file_path: relevant file path (if any)
         tags: comma-separated tags (e.g. "ssl,pinning,bypass")
+
+    Returns: JSON with keys: success (bool), id (evidence entry ID),
+    total_evidence (total count after saving).
     """
     from apk_agent.tools.evidence import save_evidence as _save
 
@@ -1387,6 +1541,12 @@ def load_evidence(category: str = "", severity: str = "") -> str:
     """Load all saved evidence from the forensic notebook.
     Use this to review what you've found so far, especially after session resume
     or context compaction. Filter by category or severity.
+
+    When to use: After session resume to recall previous findings, or periodically
+    to review accumulated evidence before writing a report.
+
+    Returns: JSON with keys: total (int), evidence (array of {id, category, title,
+    detail, severity, file_path, tags, timestamp}).
     """
     from apk_agent.tools.evidence import load_evidence as _load
 
@@ -1398,7 +1558,17 @@ def load_evidence(category: str = "", severity: str = "") -> str:
 
 @tool
 def search_evidence(query: str) -> str:
-    """Search within saved evidence by keyword. Use to find specific findings."""
+    """Search within saved evidence by keyword.
+
+    When to use: When you need to find specific evidence entries matching a term
+    (e.g. "ssl", "root detection"). Faster than load_evidence + manual filtering.
+
+    Args:
+        query: Keyword to search for in evidence titles, details, and tags.
+
+    Returns: JSON with keys: query, total_matches, results (array of matching
+    evidence entries with id, category, title, detail, severity).
+    """
     from apk_agent.tools.evidence import search_evidence as _search
 
     def _run():
@@ -1409,7 +1579,15 @@ def search_evidence(query: str) -> str:
 
 @tool
 def get_evidence_summary() -> str:
-    """Get a compact summary of all evidence — counts by category/severity and critical findings."""
+    """Get a compact summary of all evidence — counts by category/severity and critical findings.
+
+    When to use: Quick overview of evidence collection progress. Useful before
+    generating the final report to ensure all categories are covered.
+
+    Returns: JSON with keys: total_evidence, by_category (dict of category→count),
+    by_severity (dict of severity→count), critical_findings (array of the most
+    important entries).
+    """
     from apk_agent.tools.evidence import get_evidence_summary as _summary
 
     def _run():
@@ -1736,6 +1914,12 @@ def build_graph_and_index() -> str:
     Creates:
     - Call graph (NetworkX): class→method→calls relationships for instant tracing
     - Code index (JSON): class/method/string lookup for instant search
+
+    When to use: Run once after apktool_decompile. Enables all graph_* and index_*
+    tools. Re-run only if you decompile a different APK.
+
+    Returns: JSON with keys: success, graph ({nodes, edges, components}),
+    index ({classes, methods, strings, packages}).
     """
     global _code_graph, _code_index
     from apk_agent.tools.code_graph import build_code_graph, save_graph, get_graph_stats
@@ -1775,10 +1959,16 @@ def graph_callers(method_name: str, depth: int = 3) -> str:
     """Find all callers of a method — INSTANT, no file scanning.
     Uses the pre-built code graph. Much faster than trace_call_chain.
 
+    When to use: Primary tool for reverse call tracing. Use this instead of
+    trace_call_chain when the code graph is built.
+
     Args:
         method_name: Method name to trace (e.g., "checkServerTrusted", "isRooted").
             Partial match supported.
         depth: How many levels up to trace (default 3).
+
+    Returns: JSON with keys: success, method, total_callers, callers
+    (nested array of {method, class, file, depth, callers (recursive)}).
     """
     from apk_agent.tools.code_graph import query_callers
 
@@ -1796,9 +1986,15 @@ def graph_callees(method_name: str, depth: int = 2) -> str:
     """Find all methods CALLED BY the given method — follow the forward call chain.
     Uses the pre-built code graph. Instant results.
 
+    When to use: To understand what a method does by seeing what it calls.
+    Complement to graph_callers (reverse direction).
+
     Args:
         method_name: Method name to trace (e.g., "processPayment", "onCreate").
         depth: How many levels deep to trace (default 2).
+
+    Returns: JSON with keys: success, method, total_callees, callees
+    (nested array of {method, class, file, depth, callees (recursive)}).
     """
     from apk_agent.tools.code_graph import query_callees
 
@@ -1815,6 +2011,9 @@ def graph_callees(method_name: str, depth: int = 2) -> str:
 def graph_class_info(class_name: str) -> str:
     """Get full info about a class from the code graph — methods, inheritance,
     who calls it, fields. Partial match supported.
+
+    When to use: When you need a complete overview of a specific class — its
+    methods, inheritance, fields, and who interacts with it.
 
     Args:
         class_name: Class name (e.g., "SslPinningHelper", "PaymentManager").
@@ -1839,9 +2038,15 @@ def graph_find_path(source_method: str, target_method: str) -> str:
     """Find the shortest call path between two methods.
     Useful for understanding data flow: how does method A reach method B?
 
+    When to use: When you need to understand how data flows from one method
+    to another, or trace the execution path between two points.
+
     Args:
         source_method: Starting method name.
         target_method: Ending method name.
+
+    Returns: JSON with keys: success, source, target, path_found (bool),
+    path (array of method names from source to target), path_length (int).
     """
     from apk_agent.tools.code_graph import query_path
 
@@ -1859,6 +2064,12 @@ def graph_security_scan() -> str:
     """Scan the code graph for security-related methods: SSL pinning, root detection,
     crypto, anti-debug, anti-tamper, dynamic loading. Returns categorized results
     with caller counts so you know which methods are most important.
+
+    When to use: After building the code graph, use this for a quick security-focused
+    overview. Identifies high-value targets sorted by caller count.
+
+    Returns: JSON with keys: success, total_security_methods, categories
+    (dict of category→array of {method, class, file, caller_count, callers}).
     """
     from apk_agent.tools.code_graph import find_security_methods
 
@@ -1875,6 +2086,12 @@ def graph_security_scan() -> str:
 def graph_stats() -> str:
     """Get code graph statistics — total classes, methods, edges, hotspots.
     Shows the most-called methods (hotspots) which are often security-critical.
+
+    When to use: Quick check on graph size and health after building it.
+    Hotspots reveal the most-referenced methods worth investigating.
+
+    Returns: JSON with keys: success, total_classes, total_methods, total_edges,
+    connected_components, hotspots (array of {method, class, caller_count}).
     """
     from apk_agent.tools.code_graph import get_graph_stats
 
@@ -1897,8 +2114,14 @@ def index_lookup_class(query: str) -> str:
     """Look up classes by name from the persistent index — instant results.
     Partial match: "Payment" finds PaymentManager, PaymentHelper, etc.
 
+    When to use: When you know a class name (or fragment) and need its full path
+    and package. Faster than grep-based search.
+
     Args:
         query: Class name or partial match (e.g., "Payment", "Crypto", "SSL").
+
+    Returns: JSON with keys: success, query, total_matches, matches
+    (array of {class_name, package, file_path, methods (list)}).
     """
     from apk_agent.tools.index_cache import lookup_class
 
@@ -1916,8 +2139,14 @@ def index_lookup_method(method_name: str) -> str:
     """Find all classes containing a specific method — instant.
     Use this before read_file to know exactly WHERE a method lives.
 
+    When to use: When you know a method name but not which class contains it.
+    Results tell you the file path so you can read_file directly.
+
     Args:
         method_name: Method name (e.g., "checkServerTrusted", "encrypt", "isRooted").
+
+    Returns: JSON with keys: success, method, total_matches, matches
+    (array of {class_name, file_path, method_signature}).
     """
     from apk_agent.tools.index_cache import lookup_method
 
@@ -1932,11 +2161,25 @@ def index_lookup_method(method_name: str) -> str:
 
 @tool
 def index_lookup_string(query: str) -> str:
-    """Find which classes use a specific string constant.
-    Great for finding API endpoints, keys, URLs, error messages.
+    """Unified index search — finds string constants, method references, AND class names.
+    Automatically detects query type: smali references (Lm0$e;->g), method names,
+    class names, string constants (API keys, URLs, error messages).
+    Instant results from pre-built index.
+
+    When to use: First choice for ANY index lookup. Handles all query types —
+    no need to pick between class/method/string lookup. Use this when you want
+    to find where something is referenced, what class contains a method, or
+    which classes use a specific string.
 
     Args:
-        query: String to search for (e.g., "api_key", "https://", "/login").
+        query: Any search term — smali ref (e.g. "Lm0$e;->e"), method name
+               (e.g. "checkLicense"), class (e.g. "m0$e"), or string constant
+               (e.g. "api_key", "https://").
+
+    Returns:
+        JSON with string_results (const-string matches), method_results
+        (method reference matches), class_results (class name matches).
+        If nothing found, includes a hint for alternative search tools.
     """
     from apk_agent.tools.index_cache import lookup_string
 
@@ -1953,8 +2196,14 @@ def index_lookup_string(query: str) -> str:
 def index_lookup_package(package_name: str) -> str:
     """List all classes in a Java package — instant.
 
+    When to use: When you want to enumerate all classes in a specific package
+    to understand its structure or find relevant targets.
+
     Args:
         package_name: Package name (e.g., "com.example.crypto", "payment").
+
+    Returns: JSON with keys: success, package, total_classes, classes
+    (array of {class_name, file_path, method_count}).
     """
     from apk_agent.tools.index_cache import lookup_package
 
@@ -1984,6 +2233,10 @@ def auto_patch_bypass(
     This is a ONE-SHOT tool — it scans all smali dirs and applies all matching
     patterns in a single call. Much faster than manual patch plans.
 
+    When to use: Primary patching tool for bulk automated bypasses. Use this
+    instead of manual apply_smali_patch when standard bypass patterns apply.
+    Run list_bypass_categories first to see available categories.
+
     Args:
         categories: Comma-separated bypass categories to apply. If omitted, ALL are applied.
             Options: ssl_bypass, vpn_bypass, mock_location, license_bypass, pairip_bypass,
@@ -1992,6 +2245,10 @@ def auto_patch_bypass(
             Example: "ssl_bypass,vpn_bypass,license_bypass"
         custom_device_id: Custom Android device ID for spoofing (16 hex chars).
             Only used when device_spoof category is included.
+
+    Returns: JSON with keys: success, total_files_scanned, total_patches_applied,
+    categories_applied (list), per_category_stats (dict of category→{files_patched, patches}),
+    patched_files (list of modified file paths), errors (list).
     """
     from apk_agent.tools.apk_patcher import PatchCategory, run_smali_patches
 
@@ -2030,6 +2287,12 @@ def patch_flutter_ssl() -> str:
 
     Supports arm64-v8a, armeabi-v7a, and x86_64 architectures.
     Only needed for Flutter apps — check lib/ for libflutter.so first.
+
+    When to use: Only for Flutter apps. Check for lib/*/libflutter.so in the
+    decompiled APK. For non-Flutter apps, use auto_patch_bypass with ssl_bypass.
+
+    Returns: JSON with keys: success, architectures_patched (list), patches_applied (int),
+    details (array of {arch, offset, status}).
     """
     from apk_agent.tools.apk_patcher import patch_flutter_ssl as _patch
 
@@ -2053,9 +2316,15 @@ def inject_network_security_config(cert_paths: Optional[str] = None) -> str:
 
     Also copies custom CA certificate files to res/raw/ if provided.
 
+    When to use: Run BEFORE patch_manifest_security to enable traffic interception.
+    Required for Burp/mitmproxy to intercept HTTPS traffic on Android 7+.
+
     Args:
         cert_paths: Optional comma-separated paths to custom CA certificate files (.pem/.crt).
             Example: "/path/to/burp_ca.pem,/path/to/mitmproxy.pem"
+
+    Returns: JSON with keys: success, config_path (path to created XML),
+    certs_copied (list of cert files added to res/raw/), changes_made (list).
     """
     from apk_agent.tools.apk_patcher import inject_nsc
 
@@ -2084,7 +2353,11 @@ def patch_manifest_security() -> str:
     - Add requestLegacyExternalStorage=true
     - Update apktool.yml targetSdkVersion
 
-    Run this AFTER inject_network_security_config for full effect.
+    When to use: Run AFTER inject_network_security_config. Completes the manifest
+    preparation for traffic interception and removes Play Store protections.
+
+    Returns: JSON with keys: success, changes_made (list of modifications applied),
+    warnings (list), manifest_path.
     """
     from apk_agent.tools.apk_patcher import patch_manifest
 
@@ -2104,6 +2377,12 @@ def remove_ads() -> str:
     loadAd methods → return-void, ad unit IDs → zeroed.
 
     Also applies license bypass patterns (allowAccess, connectToLicensingService).
+
+    When to use: When the user wants ads removed. This is a specialized subset of
+    auto_patch_bypass focused on ADS_REMOVAL + LICENSE_BYPASS categories.
+
+    Returns: JSON with keys: success, total_files_scanned, total_patches_applied,
+    categories_applied, per_category_stats, patched_files (list), errors (list).
     """
     from apk_agent.tools.apk_patcher import PatchCategory, run_smali_patches
 
@@ -2126,7 +2405,11 @@ def remove_ads() -> str:
 def list_bypass_categories() -> str:
     """List all available automated bypass categories with pattern counts.
     Shows what auto_patch_bypass can do and how many patterns exist per category.
-    Use this to decide which categories to apply.
+
+    When to use: Before calling auto_patch_bypass, to see available categories
+    and pattern counts so you can choose which to apply.
+
+    Returns: JSON with keys: categories (array of {name, description, pattern_count}).
     """
     from apk_agent.tools.apk_patcher import list_patch_categories
 
@@ -2150,6 +2433,13 @@ def build_smali_index() -> str:
     Enables instant API caller lookup, string constant search, class hierarchy
     queries, and method-category classification.
     Must have run apktool_decompile first. Build this BEFORE unified_scan or taint analysis.
+
+    When to use: Run once after apktool_decompile. Required for unified_scan,
+    analyze_data_flow, run_taint_analysis, find_hardcoded_crypto, and generate_bypass_plans.
+
+    Returns: JSON with keys: success, total_classes, total_methods,
+    total_instructions, total_strings, total_api_targets,
+    method_categories (dict of category→count), built_at (timestamp).
     """
     global _smali_index
     from apk_agent.tools.smali_ir import build_index as build_smali_idx, save_index as save_smali_idx, index_stats
