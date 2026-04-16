@@ -76,6 +76,31 @@ def _log_file() -> Path:
     return Path("tools.log")
 
 
+# ---------------------------------------------------------------------------
+# Global tool output cap — prevents context bloat from any single tool
+# ---------------------------------------------------------------------------
+_TOOL_OUTPUT_CAP = 10_000  # max chars per tool result (head + tail)
+_CAP_HEAD = 7_000
+_CAP_TAIL = 2_500
+
+
+def _cap_tool_output(result: str) -> str:
+    """Truncate a tool result that exceeds the global cap.
+
+    Keeps the head (usually JSON keys + first findings) and tail
+    (usually closing braces + summary fields) so structured output
+    remains parsable.
+    """
+    if not isinstance(result, str) or len(result) <= _TOOL_OUTPUT_CAP:
+        return result
+    skipped = len(result) - _CAP_HEAD - _CAP_TAIL
+    return (
+        result[:_CAP_HEAD]
+        + f"\n\n... [{skipped} chars truncated — use more specific queries to narrow results] ...\n\n"
+        + result[-_CAP_TAIL:]
+    )
+
+
 def _safe_call(func, tool_name: str, *args, **kwargs) -> str:
     """Wrap any tool function with progress tracking, caching, and error recovery."""
     # Check cache for expensive idempotent tools
@@ -93,6 +118,9 @@ def _safe_call(func, tool_name: str, *args, **kwargs) -> str:
     progress_manager.start_task(task_id, tool_name)
     try:
         result = func(*args, **kwargs)
+        # Global output cap — prevent any single tool from bloating context.
+        # Individual tool limits ([:N]) still apply first; this is a safety net.
+        result = _cap_tool_output(result)
         progress_manager.complete_task(task_id, success=True)
         # Store in cache
         if cache_key is not None:

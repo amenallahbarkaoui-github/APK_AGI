@@ -19,6 +19,24 @@ def _ensure_writable(path: Path) -> None:
         path.chmod(path.stat().st_mode | stat.S_IWRITE)
 
 
+def _unescape_smali(pattern: str) -> str:
+    """Strip regex-escape backslashes from a pattern that should be literal.
+
+    LLMs often pre-escape smali metacharacters (parentheses in method
+    signatures, $ in inner-class names, dots in directives) even when the
+    pattern is supposed to be a plain-text literal.
+    """
+    return (
+        pattern
+        .replace("\\(", "(")
+        .replace("\\)", ")")
+        .replace("\\$", "$")
+        .replace("\\.", ".")
+        .replace("\\;", ";")
+        .replace("\\[", "[")
+    )
+
+
 def _write_with_retry(path: Path, content: str, retries: int = 3, delay: float = 0.3) -> None:
     """Write text to a file with retry on Windows file lock errors (WinError 32)."""
     import time
@@ -343,15 +361,79 @@ class PatchEngine:
             return None
         else:
             idx = text.find(pattern)
-            if idx == -1:
-                return None
-            return _FakeMatch(idx, idx + len(pattern), pattern)
+            if idx != -1:
+                return _FakeMatch(idx, idx + len(pattern), pattern)
+
+            # Fallback: the LLM often pre-escapes smali metacharacters
+            # (e.g. \( instead of (, \$ instead of $, \. instead of .)
+            # even when is_regex=False.  Un-escape and retry.
+            unescaped = _unescape_smali(pattern)
+            if unescaped != pattern:
+                idx = text.find(unescaped)
+                if idx != -1:
+                    return _FakeMatch(idx, idx + len(unescaped), unescaped)
+
+            # Second fallback: normalise line endings (\r\n → \n) and try
+            # both original and unescaped patterns.
+            text_lf = text.replace("\r\n", "\n")
+            for candidate in (pattern, unescaped) if unescaped != pattern else (pattern,):
+                cand_lf = candidate.replace("\r\n", "\n")
+                idx = text_lf.find(cand_lf)
+                if idx != -1:
+                    # Map position back to original text
+                    # Count how many \r\n pairs precede 'idx' in the original
+                    preceding = text_lf[:idx]
+                    real_idx = idx + preceding.count("")  # approx; use direct search
+                    # Direct search in original text for the matched region
+                    real_match = text_lf[idx:idx + len(cand_lf)]
+                    real_idx2 = text.find(real_match)
+                    if real_idx2 != -1:
+                        return _FakeMatch(real_idx2, real_idx2 + len(real_match), real_match)
+                    # If exact repositioning failed, still return the LF-based match
+                    return _FakeMatch(idx, idx + len(cand_lf), cand_lf)
+
+            # Third fallback: collapse all whitespace and try matching.
+            # This handles extra spaces, tabs, and other minor differences.
+            norm_pattern = " ".join(pattern.split())
+            norm_unesc = " ".join(unescaped.split()) if unescaped != pattern else norm_pattern
+            norm_text = " ".join(text.split())
+            for norm_p, orig_p in ((norm_pattern, pattern), (norm_unesc, unescaped)):
+                idx = norm_text.find(norm_p)
+                if idx != -1:
+                    # Try to find a reasonable match region in the original text.
+                    # Use the first few non-whitespace words as anchors.
+                    words = orig_p.split()
+                    if words:
+                        # Find the first word in original text
+                        anchor = words[0]
+                        search_start = 0
+                        for _ in range(text.count(anchor)):
+                            pos = text.find(anchor, search_start)
+                            if pos == -1:
+                                break
+                            # Check if enough of the pattern follows from here
+                            end_guess = pos + len(orig_p) + 100  # generous
+                            chunk = " ".join(text[pos:end_guess].split())
+                            if norm_p in chunk:
+                                # Find exact end by scanning forward
+                                end = pos + len(orig_p)
+                                while end < len(text) and " ".join(text[pos:end].split()) != norm_p:
+                                    end += 1
+                                    if end - pos > len(orig_p) * 3:
+                                        break
+                                return _FakeMatch(pos, min(end, len(text)), text[pos:min(end, len(text))])
+                            search_start = pos + 1
+                    break
+
+            return None
 
     def _op_replace_line(self, text: str, step: PatchStep) -> Optional[str]:
         """Replace lines containing the match pattern."""
         lines = text.splitlines(keepends=True)
         found = False
         result_lines = []
+        pat = step.match_pattern
+        pat_unesc = _unescape_smali(pat)
         for line in lines:
             if step.is_regex:
                 if re.search(step.match_pattern, line):
@@ -360,7 +442,7 @@ class PatchEngine:
                 else:
                     result_lines.append(line)
             else:
-                if step.match_pattern in line:
+                if pat in line or (pat_unesc != pat and pat_unesc in line):
                     result_lines.append(step.replacement + "\n")
                     found = True
                 else:
@@ -396,13 +478,15 @@ class PatchEngine:
         lines = text.splitlines(keepends=True)
         found = False
         result_lines = []
+        pat = step.match_pattern
+        pat_unesc = _unescape_smali(pat)
         for line in lines:
             if step.is_regex:
                 if re.search(step.match_pattern, line):
                     found = True
                     continue
             else:
-                if step.match_pattern in line:
+                if pat in line or (pat_unesc != pat and pat_unesc in line):
                     found = True
                     continue
             result_lines.append(line)

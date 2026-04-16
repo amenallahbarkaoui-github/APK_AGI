@@ -163,9 +163,9 @@ Produce a structured summary following the format described in your instructions
 # ---------------------------------------------------------------------------
 
 # Configurable thresholds (GLM-5.1 context window: 204,800 tokens, max output: 131,072)
-DEFAULT_TOKEN_THRESHOLD = 160_000  # Start compacting — leaves ~45k headroom for response + state injection
-KEEP_RECENT_MESSAGES = 40  # Keep the last N messages for immediate context
-MIN_MESSAGES_TO_COMPACT = 50  # Don't compact if fewer messages than this
+DEFAULT_TOKEN_THRESHOLD = 100_000  # Start compacting — leaves ~105k headroom for response + tools
+KEEP_RECENT_MESSAGES = 20  # Keep the last N messages for immediate context
+MIN_MESSAGES_TO_COMPACT = 30  # Don't compact if fewer messages than this
 
 
 class Compactor:
@@ -180,10 +180,21 @@ class Compactor:
         self.keep_recent = keep_recent
         self.compact_count = 0
         self.last_token_count = 0
+        self._last_compact_msg_count = 0  # message count at last compaction
 
     def should_compact(self, messages: list[BaseMessage]) -> bool:
-        """Check if the conversation needs compaction."""
+        """Check if the conversation needs compaction.
+
+        Includes a cooldown: won't re-compact until at least 10 new messages
+        have been added since the last compaction.  This prevents the expensive
+        compaction LLM call from firing on every turn when the context stays
+        near the threshold.
+        """
         if len(messages) < MIN_MESSAGES_TO_COMPACT:
+            return False
+
+        # Cooldown — require 10+ new messages since last compaction
+        if self._last_compact_msg_count and len(messages) - self._last_compact_msg_count < 10:
             return False
 
         self.last_token_count = count_message_tokens(messages)
@@ -210,6 +221,9 @@ class Compactor:
             self.last_token_count or count_message_tokens(messages),
         )
 
+        # Record message count for cooldown tracking
+        self._last_compact_msg_count = len(messages)
+
         # Separate system prompt from conversation
         system_msg = None
         conversation = []
@@ -226,6 +240,23 @@ class Compactor:
         # Split: old messages to summarize, recent to keep
         old_messages = conversation[: -self.keep_recent]
         recent_messages = conversation[-self.keep_recent :]
+
+        # If the old messages are huge, skip the LLM summarization entirely
+        # (the LLM call itself would hang trying to process 100K+ tokens).
+        # Use the fast fallback trim instead, which extracts structured state
+        # from agent_state without any LLM call.
+        old_tokens = count_message_tokens(old_messages)
+        if old_tokens > 80_000:
+            logger.info(
+                "Old messages too large for LLM summary (%d tokens). "
+                "Using fast fallback trim.",
+                old_tokens,
+            )
+            self.compact_count += 1
+            return _sanitize_compacted(
+                _fallback_trim(messages, system_msg, recent_messages, old_messages,
+                               agent_state=agent_state)
+            )
 
         # Build summary prompt
         compact_prompt = build_compact_prompt(old_messages)

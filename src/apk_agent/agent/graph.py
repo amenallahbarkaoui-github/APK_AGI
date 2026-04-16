@@ -265,10 +265,10 @@ def agent_node(state: AgentState) -> dict:
 
     # Truncate large tool results in OLD messages only (preserve recent ones)
     # Keep head + tail so we don't lose summary headers or final findings
-    _MAX_CHARS = 4000
-    _HEAD = 2500
-    _TAIL = 1200
-    _RECENT = 6  # never truncate the last N messages
+    _MAX_CHARS = 2500
+    _HEAD = 1500
+    _TAIL = 800
+    _RECENT = 6  # never truncate the last N messages (covers current tool batch)
     cutoff = len(messages) - _RECENT
     for i, msg in enumerate(messages):
         if i >= cutoff:
@@ -708,10 +708,23 @@ def tools_postprocess(state: AgentState) -> dict:
     """Extract findings and patch results from tool messages into durable state.
 
     This ensures critical analysis data survives context compaction.
+    Also maintains the **patch_registry** — a durable journal of every patch
+    attempt with tool, target, pattern, status, and user feedback.
     """
     updates: dict = {}
     new_findings: list[dict] = []
     new_patches: list[dict] = []
+    new_registry_entries: list[dict] = []
+
+    import time as _time
+    _ts = _time.strftime("%Y-%m-%d %H:%M:%S")
+
+    # Patch tool names that produce registry entries
+    _PATCH_TOOLS = {
+        "apply_smali_patch", "auto_patch_bypass", "patch_flutter_ssl",
+        "inject_network_security_config", "patch_manifest_security",
+        "remove_ads",
+    }
 
     # Only look at the most recent tool messages (from last tool call batch)
     for msg in reversed(state["messages"]):
@@ -751,19 +764,120 @@ def tools_postprocess(state: AgentState) -> dict:
             except (json.JSONDecodeError, KeyError):
                 pass
 
-        # Extract patch results
-        if tool_name == "apply_smali_patch":
+        # ── Patch registry: record every patch attempt ──────────────
+        if tool_name in _PATCH_TOOLS:
             try:
                 data = json.loads(content)
-                if isinstance(data, dict):
-                    new_patches.append({
-                        "success": data.get("success", False),
-                        "target_file": data.get("target_file", ""),
-                        "steps_applied": data.get("steps_applied", 0),
-                        "errors": data.get("errors", []),
-                    })
+                if not isinstance(data, dict):
+                    continue
             except (json.JSONDecodeError, KeyError):
-                pass
+                continue
+
+            if tool_name == "apply_smali_patch":
+                # Legacy patch_results extraction (keep for backwards compat)
+                new_patches.append({
+                    "success": data.get("success", False),
+                    "target_file": data.get("target_file", ""),
+                    "steps_applied": data.get("steps_applied", 0),
+                    "errors": data.get("errors", []),
+                })
+                # Rich registry entry
+                new_registry_entries.append({
+                    "id": len(state.get("patch_registry") or []) + len(new_registry_entries) + 1,
+                    "tool": tool_name,
+                    "target": data.get("target_file", ""),
+                    "pattern": data.get("diff_text", "")[:300] or "(no diff)",
+                    "steps_applied": data.get("steps_applied", 0),
+                    "steps_total": data.get("steps_total", 0),
+                    "tool_success": data.get("success", False),
+                    "status": "applied" if data.get("success") else "failed",
+                    "errors": data.get("errors", [])[:3],
+                    "user_feedback": "",
+                    "timestamp": _ts,
+                })
+
+            elif tool_name == "auto_patch_bypass":
+                # auto_patch_bypass returns per-category stats
+                categories = data.get("categories_applied") or []
+                total_applied = data.get("total_patches_applied", 0)
+                patched_files = data.get("patched_files") or []
+                per_cat = data.get("per_category_stats") or {}
+                success = data.get("success", False) and total_applied > 0
+                new_registry_entries.append({
+                    "id": len(state.get("patch_registry") or []) + len(new_registry_entries) + 1,
+                    "tool": tool_name,
+                    "target": f"{len(patched_files)} files",
+                    "pattern": f"categories={','.join(str(c) for c in categories[:6])}; {total_applied} patches",
+                    "steps_applied": total_applied,
+                    "steps_total": total_applied,
+                    "tool_success": success,
+                    "status": "applied" if success else "failed",
+                    "errors": data.get("errors", [])[:3],
+                    "user_feedback": "",
+                    "timestamp": _ts,
+                })
+
+            elif tool_name == "patch_flutter_ssl":
+                new_registry_entries.append({
+                    "id": len(state.get("patch_registry") or []) + len(new_registry_entries) + 1,
+                    "tool": tool_name,
+                    "target": "libflutter.so",
+                    "pattern": "binary ssl_verify_peer_cert patch",
+                    "steps_applied": data.get("patches_applied", 0),
+                    "steps_total": data.get("patches_applied", 0),
+                    "tool_success": data.get("success", False),
+                    "status": "applied" if data.get("success") else "failed",
+                    "errors": data.get("errors", [])[:3] if data.get("errors") else [],
+                    "user_feedback": "",
+                    "timestamp": _ts,
+                })
+
+            elif tool_name == "inject_network_security_config":
+                new_registry_entries.append({
+                    "id": len(state.get("patch_registry") or []) + len(new_registry_entries) + 1,
+                    "tool": tool_name,
+                    "target": "res/xml/network_security_config.xml",
+                    "pattern": "inject permissive NSC (trust all certs)",
+                    "steps_applied": len(data.get("changes_made") or []),
+                    "steps_total": len(data.get("changes_made") or []),
+                    "tool_success": data.get("success", False),
+                    "status": "applied" if data.get("success") else "failed",
+                    "errors": [],
+                    "user_feedback": "",
+                    "timestamp": _ts,
+                })
+
+            elif tool_name == "patch_manifest_security":
+                changes = data.get("changes_made") or []
+                new_registry_entries.append({
+                    "id": len(state.get("patch_registry") or []) + len(new_registry_entries) + 1,
+                    "tool": tool_name,
+                    "target": "AndroidManifest.xml",
+                    "pattern": f"{len(changes)} manifest changes",
+                    "steps_applied": len(changes),
+                    "steps_total": len(changes),
+                    "tool_success": data.get("success", False),
+                    "status": "applied" if data.get("success") else "failed",
+                    "errors": data.get("warnings", [])[:3],
+                    "user_feedback": "",
+                    "timestamp": _ts,
+                })
+
+            elif tool_name == "remove_ads":
+                total_applied = data.get("total_patches_applied", 0)
+                new_registry_entries.append({
+                    "id": len(state.get("patch_registry") or []) + len(new_registry_entries) + 1,
+                    "tool": tool_name,
+                    "target": f"{len(data.get('patched_files') or [])} files",
+                    "pattern": f"ads_removal+license_bypass; {total_applied} patches",
+                    "steps_applied": total_applied,
+                    "steps_total": total_applied,
+                    "tool_success": data.get("success", False) and total_applied > 0,
+                    "status": "applied" if (data.get("success", False) and total_applied > 0) else "failed",
+                    "errors": data.get("errors", [])[:3],
+                    "user_feedback": "",
+                    "timestamp": _ts,
+                })
 
         # Auto-build code graph + index after decompilation completes
         if tool_name == "apktool_decompile":
@@ -801,6 +915,10 @@ def tools_postprocess(state: AgentState) -> dict:
         existing = list(state.get("patch_results") or [])
         existing.extend(new_patches)
         updates["patch_results"] = existing
+    if new_registry_entries:
+        existing = list(state.get("patch_registry") or [])
+        existing.extend(new_registry_entries)
+        updates["patch_registry"] = existing
 
     # Sync working memory from module-level storage into durable state
     updates["scratchpad"] = _get_scratchpad()
@@ -847,7 +965,10 @@ def build_graph(config: AppConfig, project: Project, checkpointer=None):
     _llm_with_tools = llm.bind_tools(ALL_TOOLS)
 
     # Initialize compactor (GLM-5.1: 204k context window)
-    _compactor = Compactor(token_threshold=160_000, keep_recent=40)
+    # token_threshold: start compacting well before the context fills up
+    # keep_recent: preserve only the last few exchanges (each exchange =
+    #   AIMessage + ToolMessages can be 5-15 messages for parallel tool calls)
+    _compactor = Compactor(token_threshold=100_000, keep_recent=20)
 
     # Build tool node
     tool_node = ToolNode(ALL_TOOLS)

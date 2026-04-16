@@ -42,6 +42,7 @@ class AgentState(TypedDict):
     # ---- patch tracking ----
     patch_results: list[dict[str, Any]]
     patch_plans: list[dict[str, Any]]  # saved patch plans for replay / auditing
+    patch_registry: list[dict[str, Any]]  # durable patch journal — every patch attempt with full details
 
     # ---- execution history ----
     tool_history: list[dict[str, Any]]  # [{tool, success, duration}, ...]

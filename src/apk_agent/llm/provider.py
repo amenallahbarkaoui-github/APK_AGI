@@ -104,7 +104,7 @@ def get_llm(config: "AppConfig", temperature: float = 1.0) -> ChatOpenAI:
     # Thinking is enabled only if the model supports it AND the user hasn't disabled it
     enable_thinking = model_supports_thinking and getattr(config, "thinking_enabled", True)
 
-    http_client = _PatchedHttpClient()
+    http_client = _PatchedHttpClient(timeout=httpx.Timeout(10.0, read=300.0))
     http_client._enable_thinking = enable_thinking
 
     return ChatOpenAI(
