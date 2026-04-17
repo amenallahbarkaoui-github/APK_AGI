@@ -581,6 +581,15 @@ def find_security_methods(G: "nx.DiGraph") -> dict:
             r"Class\.forName|InMemoryDex|loadLibrary)",
             re.IGNORECASE,
         ),
+        "billing_purchase": re.compile(
+            r"(BillingClient|queryPurchases|launchBillingFlow|"
+            r"acknowledgePurchase|PurchasesUpdatedListener|"
+            r"onPurchasesUpdated|SkuDetails|ProductDetails|"
+            r"InAppBillingService|isPurchased|isPremium|"
+            r"isSubscribed|getSubscription|verifyPurchase|"
+            r"checkLicense|LicenseChecker|allowAccess)",
+            re.IGNORECASE,
+        ),
     }
 
     results = {}

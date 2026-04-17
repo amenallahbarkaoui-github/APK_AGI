@@ -46,13 +46,14 @@ _CACHEABLE_TOOLS = frozenset({
 
 def set_tool_context(config, project) -> None:
     """Set the config and project for tool execution. Called once per session."""
-    global _config, _project, _tool_cache, _smali_index, _scratchpad, _task_plan
+    global _config, _project, _tool_cache, _smali_index, _scratchpad, _task_plan, _patch_journal
     _config = config
     _project = project
     _tool_cache.clear()  # fresh cache per session
     _smali_index = None
     _scratchpad = {}
     _task_plan = []
+    _patch_journal = []
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +61,13 @@ def set_tool_context(config, project) -> None:
 # ---------------------------------------------------------------------------
 _scratchpad: dict = {}
 _task_plan: list[dict] = []
+
+# ---------------------------------------------------------------------------
+# Patch journal — authoritative record of all patch operations this session.
+# Used by generate_report to produce accurate patch data instead of relying
+# on the LLM to reconstruct patch_results_json from memory.
+# ---------------------------------------------------------------------------
+_patch_journal: list[dict] = []
 
 
 def _get_scratchpad() -> dict:
@@ -103,15 +111,19 @@ def _cap_tool_output(result: str) -> str:
     )
 
 
-def _safe_call(func, tool_name: str, *args, **kwargs) -> str:
+def _safe_call(func, tool_name: str, *args, _cache_hint: str = "", **kwargs) -> str:
     """Wrap any tool function with progress tracking, caching, error recovery, and timeout."""
     # Check cache for expensive idempotent tools
     cache_key = None
     if tool_name in _CACHEABLE_TOOLS:
-        # Normalize paths in args to prevent cache misses from \ vs /
-        norm_args = str(args).replace("\\", "/")
-        norm_kwargs = str(sorted(kwargs.items())).replace("\\", "/")
-        cache_key = f"{tool_name}:{norm_args}:{norm_kwargs}"
+        # Use explicit cache_hint when provided (closure-based tools);
+        # fall back to stringified args/kwargs for direct-call tools.
+        if _cache_hint:
+            cache_key = f"{tool_name}:{_cache_hint}"
+        else:
+            norm_args = str(args).replace("\\", "/")
+            norm_kwargs = str(sorted(kwargs.items())).replace("\\", "/")
+            cache_key = f"{tool_name}:{norm_args}:{norm_kwargs}"
         if cache_key in _tool_cache:
             return _tool_cache[cache_key]
 
@@ -409,6 +421,129 @@ def dex2jar_convert() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Build integrity helpers (called automatically by apktool_build)
+# ---------------------------------------------------------------------------
+
+def _pre_build_patch_check() -> list[str]:
+    """Before building, verify that patched smali files still contain our changes.
+
+    Compares each backed-up file against its current version.  If a file has
+    been overwritten or reverted (e.g. by a second decompilation), the diff
+    disappears — that means our patch is gone.
+    """
+    warnings: list[str] = []
+    try:
+        backup_dir = _project.patch_backup_dir
+        if not backup_dir.is_dir():
+            return []
+        diffs_dir = _project.patch_diffs_dir
+        if not diffs_dir.is_dir():
+            return []
+
+        # Each .diff file encodes what we changed.  Read a few key lines.
+        for diff_file in sorted(diffs_dir.iterdir()):
+            if not diff_file.name.endswith(".diff"):
+                continue
+            try:
+                diff_text = diff_file.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+
+            # Extract the target file from the diff header (--- a/smali/...)
+            import re as _re
+            m = _re.search(r'^--- a/(.+)$', diff_text, _re.MULTILINE)
+            if not m:
+                continue
+            rel_path = m.group(1)
+            target = _project.apktool_dir / rel_path
+            if not target.is_file():
+                warnings.append(f"Patched file MISSING: {rel_path}")
+                continue
+
+            # Check that at least one "+" line from the diff is present in the file
+            added_lines = [
+                line[1:].strip()
+                for line in diff_text.splitlines()
+                if line.startswith("+") and not line.startswith("+++")
+                and len(line.strip()) > 5
+            ]
+            if not added_lines:
+                continue  # deletion-only patch, can't verify easily
+
+            try:
+                current = target.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            # Check if any of the added lines appear in the current file
+            found = any(al in current for al in added_lines[:5])
+            if not found:
+                warnings.append(
+                    f"PATCH REVERTED: {rel_path} — our added code is no longer present! "
+                    f"Re-apply the patch before building."
+                )
+    except Exception:
+        pass  # never block the build
+    return warnings[:10]
+
+
+def _post_build_patch_check() -> list[str]:
+    """After a successful build, re-read patched files to confirm patches survived.
+
+    apktool can silently drop changes in edge cases.  This catches that.
+    """
+    warnings: list[str] = []
+    try:
+        diffs_dir = _project.patch_diffs_dir
+        if not diffs_dir.is_dir():
+            return []
+
+        import re as _re
+        checked = 0
+        for diff_file in sorted(diffs_dir.iterdir()):
+            if checked >= 5:  # spot-check up to 5 files
+                break
+            if not diff_file.name.endswith(".diff"):
+                continue
+            try:
+                diff_text = diff_file.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+
+            m = _re.search(r'^--- a/(.+)$', diff_text, _re.MULTILINE)
+            if not m:
+                continue
+            rel_path = m.group(1)
+            target = _project.apktool_dir / rel_path
+            if not target.is_file():
+                continue
+
+            added_lines = [
+                line[1:].strip()
+                for line in diff_text.splitlines()
+                if line.startswith("+") and not line.startswith("+++")
+                and len(line.strip()) > 5
+            ]
+            if not added_lines:
+                continue
+
+            try:
+                current = target.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+
+            found = any(al in current for al in added_lines[:5])
+            if not found:
+                warnings.append(
+                    f"PATCH LOST IN BUILD: {rel_path} — patch code not found after rebuild. "
+                    f"Re-apply and rebuild."
+                )
+            checked += 1
+    except Exception:
+        pass
+    return warnings[:10]
+
+
+# ---------------------------------------------------------------------------
 # Build & Sign tools
 # ---------------------------------------------------------------------------
 
@@ -427,6 +562,9 @@ def apktool_build() -> str:
     import shutil as _shutil
     from apk_agent.tools.apktool import build
 
+    # --- PRE-BUILD: verify patched files still contain our patches ---
+    pre_warnings = _pre_build_patch_check()
+
     # Clear apktool's incremental-build cache so modified smali files
     # are always recompiled into fresh .dex.  Without this, apktool may
     # reuse stale .dex from a previous build and silently ignore patches.
@@ -442,7 +580,25 @@ def apktool_build() -> str:
         log_file=_log_file(),
         force_all=True,
     )
-    return result.to_llm_str()
+    build_output = result.to_llm_str()
+
+    # --- POST-BUILD: verify patches survived the rebuild ---
+    post_warnings = []
+    if result.success:
+        post_warnings = _post_build_patch_check()
+
+    # Append warnings to the build output
+    if pre_warnings or post_warnings:
+        build_output += "\n\n--- PATCH INTEGRITY CHECKS ---"
+        for w in pre_warnings:
+            build_output += f"\n⚠️ PRE-BUILD: {w}"
+        for w in post_warnings:
+            build_output += f"\n⚠️ POST-BUILD: {w}"
+        if post_warnings:
+            build_output += ("\n\n🔴 Some patches may not have survived the build! "
+                            "Re-apply the missing patches and rebuild.")
+
+    return build_output
 
 
 @tool
@@ -839,7 +995,7 @@ def search_in_code(
             result = search_in_files(search_dir, pattern, file_extensions=exts,
                                       exclude_dirs=excl, max_results=max_results)
             return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
-    return _safe_call(_run, "search_in_code")
+    return _safe_call(_run, "search_in_code", _cache_hint=f"{pattern}:{directory}:{file_extensions}:{exclude_dirs}:{max_results}")
 
 
 @tool
@@ -875,6 +1031,782 @@ def list_files(
         result["files"] = [f for f in result["files"]
                            if any(f.lower().endswith(ext) for ext in exts)]
     return json.dumps(result, ensure_ascii=False, indent=2)[:10000]
+
+
+# ---------------------------------------------------------------------------
+# Feature-check mapping (exhaustive premium/license detection)
+# ---------------------------------------------------------------------------
+
+
+@tool
+def map_feature_checks(
+    feature: str,
+    extra_keywords: str = "",
+) -> str:
+    """Automatically map ALL check points for a feature (premium, license, etc.).
+
+    This runs index lookups, SharedPrefs analysis, string searches, and graph
+    queries to build a comprehensive map of every method, field, and SharedPrefs
+    key that gates the specified feature.  Use the returned map to ensure you
+    patch ALL check points, not just the first one you find.
+
+    When to use: BEFORE writing any patch for a premium/license/subscription
+    bypass.  This prevents the #1 failure mode: patching 1 out of 7 checks.
+
+    Args:
+        feature: The feature to map.  Examples: "premium", "pro", "subscribe",
+                 "license", "trial", "ads", "vip".
+        extra_keywords: Optional comma-separated extra keywords to search for
+                        (e.g. "gold,diamond,elite").
+
+    Returns: JSON with keys: boolean_getters (methods returning Z related to
+    the feature), int_getters (methods returning I that may encode state),
+    string_refs (hardcoded strings mentioning the feature), shared_prefs
+    (SharedPreferences keys), callers (who reads these values), paywall_methods
+    (UI gating methods), total_check_points (count of unique locations).
+    """
+    def _run():
+        return _map_feature_checks_impl(feature, extra_keywords)
+    return _safe_call(_run, "map_feature_checks")
+
+
+def _map_feature_checks_impl(feature: str, extra_keywords: str) -> str:
+    """Internal implementation of map_feature_checks."""
+    import re as _re
+    from apk_agent.tools.index_cache import lookup_method, lookup_string, lookup_class
+    from apk_agent.tools.code_graph import query_callers as _qc
+    from apk_agent.tools.deep_analysis import analyze_shared_prefs as _asp
+
+    # Build keyword list
+    keywords = [feature.strip().lower()]
+    # Common synonyms
+    _synonyms = {
+        "premium": ["pro", "paid", "subscribe", "subscription", "licensed", "vip"],
+        "pro": ["premium", "paid", "subscribe", "subscription", "licensed"],
+        "license": ["licensed", "premium", "purchase", "activation"],
+        "subscribe": ["subscription", "premium", "pro", "billing"],
+        "ads": ["ad", "banner", "interstitial", "rewarded", "admob"],
+        "trial": ["free_trial", "premium", "expire", "expiry"],
+    }
+    for syn in _synonyms.get(feature.lower(), []):
+        if syn not in keywords:
+            keywords.append(syn)
+    if extra_keywords:
+        for kw in extra_keywords.split(","):
+            kw = kw.strip().lower()
+            if kw and kw not in keywords:
+                keywords.append(kw)
+
+    # --- Step 1: Find boolean getters via index ---
+    idx = _ensure_index()
+    boolean_getters: list[dict] = []
+    int_getters: list[dict] = []
+    string_refs: list[dict] = []
+
+    if idx:
+        # Method lookup: isPremium, isPro, isSubscribed, etc.
+        getter_prefixes = ["is", "get", "has", "can", "check", "should", "verify"]
+        searched_methods: set[str] = set()
+        for kw in keywords:
+            for prefix in getter_prefixes:
+                mname = f"{prefix}{kw.capitalize()}"
+                if mname in searched_methods:
+                    continue
+                searched_methods.add(mname)
+                result = lookup_method(idx, mname)
+                for m in result.get("methods", []):
+                    entry = {
+                        "method": m.get("full_name", ""),
+                        "class": m.get("class", ""),
+                        "file": m.get("file", ""),
+                    }
+                    boolean_getters.append(entry)
+
+            # Also do a raw keyword search for under-the-radar methods
+            result = lookup_method(idx, kw)
+            for m in result.get("methods", []):
+                entry = {
+                    "method": m.get("full_name", ""),
+                    "class": m.get("class", ""),
+                    "file": m.get("file", ""),
+                }
+                if entry not in boolean_getters and entry not in int_getters:
+                    int_getters.append(entry)
+
+        # String lookup: "premium", "pro", "FREE", "PREMIUM", etc.
+        for kw in keywords:
+            for variant in [kw, kw.upper(), kw.capitalize()]:
+                result = lookup_string(idx, variant)
+                for s in result.get("matches", result.get("string_matches", []))[:10]:
+                    string_refs.append(s)
+
+    # --- Step 2: SharedPreferences analysis ---
+    shared_prefs_hits: list[dict] = []
+    try:
+        search_dirs = _get_all_smali_dirs()
+        jadx = _project.jadx_dir
+        if jadx.is_dir():
+            search_dirs.append(jadx)
+        sp_result = _asp(search_dirs)
+        for flag in sp_result.get("boolean_flags_potential_bypass", []):
+            key = flag.get("key", "").lower()
+            if any(kw in key for kw in keywords):
+                shared_prefs_hits.append(flag)
+        for key_name, refs in sp_result.get("all_keys_sample", {}).items():
+            if any(kw in key_name.lower() for kw in keywords):
+                shared_prefs_hits.append({"key": key_name, "refs": refs[:3]})
+    except Exception:
+        pass
+
+    # --- Step 3: Graph callers for discovered methods ---
+    callers_map: list[dict] = []
+    G = _ensure_graph()
+    if G:
+        seen: set[str] = set()
+        for getter in (boolean_getters + int_getters)[:15]:
+            mname = getter.get("method", "").split("->")[-1].split("(")[0] if "->" in getter.get("method", "") else ""
+            if not mname or mname in seen:
+                continue
+            seen.add(mname)
+            cr = _qc(G, mname, depth=2)
+            for chain in cr.get("call_chains", [])[:5]:
+                callers_map.append({
+                    "target": chain.get("target", ""),
+                    "caller": chain.get("caller", ""),
+                    "caller_file": chain.get("caller_file", ""),
+                })
+
+    # --- Step 4: Paywall / UI gate methods ---
+    paywall_methods: list[dict] = []
+    if idx:
+        paywall_names = ["showPaywall", "showUpgrade", "showPurchase", "showPremium",
+                         "showSubscri", "openStore", "openBilling", "showPro",
+                         "upgrade", "paywall", "locked"]
+        for pn in paywall_names:
+            result = lookup_method(idx, pn)
+            for m in result.get("methods", []):
+                paywall_methods.append({
+                    "method": m.get("full_name", ""),
+                    "file": m.get("file", ""),
+                })
+
+    # --- Step 5: BEHAVIORAL ANALYSIS — find gating methods by code patterns ---
+    # This catches obfuscated methods like a()Z that perform subscription checks
+    # by analyzing WHAT the code DOES, not what it's NAMED.
+    behavioral_hits: list[dict] = []
+
+    # Patterns that identify gating/check logic in method bodies
+    # (defined here so Steps 5, 7 can both use them):
+    _GATE_PATTERNS = [
+        # Date/time comparisons (expiry checks)
+        _re.compile(r'invoke-.*Calendar|invoke-.*Date|invoke-.*TimeUnit|invoke-.*before\(|invoke-.*after\(|invoke-.*compareTo\(', _re.I),
+        # Boolean field reads followed by returns
+        _re.compile(r'iget-boolean|sget-boolean'),
+        # String equality checks (role == "TRIER", type == "FREE")
+        _re.compile(r'invoke-.*equals\('),
+        # Numeric comparisons (type == 0, level >= 2)
+        _re.compile(r'if-(?:eq|ne|gt|ge|lt|le)\s'),
+    ]
+
+    # Collect all entity-class files found so far for behavioral scanning
+    entity_files: set[str] = set()
+    for g in boolean_getters + int_getters:
+        f = g.get("file", "")
+        if f:
+            entity_files.add(f)
+    # Also add classes that contain keyword strings
+    for s in string_refs:
+        for cls in s.get("used_by", []):
+            cls_info = idx.get("classes", {}).get(cls, {}) if idx else {}
+            f = cls_info.get("file", "")
+            if f:
+                entity_files.add(f)
+
+    try:
+        for efile in list(entity_files)[:20]:
+            try:
+                fpath = _project.apktool_dir / efile
+                if not fpath.is_file():
+                    # Try resolving differently
+                    for smali_dir in _get_all_smali_dirs():
+                        candidate = smali_dir / efile
+                        if candidate.is_file():
+                            fpath = candidate
+                            break
+                if not fpath.is_file():
+                    continue
+                text = fpath.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+
+            # Find all methods returning Z (boolean) or I (int)
+            for m in _re.finditer(
+                r'\.method\s+(.*?)([\w<>$]+)\((.*?)\)([ZI])\s*\n(.*?)\.end method',
+                text, _re.DOTALL
+            ):
+                access = m.group(1).strip()
+                mname = m.group(2)
+                ret_type = m.group(4)
+                body = m.group(5)
+
+                # Skip already-found methods
+                full_sig = f"{mname}({m.group(3)}){ret_type}"
+                already = any(
+                    mname in g.get("method", "")
+                    for g in boolean_getters + int_getters
+                )
+
+                # Check if method body has gating behavior
+                gate_reasons = []
+                for pat in _GATE_PATTERNS:
+                    if pat.search(body):
+                        gate_reasons.append(pat.pattern[:50])
+
+                if gate_reasons and not already:
+                    # This is a behaviorally-detected gating method
+                    behavioral_hits.append({
+                        "method": full_sig,
+                        "file": efile,
+                        "return_type": "boolean" if ret_type == "Z" else "int",
+                        "behavior": gate_reasons[:3],
+                        "access": access,
+                        "note": "Found by BEHAVIORAL analysis (code pattern), not by name",
+                    })
+    except Exception:
+        pass
+
+    # --- Step 6: STRUCTURAL ENTITY SCAN — find subscription model classes ---
+    # Look at ALL classes in string_refs that have multiple boolean/int getters—
+    # these are likely the subscription entity class with ALL the check fields.
+    entity_methods: list[dict] = []
+    try:
+        entity_classes: set[str] = set()
+        for g in boolean_getters + int_getters:
+            c = g.get("class", "")
+            if c:
+                entity_classes.add(c)
+
+        if idx:
+            for cls_name in list(entity_classes)[:10]:
+                cls_info = idx.get("classes", {}).get(cls_name, {})
+                if not cls_info:
+                    continue
+                fpath_str = cls_info.get("file", "")
+                if not fpath_str:
+                    continue
+                try:
+                    fpath = _project.apktool_dir / fpath_str
+                    if not fpath.is_file():
+                        for sd in _get_all_smali_dirs():
+                            c2 = sd / fpath_str
+                            if c2.is_file():
+                                fpath = c2
+                                break
+                    if not fpath.is_file():
+                        continue
+                    text = fpath.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    continue
+
+                # Find ALL methods returning Z or I in this entity class
+                for m in _re.finditer(
+                    r'\.method\s+(.*?)([\w<>$]+)\((.*?)\)([ZI])\s*\n',
+                    text
+                ):
+                    full = f"{m.group(2)}({m.group(3)}){m.group(4)}"
+                    already_listed = any(
+                        m.group(2) in g.get("method", "")
+                        for g in boolean_getters + int_getters + behavioral_hits
+                    )
+                    if not already_listed:
+                        entity_methods.append({
+                            "method": full,
+                            "class": cls_name,
+                            "file": fpath_str,
+                            "return_type": "boolean" if m.group(4) == "Z" else "int",
+                            "note": "Same entity class — may also gate features",
+                        })
+    except Exception:
+        pass
+
+    # --- Step 7: BILLING FRAMEWORK TRACING ---
+    # Find the premium system through billing API references.
+    # Billing library class names are NEVER obfuscated — they're Android SDK classes.
+    # This is the most reliable discovery method for obfuscated apps.
+    billing_hits: list[dict] = []
+    _step5_files = set(entity_files)  # Track what Step 5 already scanned
+    try:
+        # 7a: Find app classes that IMPLEMENT billing interfaces
+        _BILLING_INTERFACES = [
+            "PurchasesUpdatedListener", "BillingClientStateListener",
+            "PurchasesResponseListener", "SkuDetailsResponseListener",
+            "ProductDetailsResponseListener", "AcknowledgePurchaseResponseListener",
+            "ConsumeResponseListener", "PurchaseHistoryResponseListener",
+        ]
+        if idx:
+            for cls_name, cls_info in idx.get("classes", {}).items():
+                ifaces = cls_info.get("interfaces", [])
+                for iface in ifaces:
+                    iface_short = iface.split("/")[-1].rstrip(";")
+                    if iface_short in _BILLING_INTERFACES:
+                        f = cls_info.get("file", "")
+                        billing_hits.append({
+                            "class": cls_name,
+                            "file": f,
+                            "implements": iface_short,
+                            "note": f"Implements {iface_short} — this is the app's purchase handler",
+                        })
+                        if f:
+                            entity_files.add(f)
+
+        # 7b: Use graph to find APP classes that call billing API methods
+        _BILLING_METHODS = [
+            "queryPurchasesAsync", "queryPurchases", "launchBillingFlow",
+            "acknowledgePurchase", "consumeAsync", "querySkuDetailsAsync",
+            "queryProductDetailsAsync", "onPurchasesUpdated",
+            "getPurchaseState", "getProducts", "getOrderId",
+            "isAcknowledged", "startConnection",
+            # RevenueCat
+            "getCustomerInfo", "restorePurchases",
+        ]
+        _SDK_FILTER = frozenset({
+            "billingclient", "vending", "revenuecat", "qonversion",
+            "adapty", "android/billingclient", "billing/api",
+        })
+        G = _ensure_graph()
+        if G:
+            for bm in _BILLING_METHODS:
+                cr = _qc(G, bm, depth=1)
+                for chain in cr.get("call_chains", [])[:5]:
+                    caller = chain.get("caller", "")
+                    caller_file = chain.get("caller_file", "")
+                    if any(sdk in caller.lower() for sdk in _SDK_FILTER):
+                        continue
+                    billing_hits.append({
+                        "method": caller,
+                        "file": caller_file,
+                        "calls": bm,
+                        "note": f"Calls billing API {bm} — trace to find entity class",
+                    })
+                    if caller_file:
+                        entity_files.add(caller_file)
+
+        # 7c: Find classes that reference billing-related CLASSES by name
+        _BILLING_CLASSES = [
+            "BillingClient", "Purchase", "SkuDetails", "ProductDetails",
+            "BillingResult", "BillingFlowParams",
+        ]
+        if idx:
+            for bc in _BILLING_CLASSES:
+                result = lookup_class(idx, bc)
+                for c in result.get("classes", [])[:3]:
+                    cls_name = c.get("class", "")
+                    # Skip the SDK classes themselves
+                    if any(sdk in cls_name.lower() for sdk in _SDK_FILTER):
+                        continue
+                    f = c.get("file", "")
+                    if f and f not in entity_files:
+                        entity_files.add(f)
+                        billing_hits.append({
+                            "class": cls_name,
+                            "file": f,
+                            "references": bc,
+                            "note": f"App class referencing {bc}",
+                        })
+
+        # 7d: Trace FIELDS in billing-connected classes to find entity classes.
+        # The purchase handler often has a field like `UserInfo mUserInfo` or
+        # `SubscriptionModel mSub` — tracing field types finds the entity.
+        _new_entity_files: set[str] = set()
+        for bfile in list(entity_files - _step5_files)[:15]:
+            try:
+                fpath = _project.apktool_dir / bfile
+                if not fpath.is_file():
+                    for sd in _get_all_smali_dirs():
+                        c2 = sd / bfile
+                        if c2.is_file():
+                            fpath = c2
+                            break
+                if not fpath.is_file():
+                    continue
+                text = fpath.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+
+            # Find field types that point to app classes (potential entities)
+            for fm in _re.finditer(r'\.field\s+.*?:(L[\w/$]+;)', text):
+                field_type = fm.group(1)
+                # Skip framework/SDK types
+                if any(field_type.startswith(f"L{p}") for p in [
+                    "java/", "android/", "kotlin/", "androidx/",
+                    "com/google/", "com/android/billingclient/",
+                ]):
+                    continue
+                # This is an app class field — the field type class may be the entity
+                if idx:
+                    fc_info = idx.get("classes", {}).get(field_type, {})
+                    ff = fc_info.get("file", "")
+                    if ff and ff not in entity_files:
+                        _new_entity_files.add(ff)
+
+            # Also look for invoke-* calls to app classes (not SDK) that return
+            # entity-like objects — the purchase handler calls entity methods
+            for inv in _re.finditer(
+                r'invoke-\w+\s+\{[^}]*\},\s*(L[\w/$]+;)->([\w<>$]+)\([^)]*\)(L[\w/$]+;)',
+                text
+            ):
+                ret_class = inv.group(3)
+                if any(ret_class.startswith(f"L{p}") for p in [
+                    "java/", "android/", "kotlin/", "androidx/",
+                    "com/google/", "com/android/billingclient/",
+                ]):
+                    continue
+                if idx:
+                    rc_info = idx.get("classes", {}).get(ret_class, {})
+                    rf = rc_info.get("file", "")
+                    if rf and rf not in entity_files:
+                        _new_entity_files.add(rf)
+
+        entity_files.update(_new_entity_files)
+
+        # 7e: Behavioral scan on ALL newly discovered files (from billing tracing)
+        for bfile in list(entity_files - _step5_files)[:20]:
+            try:
+                fpath = _project.apktool_dir / bfile
+                if not fpath.is_file():
+                    for sd in _get_all_smali_dirs():
+                        c2 = sd / bfile
+                        if c2.is_file():
+                            fpath = c2
+                            break
+                if not fpath.is_file():
+                    continue
+                text = fpath.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+
+            for m in _re.finditer(
+                r'\.method\s+(.*?)([\w<>$]+)\((.*?)\)([ZI])\s*\n(.*?)\.end method',
+                text, _re.DOTALL
+            ):
+                mname = m.group(2)
+                ret_type = m.group(4)
+                body = m.group(5)
+                full_sig = f"{mname}({m.group(3)}){ret_type}"
+
+                gate_reasons = []
+                for pat in _GATE_PATTERNS:
+                    if pat.search(body):
+                        gate_reasons.append(pat.pattern[:50])
+
+                if gate_reasons:
+                    already = any(
+                        mname in g.get("method", "")
+                        for g in behavioral_hits
+                    )
+                    if not already:
+                        behavioral_hits.append({
+                            "method": full_sig,
+                            "file": bfile,
+                            "return_type": "boolean" if ret_type == "Z" else "int",
+                            "behavior": gate_reasons[:3],
+                            "access": m.group(1).strip(),
+                            "note": "Found via BILLING API tracing (billing-connected class)",
+                        })
+    except Exception:
+        pass
+
+    # Deduplicate
+    def _dedup(lst: list[dict]) -> list[dict]:
+        seen_keys: set[str] = set()
+        out = []
+        for item in lst:
+            key = json.dumps(item, sort_keys=True)
+            if key not in seen_keys:
+                seen_keys.add(key)
+                out.append(item)
+        return out
+
+    boolean_getters = _dedup(boolean_getters)[:20]
+    int_getters = _dedup(int_getters)[:20]
+    string_refs = _dedup(string_refs)[:20]
+    shared_prefs_hits = _dedup(shared_prefs_hits)[:15]
+    callers_map = _dedup(callers_map)[:30]
+    paywall_methods = _dedup(paywall_methods)[:10]
+    behavioral_hits = _dedup(behavioral_hits)[:15]
+    entity_methods = _dedup(entity_methods)[:15]
+    billing_hits = _dedup(billing_hits)[:15]
+
+    total = (len(boolean_getters) + len(int_getters) + len(shared_prefs_hits)
+             + len(paywall_methods) + len(behavioral_hits) + len(entity_methods)
+             + len(billing_hits))
+
+    return json.dumps({
+        "success": True,
+        "feature": feature,
+        "keywords_searched": keywords,
+        "boolean_getters": boolean_getters,
+        "int_getters": int_getters,
+        "behavioral_checks": behavioral_hits,
+        "entity_class_methods": entity_methods,
+        "billing_purchase_system": billing_hits,
+        "string_refs": string_refs,
+        "shared_prefs": shared_prefs_hits,
+        "callers": callers_map,
+        "paywall_methods": paywall_methods,
+        "total_check_points": total,
+        "instruction": (
+            f"Found {total} potential check points for '{feature}'. "
+            + (f"BILLING SYSTEM ({len(billing_hits)} hits): Found the app's purchase/billing "
+               f"handler classes through billing API tracing — these are the ENTRY POINTS to the "
+               f"premium system. Trace their fields and callees to find the entity class. "
+               if billing_hits else "")
+            + (f"BEHAVIORAL checks ({len(behavioral_hits)}): Methods found by analyzing "
+               f"code BEHAVIOR — these are often the REAL gating logic in obfuscated apps. "
+               if behavioral_hits else "")
+            + (f"Entity class methods ({len(entity_methods)}): OTHER boolean/int methods "
+               f"in the same subscription entity class — check each one. "
+               if entity_methods else "")
+            + f"NEXT STEPS: 1) For each billing/behavioral hit, run "
+              f"analyze_subscription_model(file) to deep-analyze the class. "
+              f"2) Read jadx source for the same class. "
+              f"3) Patch ALL gate methods. "
+              f"Save: save_evidence('patch_map', <this>)."
+        ),
+    }, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Deep subscription/premium model analysis
+# ---------------------------------------------------------------------------
+
+@tool
+def analyze_subscription_model(smali_file: str) -> str:
+    """Deep-analyze a subscription/user entity class to find ALL gating methods.
+
+    Unlike map_feature_checks (keyword-based), this tool reads a SPECIFIC class
+    file and analyzes every method's BEHAVIOR to find subscription checks, expiry
+    logic, role comparisons, feature flags, and cached premium state — even when
+    the code is fully obfuscated with single-letter names.
+
+    When to use: After map_feature_checks identifies a subscription entity class
+    (e.g. UserInfo.smali, SubscriptionInfo.smali, AccountModel.smali), use this
+    to deep-analyze that class and find ALL its gating methods. Also use when
+    methods are obfuscated (a()Z, b()I) and keyword search misses them.
+
+    Args:
+        smali_file: Path to the smali file of the subscription/entity class.
+                    Can be relative (e.g. "smali_classes3/com/app/UserInfo.smali")
+                    or absolute.
+
+    Returns: JSON with keys: class_name, fields (all fields with types), methods
+    (every method with behavioral classification), gate_methods (methods that
+    perform checks/comparisons — the ones you need to patch), field_dependencies
+    (which methods read which fields), patch_plan (recommended patches for each gate).
+    """
+    import re as _re
+
+    def _run():
+        fpath = _resolve_file(smali_file)
+        if not fpath.is_file():
+            return json.dumps({"success": False, "error": f"File not found: {fpath}"})
+
+        try:
+            text = fpath.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            return json.dumps({"success": False, "error": str(e)})
+
+        lines = text.splitlines()
+
+        # --- Parse class info ---
+        class_name = ""
+        super_class = ""
+        for ln in lines[:20]:
+            m = _re.match(r'\.class\s+.*?(L[\w/$]+;)', ln)
+            if m:
+                class_name = m.group(1)
+            m = _re.match(r'\.super\s+(L[\w/$]+;)', ln)
+            if m:
+                super_class = m.group(1)
+
+        # --- Parse all fields ---
+        fields: list[dict] = []
+        for ln in lines:
+            m = _re.match(r'\.field\s+(.*?)([\w$]+):(\S+)', ln.strip())
+            if m:
+                fields.append({
+                    "name": m.group(2),
+                    "type": m.group(3),
+                    "access": m.group(1).strip(),
+                    "type_readable": _smali_type_name(m.group(3)),
+                })
+
+        # --- Parse and classify all methods ---
+        all_methods: list[dict] = []
+        gate_methods: list[dict] = []
+        field_deps: dict[str, list[str]] = {}
+
+        method_start = -1
+        method_header = ""
+        for i, ln in enumerate(lines):
+            stripped = ln.strip()
+            if stripped.startswith(".method"):
+                method_start = i
+                method_header = stripped
+            elif stripped == ".end method" and method_start >= 0:
+                body_lines = lines[method_start:i + 1]
+                body = "\n".join(body_lines)
+
+                # Parse signature
+                hm = _re.search(
+                    r'\.method\s+(.*?)([\w<>$]+)\((.*?)\)(\S+)', method_header
+                )
+                if not hm:
+                    method_start = -1
+                    continue
+
+                access = hm.group(1).strip()
+                mname = hm.group(2)
+                params = hm.group(3)
+                ret = hm.group(4)
+                sig = f"{mname}({params}){ret}"
+
+                # Skip constructors and static initializers
+                if mname in ("<init>", "<clinit>"):
+                    method_start = -1
+                    continue
+
+                # Classify by behavior
+                behaviors: list[str] = []
+                is_gate = False
+
+                # Date/time comparison (expiry check)
+                if _re.search(r'invoke-.*(?:Calendar|Date|Time|before|after|compareTo)', body):
+                    behaviors.append("DATE_COMPARISON")
+                    is_gate = True
+
+                # String equality (role check: "TRIER", "FREE", "PREMIUM")
+                str_consts = _re.findall(r'const-string(?:/jumbo)?\s+\w+,\s*"(.*?)"', body)
+                if str_consts and _re.search(r'invoke-.*equals\(', body):
+                    behaviors.append(f"STRING_EQUALITY({','.join(str_consts[:3])})")
+                    is_gate = True
+
+                # Boolean field read + return (cached flag)
+                if _re.search(r'iget-boolean|sget-boolean', body) and ret == "Z":
+                    behaviors.append("BOOLEAN_FIELD_READ")
+                    is_gate = True
+
+                # Integer comparison (type/level check)
+                if ret in ("I", "Z") and _re.search(r'if-(?:eq|ne|gt|ge|lt|le)\s', body):
+                    behaviors.append("NUMERIC_COMPARISON")
+                    is_gate = True
+
+                # Returns a boolean and has conditional logic
+                if ret == "Z" and _re.search(r'if-', body):
+                    if not behaviors:
+                        behaviors.append("CONDITIONAL_BOOLEAN")
+                    is_gate = True
+
+                # Returns a constant directly (simple getter)
+                const_ret = _re.search(r'const(?:/4|/16)?\s+v\d+,\s*(0x[0-9a-f]+|\d+)\s*\n\s*return\s', body)
+                if const_ret and ret in ("Z", "I"):
+                    behaviors.append(f"CONST_RETURN({const_ret.group(1)})")
+
+                # Field reads (which fields does this method access?)
+                read_fields = []
+                for fm in _re.finditer(r'(?:iget|sget)[-\w]*\s+\w+,\s*\w+,\s*([\w/$]+;->[\w$]+:\S+)', body):
+                    read_fields.append(fm.group(1).split("->")[-1])
+                if not read_fields:
+                    for fm in _re.finditer(r'(?:iget|sget)[-\w]*\s+\w+,\s*\w+,\s*\S+->([\w$]+):\S+', body):
+                        read_fields.append(fm.group(1))
+
+                # API calls
+                api_calls = []
+                for bln in body_lines:
+                    bs = bln.strip()
+                    if bs.startswith("invoke-"):
+                        cm = _re.search(r'(L[\w/$]+;)->([\w<>$]+)\(', bs)
+                        if cm:
+                            api_calls.append(f"{cm.group(1)}->{cm.group(2)}")
+
+                method_info: dict = {
+                    "method": sig,
+                    "name": mname,
+                    "access": access,
+                    "return_type": _smali_type_name(ret),
+                    "behaviors": behaviors,
+                    "fields_read": read_fields[:5],
+                    "api_calls": list(set(api_calls))[:5],
+                    "line_range": [method_start + 1, i + 1],
+                    "instruction_count": sum(
+                        1 for l in body_lines
+                        if l.strip() and not l.strip().startswith(('.', '#', ':'))
+                    ),
+                }
+
+                if read_fields:
+                    field_deps[sig] = read_fields[:5]
+
+                if is_gate:
+                    # Build a recommended patch
+                    if ret == "Z":
+                        method_info["recommended_patch"] = {
+                            "operation": "replace_block",
+                            "match_pattern": f".method {access} {sig}",
+                            "strategy": "Insert 'const/4 v0, 0x1\\n    return v0' after .locals/.registers line to force TRUE",
+                            "note": "Check with jadx source if TRUE or FALSE is the 'unlocked' value",
+                        }
+                    elif ret == "I":
+                        method_info["recommended_patch"] = {
+                            "operation": "replace_block",
+                            "match_pattern": f".method {access} {sig}",
+                            "strategy": "Insert 'const/4 v0, 0x2\\n    return v0' (or the premium int value) after .locals line",
+                            "note": "Read jadx source to determine which int value = premium",
+                        }
+                    gate_methods.append(method_info)
+                    if str_consts:
+                        method_info["string_constants"] = str_consts
+
+                all_methods.append(method_info)
+                method_start = -1
+
+        return json.dumps({
+            "success": True,
+            "class_name": class_name,
+            "super_class": super_class,
+            "file": str(fpath.relative_to(_project.apktool_dir)) if str(fpath).startswith(str(_project.apktool_dir)) else str(fpath),
+            "total_fields": len(fields),
+            "fields": fields,
+            "total_methods": len(all_methods),
+            "gate_methods_count": len(gate_methods),
+            "gate_methods": gate_methods,
+            "all_methods": [m for m in all_methods if m not in gate_methods][:15],
+            "field_dependencies": field_deps,
+            "instruction": (
+                f"Found {len(gate_methods)} GATE METHODS in {class_name} — "
+                f"these are the methods that control premium/subscription access. "
+                f"For each gate method: 1) Read the jadx Java source to understand the logic, "
+                f"2) Determine what return value means 'unlocked', "
+                f"3) Patch with apply_smali_patch. "
+                f"ALSO check the fields list — fields like 'role', 'dueTime', 'type', "
+                f"'expired' store subscription state. Trace who WRITES to these fields."
+            ),
+        }, ensure_ascii=False, indent=2)[:15000]
+
+    return _safe_call(_run, "analyze_subscription_model")
+
+
+def _smali_type_name(smali_type: str) -> str:
+    """Convert smali type descriptor to readable name."""
+    _map = {"Z": "boolean", "I": "int", "J": "long", "F": "float",
+            "D": "double", "B": "byte", "S": "short", "C": "char", "V": "void"}
+    if smali_type in _map:
+        return _map[smali_type]
+    if smali_type.startswith("L") and smali_type.endswith(";"):
+        return smali_type[1:-1].replace("/", ".").split(".")[-1]
+    if smali_type.startswith("["):
+        return _smali_type_name(smali_type[1:]) + "[]"
+    return smali_type
 
 
 # ---------------------------------------------------------------------------
@@ -942,7 +1874,8 @@ def apply_smali_patch(patch_plan_json: str) -> str:
         diffs_dir=_project.patch_diffs_dir,
     )
     result = engine.apply_plan(plan)
-    return json.dumps({
+
+    out: dict = {
         "success": result.success,
         "target_file": result.target_file,
         "steps_applied": result.steps_applied,
@@ -950,7 +1883,113 @@ def apply_smali_patch(patch_plan_json: str) -> str:
         "diff_text": result.diff_text[:5000],
         "errors": result.errors,
         "backup_path": result.backup_path,
-    }, ensure_ascii=False, indent=2)
+    }
+
+    # --- AUTO-PROPAGATION CHECK ---
+    # After a successful patch, query the code graph for callers of the
+    # patched method.  This surfaces cached-result fields, AND-combined
+    # conditions, alternate read paths, and startup-only calls that the
+    # agent must also patch to get full coverage.
+    if result.success:
+        try:
+            propagation = _propagation_check(result.target_file, result.diff_text)
+            if propagation:
+                out["propagation_warnings"] = propagation
+        except Exception:
+            pass  # never let propagation check break the patch result
+
+    # Record to patch journal for accurate report generation
+    _patch_journal.append({
+        "success": result.success,
+        "target_file": result.target_file,
+        "description": plan_data.get("description", ""),
+        "steps_applied": result.steps_applied,
+        "steps_total": result.steps_total,
+        "diff_text": result.diff_text[:3000],
+        "errors": result.errors,
+        "tool": "apply_smali_patch",
+    })
+
+    return json.dumps(out, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Propagation check helper (called automatically after successful patches)
+# ---------------------------------------------------------------------------
+
+def _propagation_check(target_file: str, diff_text: str) -> list[str]:
+    """Analyse callers of the patched method and return actionable warnings.
+
+    Runs silently inside apply_smali_patch — never raises.
+    """
+    from apk_agent.tools.code_graph import query_callers as _qc
+
+    G = _ensure_graph()
+    if G is None:
+        return []
+
+    # Extract patched method names from the diff (look for .method lines)
+    import re as _re
+    method_names: list[str] = []
+    for line in diff_text.splitlines():
+        # Lines starting with - or context (unchanged) that declare a .method
+        m = _re.search(r'\.method\s+.*?([\w<>$]+)\(', line)
+        if m:
+            method_names.append(m.group(1))
+
+    # Also try to infer from target_file: com/Foo/Bar.smali -> look for class methods
+    class_name = target_file.replace("\\", "/").split("/")[-1].replace(".smali", "")
+    if class_name and not method_names:
+        method_names.append(class_name)  # fallback: search by class
+
+    warnings: list[str] = []
+    seen_callers: set[str] = set()
+
+    for mname in dict.fromkeys(method_names):  # dedupe, preserve order
+        result = _qc(G, mname, depth=2)
+        if not result.get("found"):
+            continue
+        chains = result.get("call_chains", [])[:30]
+        for chain in chains:
+            caller = chain.get("caller", "")
+            if caller in seen_callers:
+                continue
+            seen_callers.add(caller)
+
+            caller_file = chain.get("caller_file", "")
+            # Read a few lines around the call site to detect common patterns
+            if caller_file:
+                try:
+                    fpath = _project.apktool_dir / caller_file
+                    if not fpath.is_file():
+                        continue
+                    src = fpath.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    continue
+
+                lower_src = src.lower()
+                # Pattern 1: result cached in an instance field (iput-boolean, sput)
+                if any(kw in lower_src for kw in ("iput-boolean", "sput-boolean", "iput ", "sput ")):
+                    if mname.lower() in lower_src:
+                        warnings.append(
+                            f"CACHED RESULT: {caller} stores the result of {mname} in a field. "
+                            f"Patch the field initialisation too (file: {caller_file})."
+                        )
+                # Pattern 2: AND-combined condition (if-eqz after invoke → another if-eqz)
+                # Heuristic: two invoke+if-eqz within 20 lines
+                lines = src.splitlines()
+                for i, ln in enumerate(lines):
+                    if mname in ln and "invoke" in ln:
+                        window = "\n".join(lines[max(0,i-3):min(len(lines),i+15)])
+                        if window.count("if-eqz") >= 2 or window.count("if-nez") >= 2:
+                            warnings.append(
+                                f"AND-CONDITION: {caller} combines {mname} with another check. "
+                                f"Find and patch the second condition too (file: {caller_file}, ~line {i+1})."
+                            )
+                            break
+
+    # Dedupe and cap
+    return list(dict.fromkeys(warnings))[:10]
 
 
 @tool
@@ -1010,11 +2049,12 @@ def generate_report(
     """Generate a Markdown security report summarizing findings and patches.
 
     When to use: At the END of analysis, after all findings and patches are collected.
-    Pass the complete findings and patch results arrays.
+    Pass the complete findings array. Patch results are auto-collected from the
+    patch journal — you do NOT need to provide patch_results_json.
 
     Args:
         findings_json: JSON array of findings, each with: title, severity, category, description, location, evidence.
-        patch_results_json: JSON array of patch results (optional).
+        patch_results_json: JSON array of patch results (optional — auto-filled from patch journal if omitted).
 
     Returns: Text with the report file path and a preview of the first 3000 characters
     of the generated Markdown report. Full report saved to outputs/report.md.
@@ -1026,10 +2066,15 @@ def generate_report(
     except json.JSONDecodeError as e:
         return json.dumps({"success": False, "error": f"Invalid JSON in findings_json: {e}"})
 
-    try:
-        patches = json.loads(patch_results_json)
-    except json.JSONDecodeError as e:
-        return json.dumps({"success": False, "error": f"Invalid JSON in patch_results_json: {e}"})
+    # Use module-level patch journal as authoritative source (never loses data).
+    # Fall back to LLM-provided JSON only if the journal is empty.
+    if _patch_journal:
+        patches = list(_patch_journal)
+    else:
+        try:
+            patches = json.loads(patch_results_json)
+        except json.JSONDecodeError:
+            patches = []
 
     output_path = Path(_project.workspace_path) / "outputs" / "report.md"
 
@@ -1071,7 +2116,7 @@ def scan_smali_classes(directory: Optional[str] = None) -> str:
     def _run():
         result = scan_smali_directory(d)
         return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
-    return _safe_call(_run, "scan_smali_classes")
+    return _safe_call(_run, "scan_smali_classes", _cache_hint=str(directory))
 
 
 @tool
@@ -1179,7 +2224,7 @@ def scan_vulnerabilities(
     def _run():
         result = scan_directory(d, severity_filter=severity_filter)
         return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
-    return _safe_call(_run, "scan_vulnerabilities")
+    return _safe_call(_run, "scan_vulnerabilities", _cache_hint=f"{directory}:{severity_filter}")
 
 
 @tool
@@ -1274,7 +2319,7 @@ def context_search(
                                           file_extensions=exts, exclude_dirs=excl,
                                           exclude_packages=True)
             return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
-    return _safe_call(_run, "context_search")
+    return _safe_call(_run, "context_search", _cache_hint=f"{pattern}:{directory}:{context_lines}:{file_extensions}:{exclude_dirs}")
 
 
 @tool
@@ -1332,7 +2377,7 @@ def multi_search(
             "total_matches": len(all_results),
             "results": all_results[:50],
         }, ensure_ascii=False, indent=2)[:15000]
-    return _safe_call(_run, "multi_search")
+    return _safe_call(_run, "multi_search", _cache_hint=f"{patterns}:{logic}:{directory}:{exclude_dirs}")
 
 
 @tool
@@ -1376,7 +2421,7 @@ def xref_search(
             "search_type": search_type,
             "references": all_refs[:50],
         }, ensure_ascii=False, indent=2)[:15000]
-    return _safe_call(_run, "xref_search")
+    return _safe_call(_run, "xref_search", _cache_hint=f"{class_or_method}:{search_type}:{directory}")
 
 
 @tool
@@ -1403,7 +2448,7 @@ def directory_overview(directory: Optional[str] = None) -> str:
     def _run():
         result = directory_stats(d)
         return json.dumps(result, ensure_ascii=False, indent=2)[:10000]
-    return _safe_call(_run, "directory_overview")
+    return _safe_call(_run, "directory_overview", _cache_hint=str(directory))
 
 
 # ---------------------------------------------------------------------------
@@ -1436,7 +2481,7 @@ def search_interceptors(directory: Optional[str] = None) -> str:
     def _run():
         result = search_network_interceptors(d)
         return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
-    return _safe_call(_run, "search_interceptors")
+    return _safe_call(_run, "search_interceptors", _cache_hint=str(directory))
 
 
 @tool
@@ -1464,7 +2509,7 @@ def search_native_code(directory: Optional[str] = None) -> str:
     def _run():
         result = search_native_bridges(d)
         return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
-    return _safe_call(_run, "search_native_code")
+    return _safe_call(_run, "search_native_code", _cache_hint=str(directory))
 
 
 @tool
@@ -1492,7 +2537,7 @@ def search_dynamic_loaders(directory: Optional[str] = None) -> str:
     def _run():
         result = search_dynamic_loading(d)
         return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
-    return _safe_call(_run, "search_dynamic_loaders")
+    return _safe_call(_run, "search_dynamic_loaders", _cache_hint=str(directory))
 
 
 # ---------------------------------------------------------------------------
@@ -1870,7 +2915,7 @@ def refine_search(
             return json.dumps({"success": False, "error": "Invalid JSON in previous_results_json"})
         result = filter_results(prev, refine_pattern, context_lines=context_lines)
         return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
-    return _safe_call(_run, "refine_search")
+    return _safe_call(_run, "refine_search", _cache_hint=f"{refine_pattern}:{context_lines}:{hash(previous_results_json)}")
 
 
 @tool
@@ -1951,7 +2996,7 @@ def smart_search(
         result = _smart(query, base_dirs, search_type=search_type, max_results=max_results,
                          exclude_packages=True)
         return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
-    return _safe_call(_run, "smart_search")
+    return _safe_call(_run, "smart_search", _cache_hint=f"{query}:{search_type}:{directory}:{max_results}")
 
 
 # ---------------------------------------------------------------------------
@@ -2117,7 +3162,7 @@ def graph_callers(method_name: str, depth: int = 3) -> str:
             return json.dumps({"success": False, "error": "No code graph. Run build_graph_and_index first."})
         result = query_callers(G, method_name, depth=depth)
         return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
-    return _safe_call(_run, "graph_callers")
+    return _safe_call(_run, "graph_callers", _cache_hint=f"{method_name}:{depth}")
 
 
 @tool
@@ -2143,7 +3188,7 @@ def graph_callees(method_name: str, depth: int = 2) -> str:
             return json.dumps({"success": False, "error": "No code graph. Run build_graph_and_index first."})
         result = query_callees(G, method_name, depth=depth)
         return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
-    return _safe_call(_run, "graph_callees")
+    return _safe_call(_run, "graph_callees", _cache_hint=f"{method_name}:{depth}")
 
 
 @tool
@@ -2169,7 +3214,7 @@ def graph_class_info(class_name: str) -> str:
             return json.dumps({"success": False, "error": "No code graph. Run build_graph_and_index first."})
         result = query_class_info(G, class_name)
         return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
-    return _safe_call(_run, "graph_class_info")
+    return _safe_call(_run, "graph_class_info", _cache_hint=class_name)
 
 
 @tool
@@ -2195,7 +3240,7 @@ def graph_find_path(source_method: str, target_method: str) -> str:
             return json.dumps({"success": False, "error": "No code graph. Run build_graph_and_index first."})
         result = query_path(G, source_method, target_method)
         return json.dumps(result, ensure_ascii=False, indent=2)[:10000]
-    return _safe_call(_run, "graph_find_path")
+    return _safe_call(_run, "graph_find_path", _cache_hint=f"{source_method}:{target_method}")
 
 
 @tool
@@ -2270,7 +3315,7 @@ def index_lookup_class(query: str) -> str:
             return json.dumps({"success": False, "error": "No code index. Run build_graph_and_index first."})
         result = lookup_class(idx, query)
         return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
-    return _safe_call(_run, "index_lookup_class")
+    return _safe_call(_run, "index_lookup_class", _cache_hint=query)
 
 
 @tool
@@ -2295,7 +3340,7 @@ def index_lookup_method(method_name: str) -> str:
             return json.dumps({"success": False, "error": "No code index. Run build_graph_and_index first."})
         result = lookup_method(idx, method_name)
         return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
-    return _safe_call(_run, "index_lookup_method")
+    return _safe_call(_run, "index_lookup_method", _cache_hint=method_name)
 
 
 @tool
@@ -2328,7 +3373,7 @@ def index_lookup_string(query: str) -> str:
             return json.dumps({"success": False, "error": "No code index. Run build_graph_and_index first."})
         result = lookup_string(idx, query)
         return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
-    return _safe_call(_run, "index_lookup_string")
+    return _safe_call(_run, "index_lookup_string", _cache_hint=query)
 
 
 @tool
@@ -2352,7 +3397,7 @@ def index_lookup_package(package_name: str) -> str:
             return json.dumps({"success": False, "error": "No code index. Run build_graph_and_index first."})
         result = lookup_package(idx, package_name)
         return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
-    return _safe_call(_run, "index_lookup_package")
+    return _safe_call(_run, "index_lookup_package", _cache_hint=package_name)
 
 
 # ---------------------------------------------------------------------------
@@ -2415,7 +3460,18 @@ def auto_patch_bypass(
             backup_dir=_project.patch_backup_dir,
             custom_device_id=custom_device_id,
         )
-        return json.dumps(stats.to_dict(), ensure_ascii=False, indent=2)[:4000]
+        d = stats.to_dict()
+        # Record to patch journal
+        _patch_journal.append({
+            "success": d.get("success", False) and d.get("total_patches_applied", 0) > 0,
+            "target_file": f"{len(d.get('patched_files') or [])} files",
+            "description": f"Auto-bypass: {', '.join(str(c) for c in (d.get('categories_applied') or [])[:6])} — {d.get('total_patches_applied', 0)} patches",
+            "steps_applied": d.get("total_patches_applied", 0),
+            "steps_total": d.get("total_patches_applied", 0),
+            "errors": d.get("errors", []),
+            "tool": "auto_patch_bypass",
+        })
+        return json.dumps(d, ensure_ascii=False, indent=2)[:4000]
     return _safe_call(_run, "auto_patch_bypass")
 
 
@@ -2441,6 +3497,16 @@ def patch_flutter_ssl() -> str:
             apktool_dir=_project.apktool_dir,
             backup_dir=_project.patch_backup_dir,
         )
+        # Record to patch journal
+        _patch_journal.append({
+            "success": result.get("success", False),
+            "target_file": "libflutter.so",
+            "description": f"Flutter SSL pin bypass — {result.get('patches_applied', 0)} arch(s) patched",
+            "steps_applied": result.get("patches_applied", 0),
+            "steps_total": result.get("patches_applied", 0),
+            "errors": result.get("errors", []),
+            "tool": "patch_flutter_ssl",
+        })
         return json.dumps(result, ensure_ascii=False, indent=2)
     return _safe_call(_run, "patch_flutter_ssl")
 
@@ -2476,6 +3542,17 @@ def inject_network_security_config(cert_paths: Optional[str] = None) -> str:
             apktool_dir=_project.apktool_dir,
             cert_paths=certs,
         )
+        # Record to patch journal
+        changes = result.get("changes_made") or []
+        _patch_journal.append({
+            "success": result.get("success", False),
+            "target_file": "res/xml/network_security_config.xml",
+            "description": f"Injected permissive network security config ({len(changes)} changes)",
+            "steps_applied": len(changes),
+            "steps_total": len(changes),
+            "errors": [],
+            "tool": "inject_network_security_config",
+        })
         return json.dumps(result, ensure_ascii=False, indent=2)
     return _safe_call(_run, "inject_network_security_config")
 
@@ -2503,6 +3580,17 @@ def patch_manifest_security() -> str:
 
     def _run():
         result = patch_manifest(apktool_dir=_project.apktool_dir)
+        # Record to patch journal
+        changes = result.get("changes_made") or []
+        _patch_journal.append({
+            "success": result.get("success", False),
+            "target_file": "AndroidManifest.xml",
+            "description": f"Manifest security patches ({len(changes)} changes)",
+            "steps_applied": len(changes),
+            "steps_total": len(changes),
+            "errors": result.get("warnings", []),
+            "tool": "patch_manifest_security",
+        })
         return json.dumps(result, ensure_ascii=False, indent=2)
     return _safe_call(_run, "patch_manifest_security")
 
@@ -2537,7 +3625,18 @@ def remove_ads() -> str:
             categories=[PatchCategory.ADS_REMOVAL, PatchCategory.LICENSE_BYPASS],
             backup_dir=_project.patch_backup_dir,
         )
-        return json.dumps(stats.to_dict(), ensure_ascii=False, indent=2)[:20000]
+        d = stats.to_dict()
+        # Record to patch journal
+        _patch_journal.append({
+            "success": d.get("success", False) and d.get("total_patches_applied", 0) > 0,
+            "target_file": f"{len(d.get('patched_files') or [])} files",
+            "description": f"Ads removal + license bypass — {d.get('total_patches_applied', 0)} patches",
+            "steps_applied": d.get("total_patches_applied", 0),
+            "steps_total": d.get("total_patches_applied", 0),
+            "errors": d.get("errors", []),
+            "tool": "remove_ads",
+        })
+        return json.dumps(d, ensure_ascii=False, indent=2)[:20000]
     return _safe_call(_run, "remove_ads")
 
 
@@ -2654,7 +3753,7 @@ def unified_scan(severity_filter: Optional[str] = None, max_findings: int = 500)
             return json.dumps({"success": False, "error": "No SmaliIndex. Run build_smali_index first."})
         result = scan(idx, severity_filter=severity_filter, max_findings=max_findings)
         return json.dumps(result, ensure_ascii=False, indent=2)[:30000]
-    return _safe_call(_run, "unified_scan")
+    return _safe_call(_run, "unified_scan", _cache_hint=f"{severity_filter}:{max_findings}")
 
 
 @tool
@@ -2730,7 +3829,7 @@ def run_taint_analysis(max_depth: int = 5, max_flows: int = 200) -> str:
             return json.dumps({"success": False, "error": "No SmaliIndex. Run build_smali_index first."})
         result = _run_taint(idx, max_depth=max_depth, max_flows=max_flows)
         return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
-    return _safe_call(_run, "run_taint_analysis")
+    return _safe_call(_run, "run_taint_analysis", _cache_hint=f"{max_depth}:{max_flows}")
 
 
 @tool
@@ -2925,6 +4024,9 @@ ALL_TOOLS = [
     load_evidence,
     search_evidence,
     get_evidence_summary,
+    # Feature-check mapping
+    map_feature_checks,
+    analyze_subscription_model,
     # Patching
     apply_smali_patch,
     preview_smali_patch,

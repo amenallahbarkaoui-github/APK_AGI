@@ -95,7 +95,9 @@ def generate_report(
         for i, p in enumerate(patch_results, 1):
             status = "✅" if p.get("success") else "❌"
             target = p.get("target_file", "unknown")
-            sections.append(f"### {status} Patch {i}: `{target}`")
+            tool_name = p.get("tool", "")
+            header = f"`{target}`" if not tool_name else f"`{target}` ({tool_name})"
+            sections.append(f"### {status} Patch {i}: {header}")
             sections.append(f"")
             if p.get("description"):
                 sections.append(p["description"])
