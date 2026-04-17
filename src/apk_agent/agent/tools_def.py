@@ -203,6 +203,12 @@ def _resolve_dir(directory: str | None, default: str = "jadx") -> Path:
     d = directory.strip().strip("/").strip("\\")
     low = d.lower().replace("\\", "/")
 
+    # If the LLM accidentally passed a FILE path as directory, use its parent
+    _FILE_EXTS = (".smali", ".java", ".kt", ".xml", ".json", ".txt")
+    if any(low.endswith(ext) for ext in _FILE_EXTS):
+        d = str(Path(d).parent).replace("\\", "/")
+        low = d.lower().replace("\\", "/")
+
     # Exact alias matching
     if low in ("jadx", "jadx_src"):
         return _project.jadx_dir
@@ -210,6 +216,20 @@ def _resolve_dir(directory: str | None, default: str = "jadx") -> Path:
         return _project.apktool_dir
     if low == "smali":
         return _project.apktool_dir / "smali"
+
+    # Handle "jadx_src/..." or "jadx/..." paths — strip prefix, resolve under jadx_dir.
+    # jadx puts Java sources under jadx_src/sources/, so try with and without "sources/".
+    if low.startswith("jadx_src/") or low.startswith("jadx/"):
+        sub = d.split("/", 1)[1] if "/" in d else d.split("\\", 1)[1]
+        # Try direct: jadx_dir / sub  (covers jadx_src/sources/com/foo)
+        candidate = _project.jadx_dir / sub
+        if candidate.is_dir():
+            return candidate
+        # Try with sources/ inserted: jadx_dir / sources / sub (covers jadx_src/com/foo → jadx_src/sources/com/foo)
+        candidate_src = _project.jadx_dir / "sources" / sub
+        if candidate_src.is_dir():
+            return candidate_src
+        return candidate  # best guess
 
     # Handle "apktool/..." paths — strip the "apktool/" prefix and resolve
     # under the apktool_dir. Supports: "apktool/smali", "apktool/smali/com/foo",
@@ -246,12 +266,16 @@ def _resolve_dir(directory: str | None, default: str = "jadx") -> Path:
                         return test
         return candidate
 
-    # Bare path like "com/psiphon3" or "B2" — check all smali dirs
+    # Bare path like "com/psiphon3" or "B2" — check all smali dirs + jadx sources
     if not Path(directory).is_absolute():
         for smali_d in _get_all_smali_dirs():
             test = smali_d / d
             if test.is_dir():
                 return test
+        # Also check jadx sources dir (for bare Java package paths like "com/pandavpn/...")
+        jadx_sources = _project.jadx_dir / "sources" / d
+        if jadx_sources.is_dir():
+            return jadx_sources
 
     p = Path(directory)
     if p.is_absolute():
@@ -267,6 +291,10 @@ def _resolve_dir(directory: str | None, default: str = "jadx") -> Path:
     apk_sub = _project.apktool_dir / d
     if apk_sub.is_dir():
         return apk_sub
+    # Try jadx_dir directly (covers "sources/com/foo" passed as directory)
+    jadx_sub = _project.jadx_dir / d
+    if jadx_sub.is_dir():
+        return jadx_sub
     # Default to decompiled/ (more likely correct)
     return decompiled
 
@@ -1810,6 +1838,329 @@ def _smali_type_name(smali_type: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Deep tracing + Code injection tools
+# ---------------------------------------------------------------------------
+
+
+@tool
+def trace_field_access(
+    class_descriptor: str,
+    field_name: str,
+) -> str:
+    """Find ALL reads and writes of a specific field across the ENTIRE codebase.
+
+    Searches every smali file for iget/iput/sget/sput operations on the given field.
+    This catches DIRECT field access that bypasses getter/setter methods.
+
+    Essential for discovering:
+    - Where a field is SET (from constructors, deserialization, API responses)
+    - Where a field is READ directly (bypassing getter methods you may have patched)
+    - Hidden initialization code that overrides your patches
+
+    Unlike graph_callers which traces method calls, this traces raw field-level
+    access — critical when obfuscated apps read fields directly instead of
+    calling getter methods.
+
+    Args:
+        class_descriptor: Smali class descriptor, e.g. 'Lcom/app/entity/UserInfo;'
+        field_name: Field name to trace, e.g. 'w' or 'role'
+
+    Returns: JSON with total_found, reads (iget operations), writes (iput operations),
+    each with file, line, method_context, instruction, and access_type.
+    """
+    import re as _re
+
+    def _run():
+        reads = []
+        writes = []
+        # Build pattern: match field access like iget-object v0, p0, Lcom/...;->fieldName:
+        escaped_class = _re.escape(class_descriptor)
+        escaped_field = _re.escape(field_name)
+        pat = _re.compile(
+            rf'((?:iget|iput|sget|sput)[\w-]*)\s+.*{escaped_class}->{escaped_field}:'
+        )
+
+        for smali_dir in _get_all_smali_dirs():
+            for smali_file in smali_dir.rglob("*.smali"):
+                # Skip third-party libraries
+                rel = str(smali_file.relative_to(smali_dir)).replace("\\", "/")
+                if any(rel.startswith(p) for p in (
+                    "android/", "androidx/", "com/google/", "kotlin/",
+                    "kotlinx/", "io/reactivex/", "okhttp3/", "retrofit2/",
+                    "com/squareup/", "org/", "io/netty/",
+                )):
+                    continue
+
+                try:
+                    text = smali_file.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+
+                file_lines = text.splitlines()
+                current_method = "(class-level)"
+                for i, line in enumerate(file_lines):
+                    s = line.strip()
+                    if s.startswith(".method"):
+                        current_method = s
+                    elif s == ".end method":
+                        current_method = "(class-level)"
+
+                    m = pat.search(s)
+                    if m:
+                        op = m.group(1)
+                        is_write = op.startswith(("iput", "sput"))
+                        entry = {
+                            "file": rel,
+                            "line": i + 1,
+                            "instruction": s[:120],
+                            "method": current_method[:100],
+                            "access_type": "write" if is_write else "read",
+                        }
+                        if is_write:
+                            writes.append(entry)
+                        else:
+                            reads.append(entry)
+
+        return json.dumps({
+            "success": True,
+            "class": class_descriptor,
+            "field": field_name,
+            "total_found": len(reads) + len(writes),
+            "total_reads": len(reads),
+            "total_writes": len(writes),
+            "reads": reads[:40],
+            "writes": writes[:40],
+        }, ensure_ascii=False, indent=2)[:15000]
+
+    return _safe_call(_run, "trace_field_access",
+                      _cache_hint=f"{class_descriptor}:{field_name}")
+
+
+@tool
+def find_class_instantiations(class_descriptor: str) -> str:
+    """Find every location where a class is instantiated, deserialized, or received.
+
+    Searches the entire codebase for:
+    - new-instance allocations (where the object is created)
+    - Constructor calls (<init> invocations on this class)
+    - check-cast operations (often from deserialization / JSON parsing)
+    - Method return types (factory methods that produce this class)
+    - Field reads that yield this class type
+
+    Essential for understanding the full lifecycle of an entity class:
+    where it's created, where data flows into it, and where it's consumed.
+    Use this AFTER trace_field_access to understand the full data pipeline.
+
+    Args:
+        class_descriptor: Smali class descriptor, e.g. 'Lcom/app/entity/UserInfo;'
+
+    Returns: JSON with instantiation_points: file, line, type (new-instance,
+    check-cast, init-call, factory-call), method_context, instruction.
+    """
+    import re as _re
+
+    def _run():
+        results = []
+        escaped = _re.escape(class_descriptor)
+        patterns = [
+            (_re.compile(rf'new-instance\s+\w+,\s*{escaped}'), "new-instance"),
+            (_re.compile(rf'invoke-direct\s+.*{escaped}-><init>'), "init-call"),
+            (_re.compile(rf'check-cast\s+\w+,\s*{escaped}'), "check-cast"),
+            (_re.compile(rf'invoke-.*\).*{escaped}'), "method-returning"),
+        ]
+
+        for smali_dir in _get_all_smali_dirs():
+            for smali_file in smali_dir.rglob("*.smali"):
+                rel = str(smali_file.relative_to(smali_dir)).replace("\\", "/")
+                if any(rel.startswith(p) for p in (
+                    "android/", "androidx/", "com/google/", "kotlin/",
+                    "kotlinx/", "io/reactivex/", "okhttp3/", "retrofit2/",
+                    "com/squareup/", "org/", "io/netty/",
+                )):
+                    continue
+
+                try:
+                    text = smali_file.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+
+                file_lines = text.splitlines()
+                current_method = "(class-level)"
+                for i, line in enumerate(file_lines):
+                    s = line.strip()
+                    if s.startswith(".method"):
+                        current_method = s
+                    elif s == ".end method":
+                        current_method = "(class-level)"
+
+                    for pat, ptype in patterns:
+                        if pat.search(s):
+                            results.append({
+                                "file": rel,
+                                "line": i + 1,
+                                "type": ptype,
+                                "instruction": s[:120],
+                                "method": current_method[:100],
+                            })
+                            break  # one match per line
+
+        # Deduplicate init-calls that are part of new-instance (same file+method)
+        return json.dumps({
+            "success": True,
+            "class": class_descriptor,
+            "total_found": len(results),
+            "instantiation_points": results[:60],
+        }, ensure_ascii=False, indent=2)[:15000]
+
+    return _safe_call(_run, "find_class_instantiations",
+                      _cache_hint=class_descriptor)
+
+
+@tool
+def inject_smali_code(
+    smali_file: str,
+    method_name: str,
+    smali_code: str,
+    position: str = "start",
+) -> str:
+    """Inject smali instructions into an existing method WITHOUT removing anything.
+
+    Unlike apply_smali_patch which REPLACES existing instructions, this tool ADDS
+    new code at the specified position. Use this to:
+    - Override field values after a constructor runs (position='after_super')
+    - Add initialization code at method start (position='start')
+    - Force values just before a method returns (position='end' or 'before_return')
+
+    The tool automatically bumps .locals if your injected code uses registers
+    beyond the current allocation — safe and non-destructive.
+
+    IMPORTANT: Injected code must be valid smali. Use p0 for 'this' in instance
+    methods. The tool wraps your code in marker comments for traceability.
+
+    Args:
+        smali_file: path to .smali file (relative to apktool dir or absolute)
+        method_name: method to inject into (e.g. '<init>', 'onCreate', 'a()Z').
+            For short/ambiguous names, include signature suffix: 'a()Z'
+        smali_code: smali instructions to inject, newline-separated. Example:
+            'const-string v0, "SVIP"\\niput-object v0, p0, Lcom/app/E;->role:Ljava/lang/String;'
+        position: where to inject:
+            'start' — after .locals (first executable position)
+            'end' or 'before_return' — before the last return instruction
+            'after_super' — after invoke-direct {p0} <init> (for constructors)
+
+    Returns: JSON with success, file, method, position, injected_at_line, lines_injected.
+    """
+    from apk_agent.tools.code_injector import inject_code_in_method
+
+    def _run():
+        fpath = str(_resolve_file(smali_file))
+        result = inject_code_in_method(fpath, method_name, smali_code, position)
+        return json.dumps(result, ensure_ascii=False, indent=2)
+
+    return _safe_call(_run, "inject_smali_code")
+
+
+@tool
+def generate_constructor_override(
+    smali_file: str,
+    class_descriptor: str,
+    field_overrides_json: str,
+) -> str:
+    """Patch ALL constructors of a class to force-set field values after initialization.
+
+    This DIRECTLY addresses the #1 bypass failure: patching getters is NOT enough
+    when other code reads fields directly. By overriding field values at constructor
+    exit, ALL downstream reads — both through getters AND direct field access — see
+    the forced values.
+
+    The tool:
+    1. Finds ALL <init> constructors in the class
+    2. Allocates a scratch register safely (bumps .locals)
+    3. Injects field-setting instructions before each constructor's return-void
+    4. Handles string, boolean, int, and long types automatically
+
+    Args:
+        smali_file: path to .smali file containing the target class
+        class_descriptor: Smali class descriptor, e.g. 'Lcom/app/entity/UserInfo;'
+        field_overrides_json: JSON string mapping field names to type+value. Format:
+            '{"w": {"type": "Ljava/lang/String;", "value": "SVIP"},
+              "u": {"type": "Z", "value": true},
+              "F": {"type": "I", "value": 999}}'
+            Supported types: Z (boolean), I (int), J (long), Ljava/lang/String;
+
+    Returns: JSON with success, constructors_found, constructors_patched, fields_overridden.
+    """
+    from apk_agent.tools.code_injector import override_constructor_fields
+
+    def _run():
+        fpath = str(_resolve_file(smali_file))
+        overrides = json.loads(field_overrides_json)
+        result = override_constructor_fields(fpath, class_descriptor, overrides)
+        return json.dumps(result, ensure_ascii=False, indent=2)
+
+    return _safe_call(_run, "generate_constructor_override")
+
+
+@tool
+def inject_startup_hook(smali_code: str) -> str:
+    """Inject smali code that executes when the app starts.
+
+    Automatically:
+    1. Finds the Application class from AndroidManifest.xml
+    2. Locates its onCreate() method
+    3. Injects code after super.onCreate() (position='after_super')
+    4. If no Application class, falls back to the main launcher Activity
+
+    Use this to:
+    - Force SharedPreferences values at startup before any Activity reads them
+    - Set static fields that control premium/license state app-wide
+    - Override initialization that happens before UI loads
+    - Run setup code that needs to execute once at app launch
+
+    The injected code runs ONCE per app start, in the Application context.
+    Use p0 for 'this' (the Application instance). Be careful not to reference
+    classes not yet loaded at this point.
+
+    Args:
+        smali_code: smali instructions to inject (will run at app startup).
+            Example: 'sget-object v0, Lcom/app/Config;->INSTANCE:Lcom/app/Config;
+            const/4 v1, 0x1
+            iput-boolean v1, v0, Lcom/app/Config;->isPremium:Z'
+
+    Returns: JSON with success, entry_type (Application or LauncherActivity),
+    class_name, smali_file, injected_at_line.
+    """
+    from apk_agent.tools.code_injector import find_startup_entry, inject_code_in_method
+
+    def _run():
+        manifest = _project.apktool_dir / "AndroidManifest.xml"
+        entry = find_startup_entry(str(manifest), str(_project.apktool_dir))
+        if not entry.get("success"):
+            return json.dumps(entry, ensure_ascii=False, indent=2)
+
+        smali_path = entry["smali_file"]
+        entry_type = entry["entry_type"]
+
+        if not entry.get("has_onCreate"):
+            return json.dumps({
+                "success": False,
+                "error": f"onCreate not found in {entry['class_name']}. "
+                         f"Use inject_smali_code on a specific method instead.",
+                "entry_info": entry,
+            }, ensure_ascii=False, indent=2)
+
+        # For Application.onCreate → inject after super.onCreate
+        # For Activity.onCreate → inject after super.onCreate
+        pos = "after_super"
+        result = inject_code_in_method(smali_path, "onCreate", smali_code, pos)
+        result["entry_type"] = entry_type
+        result["class_name"] = entry["class_name"]
+        return json.dumps(result, ensure_ascii=False, indent=2)
+
+    return _safe_call(_run, "inject_startup_hook")
+
+
+# ---------------------------------------------------------------------------
 # Patch tools
 # ---------------------------------------------------------------------------
 
@@ -2792,7 +3143,9 @@ def analyze_method_deep(smali_file: str, method_name: str) -> str:
 
     Args:
         smali_file: path to .smali file (relative to apktool dir or absolute)
-        method_name: method name to analyze (e.g. 'checkServerTrusted', 'onCreate')
+        method_name: method name to analyze (e.g. 'checkServerTrusted', 'onCreate').
+            For short/ambiguous names in obfuscated code, include the signature
+            suffix for precision: e.g. 'a()Z' instead of just 'a'.
 
     Returns: JSON with keys: success, file, method (full signature), line_range [start, end],
     instruction_count, body (full method bytecode), registers_used (list),
@@ -4027,6 +4380,12 @@ ALL_TOOLS = [
     # Feature-check mapping
     map_feature_checks,
     analyze_subscription_model,
+    # Deep tracing + Code injection
+    trace_field_access,
+    find_class_instantiations,
+    inject_smali_code,
+    generate_constructor_override,
+    inject_startup_hook,
     # Patching
     apply_smali_patch,
     preview_smali_patch,

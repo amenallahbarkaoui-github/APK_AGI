@@ -36,15 +36,38 @@ def analyze_method_deep(smali_file: str | Path, method_name: str) -> dict:
     text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
 
-    # Find the method
+    # Find the method — extract the real method name from the smali signature
+    # so that searching for "a" doesn't match "<clinit>" or constructor params.
+    def _method_name_matches(header_line: str, query: str) -> bool:
+        """Check if *query* matches the method name in a .method line.
+
+        Smali method headers look like:
+            .method public a()Z
+            .method static constructor <clinit>()V
+            .method public <init>(I)V
+            .method public final checkServerTrusted(...)V
+
+        We extract the token just before '(' — that's the method name.
+        """
+        m = re.search(r'(\S+)\(', header_line)
+        if not m:
+            return False
+        name_token = m.group(1)          # e.g. "a", "<clinit>", "checkServerTrusted"
+        # If query contains '(' it's a partial signature like "a()Z" — match against name+rest
+        if '(' in query:
+            sig_part = header_line[header_line.index(name_token):]
+            return query in sig_part
+        return name_token == query
+
     method_start = -1
     method_end = -1
     method_header = ""
     for i, line in enumerate(lines):
-        if line.strip().startswith(".method") and method_name in line:
+        stripped = line.strip()
+        if stripped.startswith(".method") and _method_name_matches(stripped, method_name):
             method_start = i
-            method_header = line.strip()
-        if method_start >= 0 and line.strip() == ".end method":
+            method_header = stripped
+        if method_start >= 0 and stripped == ".end method":
             method_end = i
             break
 

@@ -181,17 +181,41 @@ For EACH gate method from Step 2:
 3. validate_patch + diff_patched_file after each patch
 4. Check `propagation_warnings` — if callers cache the result, patch the cache too
 
+**⚠️ STEP 3b — FORCE FIELD VALUES AT CONSTRUCTION (CRITICAL — DO NOT SKIP):**
+Patching getter return values is NOT ENOUGH. Other code often reads entity FIELDS directly,
+bypassing the getter. You MUST also force-set the fields at the data layer:
+
+1. `trace_field_access("<entity_class_descriptor>", "<field_name>")` for EACH premium-related field
+   → reveals who reads/writes that field directly. If ANYONE reads the field outside the class
+   (not through the getter you patched), the bypass is incomplete.
+2. `generate_constructor_override("<entity_smali_file>", "<class_descriptor>", '<field_overrides_json>')`
+   → patches ALL constructors to force-set premium field values at construction time.
+   This means whenever the entity object is created (from API response, deserialization, cache),
+   ALL fields start with the "premium" values. Every read — getter or direct — sees the right data.
+3. `find_class_instantiations("<entity_class_descriptor>")` → verify where the entity is created.
+   If it's deserialized from JSON/network response, the constructor override ensures the fields
+   are overwritten AFTER deserialization fills them.
+
+Example flow: Entity has field `w` (role string) and getter `b()Z` (checks if role == "TRIER").
+- Patching `b()` alone FAILS if other code does `iget-object v0, p0, Entity;->w:Ljava/lang/String;`
+- Using `generate_constructor_override` to set `w = "SVIP"` fixes BOTH the getter AND direct reads.
+
 **STEP 4 — VERIFY completeness before build:**
 - `graph_callers(patched_method, depth=2)` for each patched method — verify all call sites
+- `trace_field_access` for each premium-related field — verify NO unpatched direct reads remain
 - `smart_search` with terms relevant to the feature — catch UI gates you may have missed
 - Cross-reference with your PATCH REGISTRY — is every discovered check point patched?
+- If the app uses SharedPreferences for premium state, consider `inject_startup_hook` to force-set
+  preference values at app startup (before any Activity reads them)
 
 **Save:** `save_evidence("patch_map", {<complete map with methods + patch status>})`
 
-**Common mistake — patching ONE gate but missing others in the same system:**
+**Common mistake — patching only getters but not the underlying data:**
 An entity class typically has MULTIPLE gate methods — an expiry check, a role/tier check, a cached
 boolean flag, a numeric type getter. ALL must be patched or the feature stays locked.
-Also check: SharedPreferences reads bypassing the entity, cached fields set at init, UI gate
+**Even more critically**: the FIELDS holding premium state must be forced to premium values.
+Use `generate_constructor_override` on the entity class. Use `inject_startup_hook` for app-wide state.
+Also check: SharedPreferences reads bypassing the entity, static fields set at init, UI gate
 methods in other classes, alternate code paths that call different methods for the same check.
 
 **Preferred helpers (non-patch):**
@@ -804,7 +828,7 @@ analyze_subscription_model("<path_to_entity_file>")
 Then ALWAYS read the jadx Java source of the same class — it shows what each method actually does and
 what return value means "unlocked" vs "locked". Without this, you're guessing.
 
-**Step 3 — Patch ALL gates + verify:**
+**Step 3 — Patch ALL gates + force field values:**
 For each gate: read jadx → determine unlocked value → write smali patch → validate → diff.
 Guidelines for determining the correct patch value:
 - Methods checking "is X expired/trial/free/restricted?" → patch to return FALSE (0x0) — negating the restriction
@@ -813,10 +837,23 @@ Guidelines for determining the correct patch value:
   highest tier, then patch to return that value
 - void methods that show upgrade dialogs/paywalls → patch to `return-void` at method start
 
+**⚠️ THEN — Force field values at the data layer (DO NOT SKIP):**
+```
+trace_field_access("<entity_class>", "<field_name>")     ← for EACH premium-related field
+```
+If ANY code reads the field directly (bypassing the getter you patched), you MUST also:
+```
+generate_constructor_override("<entity_file>", "<class>", '<{"field": {"type": "...", "value": ...}}>')
+```
+This forces the field values in ALL constructors, so deserialization/API responses produce
+objects that already have premium values in their fields.
+
 **Step 4 — Cross-check completeness:**
 - `graph_callers` on each patched method — verify all call sites will see the new value
+- `trace_field_access` on each premium field — verify no unpatched direct reads remain
 - `smart_search` with terms relevant to the feature — catch UI gates you may have missed
 - Cross-reference with your PATCH REGISTRY
+- If the app stores premium state in SharedPreferences, use `inject_startup_hook` to force values at boot
 
 **⚠️ WHEN map_feature_checks RETURNS FEW/NO RESULTS (heavily obfuscated app):**
 Don't give up. Escalate through these strategies:
@@ -831,10 +868,13 @@ Don't give up. Escalate through these strategies:
 
 **CRITICAL: Patch ALL layers, not just one.** A typical premium system has:
 - An entity/model class with multiple gate methods (expiry, tier, cached flag — ALL must be patched)
+- **Entity FIELDS that are read directly** — use `generate_constructor_override` to force values
 - A purchase handler that validates billing responses (patch to always return valid/purchased)
-- SharedPreferences or database storage (patch the reads or writes)
+- SharedPreferences or database storage — use `inject_startup_hook` to force preference values
 - UI gate methods that show purchase dialogs (patch to skip — return-void)
 - Feature-specific checks scattered across the app (find with graph_callers on each patched method)
+- **Use `trace_field_access` to verify NO direct field reads bypass your getter patches**
+- **Use `find_class_instantiations` to verify where the entity is created and ensure constructor overrides cover all creation paths**
 
 **Fallback only**: `auto_patch_bypass(categories="license_bypass,purchase_bypass")` — generic regex patterns
 
