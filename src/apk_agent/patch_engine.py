@@ -96,7 +96,13 @@ class PatchPlan:
             ))
         # Normalise target_file: the LLM sometimes sends absolute paths or
         # prefixed relative paths. We need a clean relative path within apktool/.
-        tf = data["target_file"].replace("\\", "/")
+        raw_tf = data.get("target_file") or data.get("file") or data.get("smali_file") or ""
+        if not raw_tf:
+            raise ValueError(
+                "Missing 'target_file' in patch plan JSON. "
+                "The JSON must contain a 'target_file' key with the smali file path."
+            )
+        tf = raw_tf.replace("\\", "/")
 
         # Handle absolute paths: extract everything after "decompiled/apktool/"
         if "decompiled/apktool/" in tf:
@@ -186,9 +192,10 @@ class PatchEngine:
             return f"\u274c Target file not found: {plan.target_file}"
 
         original = target.read_text(encoding="utf-8", errors="replace")
-        modified = self._apply_steps(original, plan.steps)
+        modified, errors = self._apply_steps(original, plan.steps, collect_errors=True)
         if modified is None:
-            return "\u274c Could not apply one or more steps (pattern not found)."
+            error_detail = "\n".join(errors) if errors else "Unknown step failure"
+            return f"❌ Could not apply one or more steps (pattern not found).\n\n{error_detail}"
 
         clean_path = plan.target_file.lstrip("/").replace("\\", "/")
         while "//" in clean_path:
@@ -201,6 +208,23 @@ class PatchEngine:
             lineterm="",
         )
         return "".join(diff) or "(no changes)"
+
+    def restore_backup(self, target_file: str) -> dict:
+        """Restore a file from its backup (undo all patches)."""
+        backup_path = self.backup_dir / target_file
+        if not backup_path.is_file():
+            return {"success": False, "error": f"No backup found for {target_file}"}
+
+        target = self._find_target(target_file)
+        if target is None:
+            return {"success": False, "error": f"Target file not found: {target_file}"}
+
+        shutil.copy2(str(backup_path), str(target))
+        return {
+            "success": True,
+            "restored_file": str(target),
+            "backup_source": str(backup_path),
+        }
 
     def apply_plan(self, plan: PatchPlan) -> PatchResult:
         """Apply a patch plan to the target file. Backs up before modifying."""
@@ -215,19 +239,20 @@ class PatchEngine:
             result.errors.append(f"Target file not found: {plan.target_file}")
             return result
 
-        # Backup (retry on Windows file locks)
+        # Backup — only create if no backup exists yet (preserve the ORIGINAL)
         backup_path = self.backup_dir / plan.target_file
         backup_path.parent.mkdir(parents=True, exist_ok=True)
-        import time as _t
-        for _attempt in range(3):
-            try:
-                shutil.copy2(str(target), str(backup_path))
-                break
-            except OSError as _oe:
-                if _attempt < 2 and getattr(_oe, 'winerror', 0) == 32:
-                    _t.sleep(0.3 * (_attempt + 1))
-                else:
-                    raise
+        if not backup_path.is_file():
+            import time as _t
+            for _attempt in range(3):
+                try:
+                    shutil.copy2(str(target), str(backup_path))
+                    break
+                except OSError as _oe:
+                    if _attempt < 2 and getattr(_oe, 'winerror', 0) == 32:
+                        _t.sleep(0.3 * (_attempt + 1))
+                    else:
+                        raise
         result.backup_path = str(backup_path)
 
         # Read original
@@ -273,14 +298,32 @@ class PatchEngine:
         result.success = result.steps_applied == result.steps_total
         return result
 
-    def _apply_steps(self, text: str, steps: list[PatchStep]) -> Optional[str]:
-        """Apply all steps; return None if any step fails."""
+    def _apply_steps(self, text: str, steps: list[PatchStep],
+                      collect_errors: bool = False) -> Optional[str] | tuple[Optional[str], list[str]]:
+        """Apply all steps; return None if any step fails.
+
+        If *collect_errors* is True, returns (result, errors_list) — where
+        result may be partial (steps applied up to the failure point) and
+        errors_list contains descriptions of each failed step.
+        """
         current = text
-        for step in steps:
+        errors: list[str] = []
+        for i, step in enumerate(steps, 1):
             result = self._apply_single_step(current, step)
             if result is None:
-                return None
-            current = result
+                desc = step.description or f"step {i}"
+                pat_preview = step.match_pattern[:120] if step.match_pattern else "(empty)"
+                errors.append(
+                    f"Step {i} ({step.operation.value}) FAILED — "
+                    f"pattern not found: {pat_preview!r}  "
+                    f"(description: {desc})"
+                )
+                if not collect_errors:
+                    return (None, errors) if collect_errors else None
+            else:
+                current = result
+        if collect_errors:
+            return (current if not errors else None, errors)
         return current
 
     def _apply_single_step(self, text: str, step: PatchStep) -> Optional[str]:

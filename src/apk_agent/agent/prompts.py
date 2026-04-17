@@ -157,6 +157,12 @@ For EACH entity class file discovered in Step 1 (collect unique `file` values fr
 ```
 analyze_subscription_model("<path_to_entity_smali_file>")
 ```
+If the class has obfuscated names (single letters like `a`, `b`, `c`), also run:
+```
+deobfuscate_names("<class_descriptor>")
+```
+This suggests human-readable names for methods and fields based on their behaviour, so you
+can reason about them clearly (e.g. `a()` → `isPremium`, `b` → `subscriptionType`).
 This classifies EVERY method by behavioral pattern:
 - `DATE_COMPARISON` — likely an expiry/validity check
 - `STRING_EQUALITY` — likely a role or tier comparison
@@ -177,8 +183,10 @@ For EACH gate method from Step 2:
    - Methods checking "is expired/trial/free?" → patch to return FALSE (0x0)
    - Methods checking "is premium/pro/vip/paid?" → patch to return TRUE (0x1)
    - Methods returning a tier/level integer → patch to return the premium tier value (find it in jadx)
-2. Write the smali patch: `const/4 v0, <value>` + `return v0` after `.locals` line
-3. validate_patch + diff_patched_file after each patch
+2. Use `batch_patch_methods` to patch ALL methods at once — pass a JSON array of
+   {file, method, return_type, value, description}. This is faster and more reliable
+   than calling apply_smali_patch multiple times.
+3. validate_patch + diff_patched_file to verify patches
 4. Check `propagation_warnings` — if callers cache the result, patch the cache too
 
 **⚠️ STEP 3b — FORCE FIELD VALUES AT CONSTRUCTION (CRITICAL — DO NOT SKIP):**
@@ -201,12 +209,23 @@ Example flow: Entity has field `w` (role string) and getter `b()Z` (checks if ro
 - Using `generate_constructor_override` to set `w = "SVIP"` fixes BOTH the getter AND direct reads.
 
 **STEP 4 — VERIFY completeness before build:**
+- `cross_reference_map("<entity_class>")` — ONE-CALL deep x-ref: all callers, callees, field
+  reads/writes, strings, resource refs. Use FIRST before targeted tools.
+- `trace_data_pipeline("<entity_class>")` — see the FULL lifecycle: instantiation → field writes →
+  field reads → consumption. Verify every path is covered.
 - `graph_callers(patched_method, depth=2)` for each patched method — verify all call sites
 - `trace_field_access` for each premium-related field — verify NO unpatched direct reads remain
-- `smart_search` with terms relevant to the feature — catch UI gates you may have missed
+- `map_ui_gates("<relevant_terms>")` — find upgrade dialogs, paywall buttons, locked overlays.
+  Patch the controlling code (often return-void on dialog show methods).
+- `find_dynamic_checks()` — find lifecycle hooks (onResume, onStart) that RE-VALIDATE premium
+  status. These can undo your patches when the user backgrounds/returns to the app.
+- `identify_server_checks()` — see which API endpoints set premium state. Trace response handlers
+  to find where server data flows into entity fields.
+- If SharedPreferences store premium state: `patch_shared_prefs_reads("<key>", "<value>")` —
+  patches EVERY read of that key across the codebase to return your forced value.
+- `verify_bypass_completeness()` — FINAL quality gate. Re-scans for remaining unpatched
+  premium methods, SharedPrefs reads, and UI gates. MUST return verdict=PASS.
 - Cross-reference with your PATCH REGISTRY — is every discovered check point patched?
-- If the app uses SharedPreferences for premium state, consider `inject_startup_hook` to force-set
-  preference values at app startup (before any Activity reads them)
 
 **Save:** `save_evidence("patch_map", {<complete map with methods + patch status>})`
 
@@ -215,8 +234,35 @@ An entity class typically has MULTIPLE gate methods — an expiry check, a role/
 boolean flag, a numeric type getter. ALL must be patched or the feature stays locked.
 **Even more critically**: the FIELDS holding premium state must be forced to premium values.
 Use `generate_constructor_override` on the entity class. Use `inject_startup_hook` for app-wide state.
-Also check: SharedPreferences reads bypassing the entity, static fields set at init, UI gate
-methods in other classes, alternate code paths that call different methods for the same check.
+Use `patch_shared_prefs_reads` to force SharedPreferences key reads across the entire codebase.
+Use `map_ui_gates` to find premium UI gates. Use `identify_server_checks` to map server-side flows.
+Use `trace_data_pipeline` to see the full entity lifecycle and verify you've covered every path.
+
+**🚫 INJECTION SAFETY RULES — READ BEFORE USING ANY INJECTION TOOL:**
+Injection tools (`inject_smali_code`, `generate_constructor_override`, `inject_startup_hook`) are
+SURGICAL instruments. Misuse corrupts smali files and breaks the APK build.
+
+**STRICT RULES:**
+1. **NEVER use `write_file` to rewrite an entire .smali file.** If you read a smali file and the
+   output was truncated, DO NOT reconstruct it and write it back — class descriptors will be
+   corrupted (e.g., `LIF0/y;` becomes `IF0/y;` — missing the L prefix). Use `apply_smali_patch`
+   or `inject_smali_code` to make targeted edits instead.
+2. **ONLY inject code you have VERIFIED is valid smali.** Every class reference MUST use the
+   `L<package>/<Name>;` format. Every method reference MUST use `L<class>;-><method>(<params>)<ret>`.
+   If you're unsure about a class descriptor, use `read_file` on the target .smali to copy the
+   exact descriptor — never guess or reconstruct from truncated output.
+3. **inject_smali_code** — use ONLY for these specific purposes:
+   - Force field values after constructor/super call (`position='after_super'`)
+   - Add initialization at method start (`position='start'`)
+   - Override return values before return (`position='before_return'`)
+   Do NOT inject large blocks of complex logic. Keep injections to 2-6 instructions max.
+4. **generate_constructor_override** — use ONLY on entity/model classes where you need to force
+   field values at construction time. This is safe and well-tested. Always preferred over manual
+   injection for constructor field overriding.
+5. **inject_startup_hook** — use ONLY for app-wide state that must be set at boot (SharedPrefs,
+   static fields). Do NOT inject arbitrary code into Application.onCreate.
+6. **Always verify after injection:** run `validate_patch` + `diff_patched_file` on the modified
+   file. If the validation fails, restore from the auto-backup (.smali.bak) and retry.
 
 **Preferred helpers (non-patch):**
 ```
@@ -270,16 +316,18 @@ A patch registry is injected into your context on every turn. It tracks all patc
 ### PHASE 6 — Build & Sign
 
 **6a. PRE-BUILD COVERAGE SCAN (mandatory — do NOT skip):**
-Before building, verify ALL check points are patched. Run:
+Before building, run the final quality gate:
 ```
-smart_search("<key_terms_for_the_feature>")  ← e.g., "premium|pro|subscribe|paywall|upgrade|locked"
+verify_bypass_completeness()   ← re-scans ALL smali for unpatched premium gates, SharedPrefs reads, UI gates
 ```
-For EVERY hit returned:
+If verdict is FAIL → patch remaining gates. If PASS → proceed to build.
+
+Also run `extract_all_urls()` to ensure you haven't missed server-side validation endpoints.
+
+For EVERY remaining gate found:
 - Cross-reference with your PATCH REGISTRY — is this location already patched?
 - If NOT patched → read the code → decide if it needs patching → patch it
-- Keep going until every relevant check point is covered
-
-This catches the #1 failure mode: patching 3 out of 7 check points and shipping a half-unlocked app.
+- Keep going until `verify_bypass_completeness()` returns verdict=PASS
 
 **6b. BUILD:**
 ```

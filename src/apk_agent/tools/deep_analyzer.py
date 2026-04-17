@@ -72,7 +72,21 @@ def analyze_method_deep(smali_file: str | Path, method_name: str) -> dict:
             break
 
     if method_start < 0:
-        return {"success": False, "error": f"Method '{method_name}' not found in {path.name}"}
+        # Collect all method signatures so the agent can pick the right one
+        available = []
+        for line in lines:
+            s = line.strip()
+            if s.startswith(".method"):
+                m = re.search(r'(\S+\(.*?\)\S+)', s)
+                if m:
+                    available.append(m.group(1))
+        return {
+            "success": False,
+            "error": f"Method '{method_name}' not found in {path.name}",
+            "available_methods": available,
+            "hint": "The method may have a different name due to obfuscation or Kotlin compilation. "
+                    "Check the available_methods list and retry with the correct name.",
+        }
 
     body_lines = lines[method_start:method_end + 1]
     body_text = "\n".join(body_lines)

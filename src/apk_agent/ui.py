@@ -10,6 +10,7 @@ from rich.columns import Columns
 from rich.console import Console, Group
 from rich.live import Live
 from rich.markdown import Markdown
+from rich.markup import escape as _escape_markup
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
@@ -43,8 +44,8 @@ def print_welcome(project_id: str | None = None, apk_name: str | None = None) ->
         console.print(f"  [bold bright_cyan]📦[/] [bold]{apk_name}[/]  [dim]({project_id[:12]}…)[/]")
     console.print()
     console.print("[dim]Modes: normal chat │ /orchestrator (parallel) │ /auto (one-shot) │ /thinking (toggle reasoning)[/]")
-    console.print("[dim]Commands: /status /tokens /progress /plan /session /help[/]")
-    console.print("[dim]Type your task (e.g., 'full security audit', 'bypass SSL pinning')[/]")
+    console.print("[dim]Commands: /dashboard /findings /patches /tools /status /session /tokens /help[/]")
+    console.print("[dim]Type your task (e.g., 'full security audit', 'bypass premium', 'remove ads')[/]")
     console.print()
 
 
@@ -62,10 +63,30 @@ def print_ai_message(content: str) -> None:
 
 
 def print_tool_output(tool_name: str, content: str, success: bool = True) -> None:
-    """Render a tool execution result with smart truncation."""
+    """Render a tool execution result with smart truncation and severity coloring."""
     icon = "✅" if success else "❌"
-    style = "green" if success else "red"
+
+    # Auto-detect severity/importance from content
+    content_lower = content[:500].lower()
+    if not success:
+        style = "red"
+    elif '"verdict": "fail"' in content_lower or '"remaining_gates"' in content_lower:
+        style = "yellow"
+        icon = "⚠️ "
+    elif '"verdict": "pass"' in content_lower:
+        style = "bright_green"
+        icon = "✅"
+    elif any(k in content_lower for k in ('"critical"', '"severity": "high"')):
+        style = "bright_red"
+    elif tool_name in ("verify_bypass_completeness", "batch_patch_methods"):
+        style = "bright_cyan"
+    else:
+        style = "green"
+
     title = f"{icon} {tool_name}"
+
+    # Escape Rich markup in tool output (smali text has [/;] etc.)
+    content = _escape_markup(content)
 
     # Smart truncation — preserve start and end for context
     if len(content) > 3000:
@@ -371,27 +392,27 @@ def print_hitl_prompt(prompt_text: str) -> None:
 
 def print_user_message(content: str) -> None:
     """Render a user message."""
-    console.print(f"\n[bold green]▶ You:[/] {content}")
+    console.print(f"\n[bold green]▶ You:[/] {_escape_markup(content)}")
 
 
 def print_error(message: str) -> None:
     """Print an error message."""
-    console.print(f"[bold red]❌ Error:[/] {message}")
+    console.print(f"[bold red]❌ Error:[/] {_escape_markup(message)}")
 
 
 def print_warning(message: str) -> None:
     """Print a warning."""
-    console.print(f"[bold yellow]⚠️  Warning:[/] {message}")
+    console.print(f"[bold yellow]⚠️  Warning:[/] {_escape_markup(message)}")
 
 
 def print_success(message: str) -> None:
     """Print a success message."""
-    console.print(f"[bold green]✅ {message}[/]")
+    console.print(f"[bold green]✅ {_escape_markup(message)}[/]")
 
 
 def print_info(message: str) -> None:
     """Print an info message."""
-    console.print(f"[bold blue]ℹ️  {message}[/]")
+    console.print(f"[bold blue]ℹ️  {_escape_markup(message)}[/]")
 
 
 # ---------------------------------------------------------------------------
@@ -575,13 +596,24 @@ def print_sub_agent_result(result: dict) -> None:
 
 def print_help() -> None:
     """Print help text for available commands."""
-    help_text = """
+    # Get actual tool count
+    try:
+        from apk_agent.agent.tools_def import ALL_TOOLS
+        tool_count = str(len(ALL_TOOLS))
+    except Exception:
+        tool_count = "90"
+
+    help_text = f"""
 [bold cyan]━━━ Project ━━━[/]
   [cyan]/new <apk_path>[/]    — Create a new project from an APK/XAPK file
   [cyan]/open <id>[/]         — Open an existing project by ID
   [cyan]/list[/]               — List all projects
 
-[bold cyan]━━━ Info ━━━[/]
+[bold cyan]━━━ Dashboard & Info ━━━[/]
+  [cyan]/dashboard[/]          — Full overview: findings, patches, context, progress
+  [cyan]/findings[/]           — List all findings with severity highlighting
+  [cyan]/patches[/]            — List all patches with status & coverage
+  [cyan]/tools[/]              — Show all {tool_count} tools grouped by category
   [cyan]/status[/]             — Show current project status
   [cyan]/session[/]            — Show session info (thread ID, messages, tokens)
   [cyan]/tokens[/]             — Show current context & token usage
@@ -608,15 +640,17 @@ def print_help() -> None:
   [dim]--auto[/]                      — Start in auto mode
   [dim]--verbose / -v[/]             — Enable debug logging
 
-[bold]SOTA Analysis Tools:[/]
-  [dim]SmaliIndex IR · Unified Scanner · Taint Analysis · Auto-Bypass
-  Manifest Analyzer · Cloud Scanner · Code Graph · 72 tools total[/]
+[bold]SOTA Analysis ({tool_count} tools):[/]
+  [dim]SmaliIndex IR · Code Graph · Taint Analysis · Auto-Bypass · Deobfuscation
+  Cross-Reference · Dynamic Checks · URL Extraction · Bypass Verification
+  Deep Injection · Batch Patching · UI Gate Mapping · Cloud Scanner[/]
 
 [bold]Example Tasks:[/]
   • [dim]"full security audit of this APK"[/]
-  • [dim]"bypass SSL pinning statically"[/]
+  • [dim]"bypass premium — unlock all features"[/]
   • [dim]"find hardcoded API keys and secrets"[/]
   • [dim]"run taint analysis to find data leaks"[/]
+  • [dim]"remove all ads and tracking"[/]
 """
     console.print(Panel(help_text.strip(), title="📖 Help", border_style="bright_cyan", padding=(0, 1)))
 
@@ -731,4 +765,323 @@ def print_turn_summary() -> None:
 
     separator = " │ "
     console.print(f"[dim]╰── {separator.join(parts)} ──╯[/]")
+
+
+# ---------------------------------------------------------------------------
+# Dashboard — rich multi-panel overview
+# ---------------------------------------------------------------------------
+
+
+def print_dashboard(state: dict | None = None) -> None:
+    """Print a rich multi-panel dashboard showing overall analysis state.
+
+    Args:
+        state: The agent's current state dict (from graph checkpoint).
+    """
+    if not state:
+        console.print("[dim]No state available. Run an analysis first.[/]")
+        return
+
+    findings = state.get("findings") or []
+    patches = state.get("patch_results") or []
+    patch_registry = state.get("patch_registry") or []
+    task_plan = state.get("task_plan") or []
+    scratchpad = state.get("scratchpad") or {}
+    graph_ready = state.get("graph_ready", False)
+    target_pkgs = state.get("target_packages") or []
+
+    # ── Findings summary panel ──
+    severity_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+    for f in findings:
+        sev = (f.get("severity") or "INFO").upper()
+        severity_counts[sev] = severity_counts.get(sev, 0) + 1
+
+    findings_lines = []
+    colors = {"CRITICAL": "bold red", "HIGH": "red", "MEDIUM": "yellow", "LOW": "blue", "INFO": "dim"}
+    icons = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵", "INFO": "ℹ️ "}
+    for sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"):
+        count = severity_counts[sev]
+        if count > 0:
+            findings_lines.append(f"  {icons[sev]} [{colors[sev]}]{sev}: {count}[/{colors[sev]}]")
+    if not findings_lines:
+        findings_lines.append("  [dim]No findings yet[/]")
+
+    findings_panel = Panel(
+        "\n".join(findings_lines),
+        title=f"[bold]🔍 Findings ({len(findings)})[/]",
+        border_style="cyan",
+        padding=(0, 1),
+    )
+
+    # ── Patches summary panel ──
+    patch_ok = sum(1 for p in patches if p.get("success"))
+    patch_fail = sum(1 for p in patches if not p.get("success"))
+    reg_status = {"applied": 0, "verified": 0, "failed": 0, "user_rejected": 0}
+    for r in patch_registry:
+        st = r.get("status", "unknown")
+        reg_status[st] = reg_status.get(st, 0) + 1
+
+    patch_lines = []
+    if patches:
+        patch_lines.append(f"  [green]✅ {patch_ok} applied[/]  [red]❌ {patch_fail} failed[/]")
+    if reg_status.get("verified"):
+        patch_lines.append(f"  [bold green]✔️  {reg_status['verified']} verified[/]")
+    if reg_status.get("user_rejected"):
+        patch_lines.append(f"  [yellow]🔄 {reg_status['user_rejected']} user rejected[/]")
+    if not patch_lines:
+        patch_lines.append("  [dim]No patches yet[/]")
+
+    patches_panel = Panel(
+        "\n".join(patch_lines),
+        title=f"[bold]🔧 Patches ({len(patches)})[/]",
+        border_style="green",
+        padding=(0, 1),
+    )
+
+    # ── Progress panel ──
+    progress_lines = []
+    if task_plan:
+        done = sum(1 for t in task_plan if t.get("status") == "done")
+        total = len(task_plan)
+        bar_w = 20
+        filled = int(done / max(total, 1) * bar_w)
+        bar = f"[green]{'█' * filled}[/][dim]{'░' * (bar_w - filled)}[/]"
+        progress_lines.append(f"  Plan: [{bar}] {done}/{total}")
+    if scratchpad:
+        progress_lines.append(f"  Scratchpad: {len(scratchpad)} entries")
+    if target_pkgs:
+        progress_lines.append(f"  Scope: {', '.join(target_pkgs[:3])}")
+    if graph_ready:
+        progress_lines.append("  Code Graph: [green]● loaded[/]")
+    if not progress_lines:
+        progress_lines.append("  [dim]No progress data yet[/]")
+
+    progress_panel = Panel(
+        "\n".join(progress_lines),
+        title="[bold]📊 Progress[/]",
+        border_style="yellow",
+        padding=(0, 1),
+    )
+
+    # ── Context panel ──
+    tt = token_tracker
+    ctx_lines = []
+    if tt.total_tokens:
+        ctx_lines.append(f"  Tokens: {tt.total_tokens:,}  ({tt.total_calls} calls)")
+    try:
+        from apk_agent.agent.graph import _compactor
+        if _compactor and _compactor.last_token_count > 0:
+            ctx_pct = (_compactor.last_token_count / _compactor.token_threshold) * 100
+            bar_w = 20
+            filled = int(ctx_pct / 100 * bar_w)
+            color = "green" if ctx_pct < 60 else ("yellow" if ctx_pct < 85 else "red")
+            bar = f"[{color}]{'━' * filled}[/{color}][dim]{'━' * (bar_w - filled)}[/dim]"
+            ctx_lines.append(f"  Context: [{bar}] [{color}]{ctx_pct:.0f}%[/{color}]")
+            ctx_lines.append(f"  Compactions: {_compactor.compact_count}")
+    except Exception:
+        pass
+    if tt.total_cached_tokens > 0:
+        cache_pct = (tt.total_cached_tokens / max(tt.total_prompt_tokens, 1)) * 100
+        ctx_lines.append(f"  Cache hit: [green]⚡ {cache_pct:.0f}%[/green]")
+    if not ctx_lines:
+        ctx_lines.append("  [dim]No data yet[/]")
+
+    context_panel = Panel(
+        "\n".join(ctx_lines),
+        title="[bold]🪙 Context[/]",
+        border_style="magenta",
+        padding=(0, 1),
+    )
+
+    # Layout: 2x2 grid
+    console.print(Columns([findings_panel, patches_panel], equal=True, expand=True))
+    console.print(Columns([progress_panel, context_panel], equal=True, expand=True))
+
+
+def print_findings_list(findings: list[dict]) -> None:
+    """Print all findings with severity highlighting in a rich table."""
+    if not findings:
+        console.print("[dim]No findings recorded yet.[/]")
+        return
+
+    colors = {"CRITICAL": "bold red", "HIGH": "red", "MEDIUM": "yellow", "LOW": "blue", "INFO": "dim"}
+    icons = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵", "INFO": "ℹ️ "}
+
+    table = Table(
+        title=f"🔍 Findings ({len(findings)})",
+        show_header=True,
+        header_style="bold cyan",
+        border_style="dim",
+        padding=(0, 1),
+        expand=True,
+    )
+    table.add_column("#", style="bold", width=4, justify="center")
+    table.add_column("Sev", width=10)
+    table.add_column("Category", width=16)
+    table.add_column("Title", min_width=30)
+    table.add_column("Location", style="dim", width=30)
+
+    for i, f in enumerate(findings, 1):
+        sev = (f.get("severity") or "INFO").upper()
+        icon = icons.get(sev, "ℹ️ ")
+        color = colors.get(sev, "dim")
+        category = f.get("category", "—")
+        title = f.get("title", "Finding")
+        location = f.get("location", "")
+        if len(title) > 50:
+            title = title[:47] + "..."
+        if len(location) > 30:
+            location = "…" + location[-28:]
+        table.add_row(
+            str(i),
+            f"[{color}]{icon} {sev}[/{color}]",
+            category,
+            title,
+            location,
+        )
+
+    console.print(table)
+
+    # Severity summary
+    sev_summary = {}
+    for f in findings:
+        sev = (f.get("severity") or "INFO").upper()
+        sev_summary[sev] = sev_summary.get(sev, 0) + 1
+    parts = []
+    for sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"):
+        if sev_summary.get(sev, 0) > 0:
+            color = colors.get(sev, "dim")
+            parts.append(f"[{color}]{sev}: {sev_summary[sev]}[/{color}]")
+    if parts:
+        console.print(f"  {' │ '.join(parts)}")
+
+
+def print_patches_list(patches: list[dict], registry: list[dict] | None = None) -> None:
+    """Print all patches with status in a rich table."""
+    if not patches and not registry:
+        console.print("[dim]No patches applied yet.[/]")
+        return
+
+    table = Table(
+        title=f"🔧 Patches ({len(patches)})",
+        show_header=True,
+        header_style="bold cyan",
+        border_style="dim",
+        padding=(0, 1),
+        expand=True,
+    )
+    table.add_column("#", style="bold", width=4, justify="center")
+    table.add_column("Status", width=12)
+    table.add_column("Tool", width=18)
+    table.add_column("Target", min_width=30)
+    table.add_column("Steps", width=8, justify="center")
+
+    status_icons = {
+        True: "[green]✅ OK[/]",
+        False: "[red]❌ FAIL[/]",
+    }
+
+    for i, p in enumerate(patches, 1):
+        success = p.get("success", False)
+        status = status_icons.get(success, "[dim]?[/]")
+        tool_name = p.get("tool", "—")
+        target = p.get("target_file", "—")
+        if len(target) > 35:
+            target = "…" + target[-33:]
+        steps = f"{p.get('steps_applied', 0)}/{p.get('steps_total', 0)}"
+        table.add_row(str(i), status, tool_name, target, steps)
+
+    console.print(table)
+
+    # Coverage from registry
+    if registry:
+        ok = sum(1 for r in registry if r.get("status") in ("applied", "verified"))
+        failed = sum(1 for r in registry if r.get("status") == "failed")
+        rejected = sum(1 for r in registry if r.get("status") == "user_rejected")
+        total = len(registry)
+        coverage = (ok / max(total, 1)) * 100
+        color = "green" if coverage >= 80 else ("yellow" if coverage >= 50 else "red")
+        console.print(
+            f"  Registry: {total} entries │ "
+            f"[green]{ok} applied[/] │ [red]{failed} failed[/] │ [yellow]{rejected} rejected[/] │ "
+            f"Coverage: [{color}]{coverage:.0f}%[/{color}]"
+        )
+
+
+def print_tools_list() -> None:
+    """Print all tools grouped by category in a compact display."""
+    try:
+        from apk_agent.agent.tools_def import ALL_TOOLS
+    except Exception:
+        console.print("[dim]Could not load tools.[/]")
+        return
+
+    categories = {
+        "Decompilation & Build": [],
+        "Manifest & Components": [],
+        "Smali Analysis": [],
+        "Graph & Index": [],
+        "Search & Discovery": [],
+        "Security & Scanning": [],
+        "Premium Bypass": [],
+        "Deep Tracing & Injection": [],
+        "SOTA Analysis": [],
+        "File & Evidence": [],
+        "Patching": [],
+    }
+
+    # Categorize tools by name patterns
+    for t in ALL_TOOLS:
+        name = t.name
+        if name in ("apktool_decompile", "jadx_decompile", "dex2jar_convert", "apktool_build", "zipalign_apk_tool", "sign_apk", "aapt2_dump"):
+            categories["Decompilation & Build"].append(name)
+        elif name in ("parse_manifest", "identify_app_packages", "analyze_attack_surface", "analyze_network_config", "analyze_native_libs", "analyze_manifest_deep", "score_permissions", "analyze_certificate"):
+            categories["Manifest & Components"].append(name)
+        elif name in ("scan_smali_classes", "analyze_smali_class", "find_string_decryption_patterns", "find_method_xrefs", "analyze_method_deep", "detect_protections", "trace_call_chain", "reconstruct_strings"):
+            categories["Smali Analysis"].append(name)
+        elif "graph_" in name or "index_" in name or name in ("build_graph_and_index", "build_smali_index", "smali_index_stats"):
+            categories["Graph & Index"].append(name)
+        elif name in ("context_search", "multi_search", "xref_search", "directory_overview", "refine_search", "batch_read_smali_methods", "smart_search", "extract_strings", "search_in_code", "search_interceptors", "search_native_code", "search_dynamic_loaders"):
+            categories["Search & Discovery"].append(name)
+        elif name in ("scan_vulnerabilities", "list_vuln_patterns", "unified_scan", "analyze_data_flow", "run_taint_analysis", "find_hardcoded_crypto", "scan_cloud_secrets"):
+            categories["Security & Scanning"].append(name)
+        elif name in ("map_feature_checks", "analyze_subscription_model", "auto_patch_bypass", "patch_flutter_ssl", "inject_network_security_config", "patch_manifest_security", "remove_ads", "list_bypass_categories", "generate_bypass_plans"):
+            categories["Premium Bypass"].append(name)
+        elif name in ("trace_field_access", "find_class_instantiations", "inject_smali_code", "generate_constructor_override", "inject_startup_hook", "batch_patch_methods", "trace_data_pipeline", "map_ui_gates", "patch_shared_prefs_reads", "identify_server_checks"):
+            categories["Deep Tracing & Injection"].append(name)
+        elif name in ("cross_reference_map", "deobfuscate_names", "find_dynamic_checks", "extract_all_urls", "verify_bypass_completeness"):
+            categories["SOTA Analysis"].append(name)
+        elif name in ("read_file", "write_file", "list_files", "save_evidence", "load_evidence", "search_evidence", "get_evidence_summary", "generate_report"):
+            categories["File & Evidence"].append(name)
+        elif name in ("apply_smali_patch", "preview_smali_patch", "restore_smali_backup"):
+            categories["Patching"].append(name)
+        else:
+            # Default to SOTA
+            categories["SOTA Analysis"].append(name)
+
+    cat_icons = {
+        "Decompilation & Build": "🔨",
+        "Manifest & Components": "📋",
+        "Smali Analysis": "🔬",
+        "Graph & Index": "🕸️ ",
+        "Search & Discovery": "🔍",
+        "Security & Scanning": "🛡️ ",
+        "Premium Bypass": "🔓",
+        "Deep Tracing & Injection": "💉",
+        "SOTA Analysis": "🚀",
+        "File & Evidence": "📁",
+        "Patching": "🩹",
+    }
+
+    total = len(ALL_TOOLS)
+    console.print(f"\n[bold bright_cyan]🧰 APK Agent Tools — {total} total[/]\n")
+
+    for cat_name, tools in categories.items():
+        if not tools:
+            continue
+        icon = cat_icons.get(cat_name, "📦")
+        tools_str = ", ".join(f"[cyan]{t}[/]" for t in tools)
+        console.print(f"  {icon} [bold]{cat_name}[/] [dim]({len(tools)})[/]")
+        console.print(f"     {tools_str}")
+        console.print()
 

@@ -29,20 +29,24 @@ from apk_agent.ui import (
     console,
     live_bar,
     print_ai_message,
+    print_dashboard,
     print_error,
+    print_findings_list,
     print_help,
     print_hitl_prompt,
     print_info,
+    print_patches_list,
     print_success,
     print_status,
+    print_status_bar,
     print_tool_output,
     print_tool_start,
+    print_tools_list,
+    print_turn_summary,
     print_user_message,
     print_warning,
     print_welcome,
     enable_live_progress,
-    print_status_bar,
-    print_turn_summary,
     token_tracker,
 )
 from apk_agent.workspace import Project, ProjectManager
@@ -67,15 +71,25 @@ def _setup_logging(verbose: bool = False) -> None:
 
 def _print_startup() -> None:
     """Print the full-screen startup banner with gradient style."""
+    # Get actual tool count
+    try:
+        from apk_agent.agent.tools_def import ALL_TOOLS
+        tool_count = len(ALL_TOOLS)
+    except Exception:
+        tool_count = 90
+
     console.print()
-    console.print("[bold bright_cyan]╔══════════════════════════════════════════════════════════╗[/]")
-    console.print("[bold bright_cyan]║[/]                                                          [bold bright_cyan]║[/]")
-    console.print("[bold bright_cyan]║[/]   [bold white]🔬  A P K   A G E N T[/]   [dim]v4.0[/]                         [bold bright_cyan]║[/]")
-    console.print("[bold bright_cyan]║[/]   [bold bright_white]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/]                     [bold bright_cyan]║[/]")
-    console.print("[bold bright_cyan]║[/]   [dim italic]AI-Powered Android APK Reverse Engineering[/]          [bold bright_cyan]║[/]")
-    console.print("[bold bright_cyan]║[/]   [dim]72 Tools • Taint Analysis • Auto-Bypass • Patching[/] [bold bright_cyan]║[/]")
-    console.print("[bold bright_cyan]║[/]                                                          [bold bright_cyan]║[/]")
-    console.print("[bold bright_cyan]╚══════════════════════════════════════════════════════════╝[/]")
+    console.print("[bold bright_cyan]╔══════════════════════════════════════════════════════════════════╗[/]")
+    console.print("[bold bright_cyan]║[/]                                                                  [bold bright_cyan]║[/]")
+    console.print("[bold bright_cyan]║[/]   [bold bright_white]█▀▀█ █▀▀█ █ █   █▀▀█ █▀▀▀ █▀▀▀ █▄  █ ▀▀█▀▀[/]                [bold bright_cyan]║[/]")
+    console.print("[bold bright_cyan]║[/]   [bold bright_white]█▄▄█ █▄▄█ █▀▄   █▄▄█ █ ▀█ █▀▀▀ █ █ █   █[/]                  [bold bright_cyan]║[/]")
+    console.print("[bold bright_cyan]║[/]   [bold bright_white]█  █ █    █ █   █  █ █▄▄█ █▄▄▄ █  ▀█   █[/]   [dim]v5.0[/]          [bold bright_cyan]║[/]")
+    console.print("[bold bright_cyan]║[/]                                                                  [bold bright_cyan]║[/]")
+    console.print(f"[bold bright_cyan]║[/]   [dim italic]AI-Powered Android APK Reverse Engineering & Patching[/]        [bold bright_cyan]║[/]")
+    console.print(f"[bold bright_cyan]║[/]   [bold green]{tool_count}[/] [dim]Tools[/] [dim]•[/] [bold yellow]Taint Analysis[/] [dim]•[/] [bold magenta]Auto-Bypass[/] [dim]•[/] [bold cyan]Code Graph[/]     [bold bright_cyan]║[/]")
+    console.print("[bold bright_cyan]║[/]   [dim]SmaliIndex IR • Deobfuscation • Deep Injection • Verification[/]   [bold bright_cyan]║[/]")
+    console.print("[bold bright_cyan]║[/]                                                                  [bold bright_cyan]║[/]")
+    console.print("[bold bright_cyan]╚══════════════════════════════════════════════════════════════════╝[/]")
     console.print()
 
 
@@ -615,7 +629,7 @@ def _chat_loop(
 
         # Handle commands
         if user_input.startswith("/"):
-            result = _handle_command(user_input, project, pm, config, session_meta)
+            result = _handle_command(user_input, project, pm, config, session_meta, graph, graph_config)
             if result == "quit":
                 # Save session on quit
                 session_meta.status = "active"
@@ -680,6 +694,7 @@ def _chat_loop(
 def _handle_command(
     cmd: str, project: Project, pm: ProjectManager,
     config: AppConfig, session_meta: SessionMeta,
+    graph=None, graph_config: dict | None = None,
 ) -> str | None:
     """Handle / commands. Returns 'quit' to exit, mode changes, or None."""
     parts = cmd.split(maxsplit=1)
@@ -689,6 +704,14 @@ def _handle_command(
     match command:
         case "/help":
             print_help()
+        case "/dashboard":
+            _show_dashboard(graph, graph_config)
+        case "/findings":
+            _show_findings(graph, graph_config)
+        case "/patches":
+            _show_patches(graph, graph_config)
+        case "/tools":
+            print_tools_list()
         case "/status":
             print_status(project.id, project.apk_name, project.status)
         case "/session":
@@ -1098,6 +1121,50 @@ def _show_token_count() -> None:
         pass
 
     console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# Dashboard / Findings / Patches helpers
+# ---------------------------------------------------------------------------
+
+def _get_agent_state(graph, graph_config) -> dict | None:
+    """Safely retrieve the current agent state from the graph checkpoint."""
+    if not graph or not graph_config:
+        return None
+    try:
+        ckpt = graph.get_state(graph_config)
+        if ckpt and ckpt.values:
+            return ckpt.values
+    except Exception:
+        pass
+    return None
+
+
+def _show_dashboard(graph, graph_config) -> None:
+    """Show the full dashboard."""
+    state = _get_agent_state(graph, graph_config)
+    print_dashboard(state)
+
+
+def _show_findings(graph, graph_config) -> None:
+    """Show all findings."""
+    state = _get_agent_state(graph, graph_config)
+    if not state:
+        print_info("No state available. Run an analysis first.")
+        return
+    findings = state.get("findings") or []
+    print_findings_list(findings)
+
+
+def _show_patches(graph, graph_config) -> None:
+    """Show all patches."""
+    state = _get_agent_state(graph, graph_config)
+    if not state:
+        print_info("No state available. Run a patching task first.")
+        return
+    patches = state.get("patch_results") or []
+    registry = state.get("patch_registry") or []
+    print_patches_list(patches, registry)
 
 
 # ---------------------------------------------------------------------------

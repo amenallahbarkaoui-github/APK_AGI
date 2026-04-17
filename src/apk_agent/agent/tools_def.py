@@ -913,6 +913,34 @@ def read_file(file_path: str, start_line: int = 0, end_line: int = 0) -> str:
                 p = c
                 break
 
+    # If still not found, search for the filename in jadx and smali dirs
+    if not p.is_file():
+        fname = Path(file_path.replace("\\", "/")).name
+        nearby: list[str] = []
+        # Search jadx sources
+        jadx_sources = _project.jadx_dir / "sources"
+        if jadx_sources.is_dir():
+            for hit in jadx_sources.rglob(fname):
+                nearby.append(str(hit))
+                if len(nearby) >= 5:
+                    break
+        # Search smali dirs for .smali equivalent
+        if fname.endswith(".java"):
+            smali_name = fname.replace(".java", ".smali")
+            for sd in _get_all_smali_dirs():
+                for hit in sd.rglob(smali_name):
+                    nearby.append(str(hit))
+                    if len(nearby) >= 8:
+                        break
+        if nearby:
+            return json.dumps({
+                "success": False,
+                "error": f"File not found: {file_path}",
+                "similar_files_found": nearby,
+                "hint": "The exact path doesn't exist. Try one of the similar files above, "
+                        "or read the .smali version instead.",
+            }, ensure_ascii=False, indent=2)
+
     result = _read(p, start_line=start_line, end_line=end_line)
     return json.dumps(result, ensure_ascii=False, indent=2)[:12000]
 
@@ -920,7 +948,11 @@ def read_file(file_path: str, start_line: int = 0, end_line: int = 0) -> str:
 @tool
 def write_file(file_path: str, content: str) -> str:
     """Write or overwrite a file in the decompiled project.
-    Use this for direct smali edits, adding new files, or modifying XML configs.
+    Use this for XML configs, new resource files, or small non-smali edits.
+
+    ⚠️  DO NOT use this to rewrite entire .smali files — use apply_smali_patch
+    or inject_smali_code instead. If you must write a .smali file, validity
+    checks will be enforced automatically.
 
     When to use: For small direct edits to specific files. For structured smali patches
     with backup/diff tracking, use apply_smali_patch instead.
@@ -932,9 +964,62 @@ def write_file(file_path: str, content: str) -> str:
     Returns: JSON with keys: success (bool), path (absolute path written),
     bytes_written (int).
     """
+    import re as _re
+
     p = Path(file_path)
     if not p.is_absolute():
         p = Path(_project.workspace_path) / file_path
+
+    # --- Smali validation guard ------------------------------------------
+    if p.suffix == ".smali":
+        # 1. Must have a .class directive
+        if not _re.search(r'^\s*\.class\s+', content, _re.MULTILINE):
+            return json.dumps({"success": False,
+                "error": "BLOCKED: .smali file has no .class directive — content is corrupt. "
+                         "Use apply_smali_patch or inject_smali_code instead of write_file."})
+
+        # 2. Detect broken class descriptors: bare Package/Name; without L prefix
+        #    Valid: Lcom/app/Foo;  Invalid: com/app/Foo; (missing L)
+        #    Look for references like ", IF0/y;" or "->field:IF0/y;" where L is missing
+        broken_refs = _re.findall(
+            r'(?<![L\w/])([A-Za-z]\w*/\w[^\s;]*;)', content
+        )
+        # Filter: only flag if it looks like a class descriptor (has / and ends with ;)
+        # but doesn't start with L and isn't a known type prefix
+        real_broken = []
+        for ref in broken_refs:
+            # Skip if it starts with a known type like Ljava, or is just a path
+            if ref.startswith("L") or ref.startswith("["):
+                continue
+            # Must look like Package/Name; pattern (at least one /)
+            if "/" in ref and ref.endswith(";"):
+                real_broken.append(ref)
+        if real_broken:
+            examples = ", ".join(real_broken[:5])
+            return json.dumps({"success": False,
+                "error": f"BLOCKED: .smali file has broken class descriptors missing 'L' prefix: "
+                         f"{examples}. This would corrupt the APK. "
+                         f"Use apply_smali_patch or inject_smali_code instead of write_file."})
+
+        # 3. .method / .end method must be balanced
+        opens = len(_re.findall(r'^\s*\.method\s+', content, _re.MULTILINE))
+        closes = len(_re.findall(r'^\s*\.end\s+method', content, _re.MULTILINE))
+        if opens != closes:
+            return json.dumps({"success": False,
+                "error": f"BLOCKED: .smali file has unbalanced method blocks "
+                         f"({opens} .method vs {closes} .end method). "
+                         f"Use apply_smali_patch or inject_smali_code instead of write_file."})
+
+        # 4. Auto-backup before overwriting existing smali
+        if p.is_file():
+            bak = p.with_suffix(".smali.bak")
+            if not bak.exists():
+                try:
+                    import shutil
+                    shutil.copy2(p, bak)
+                except OSError:
+                    pass
+
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
@@ -2051,9 +2136,35 @@ def inject_smali_code(
     Returns: JSON with success, file, method, position, injected_at_line, lines_injected.
     """
     from apk_agent.tools.code_injector import inject_code_in_method
+    import re as _re
 
     def _run():
+        # --- Validate injected smali code BEFORE touching the file -----------
+        # Check for broken class descriptors (missing L prefix)
+        # Valid: Lcom/app/Foo;  Invalid: com/app/Foo; (missing L)
+        broken = _re.findall(
+            r'(?<![L\w/\[])([A-Za-z]\w*/\w[^\s,;)]*;)', smali_code
+        )
+        real_broken = [r for r in broken if "/" in r and r.endswith(";")
+                       and not r.startswith("L") and not r.startswith("[")]
+        if real_broken:
+            examples = ", ".join(real_broken[:5])
+            return json.dumps({"success": False,
+                "error": f"BLOCKED: injected smali code has broken class descriptors "
+                         f"missing 'L' prefix: {examples}. "
+                         f"Fix class references to use L-prefix format (e.g. Lcom/app/Foo;)."})
+
+        # Auto-backup the target file
         fpath = str(_resolve_file(smali_file))
+        fp = Path(fpath)
+        bak = fp.with_suffix(".smali.bak")
+        if fp.is_file() and not bak.exists():
+            try:
+                import shutil
+                shutil.copy2(fp, bak)
+            except OSError:
+                pass
+
         result = inject_code_in_method(fpath, method_name, smali_code, position)
         return json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -2149,8 +2260,6 @@ def inject_startup_hook(smali_code: str) -> str:
                 "entry_info": entry,
             }, ensure_ascii=False, indent=2)
 
-        # For Application.onCreate → inject after super.onCreate
-        # For Activity.onCreate → inject after super.onCreate
         pos = "after_super"
         result = inject_code_in_method(smali_path, "onCreate", smali_code, pos)
         result["entry_type"] = entry_type
@@ -2158,6 +2267,1478 @@ def inject_startup_hook(smali_code: str) -> str:
         return json.dumps(result, ensure_ascii=False, indent=2)
 
     return _safe_call(_run, "inject_startup_hook")
+
+
+# ---------------------------------------------------------------------------
+# Bulk patching + Data-flow tracing + UI gate mapping
+# ---------------------------------------------------------------------------
+
+
+@tool
+def batch_patch_methods(patches_json: str) -> str:
+    """Patch MULTIPLE methods at once — each with a different forced return value.
+
+    Instead of calling apply_smali_patch 6+ times sequentially, call this ONCE
+    with a list of methods and their desired return values. It:
+    1. Groups patches by file (reads each file only once)
+    2. Applies all patches in a single pass
+    3. Creates backups and diffs for each file
+    4. Returns a summary of successes and failures
+
+    This is the PREFERRED tool for premium bypass — after you've analyzed the
+    entity class and know which methods to patch and what values to use.
+
+    Args:
+        patches_json: JSON string with an array of patch specifications:
+            [
+                {"file": "smali_classes3/com/app/UserInfo.smali",
+                 "method": "a()Z", "return_type": "boolean", "value": false,
+                 "description": "isExpired → always false"},
+                {"file": "smali_classes3/com/app/UserInfo.smali",
+                 "method": "b()Z", "return_type": "boolean", "value": true,
+                 "description": "isPremium → always true"},
+                {"file": "smali_classes3/com/app/UserInfo.smali",
+                 "method": "c()I", "return_type": "int", "value": 2,
+                 "description": "getType → premium tier"},
+                {"file": "smali_classes3/com/app/Dialog.smali",
+                 "method": "show()V", "return_type": "void",
+                 "description": "suppress upgrade dialog"}
+            ]
+            return_type: "boolean", "int", "void", "long"
+            value: the value to return (ignored for void)
+
+    Returns: JSON with total, succeeded, failed, and details per patch.
+    """
+    import re as _re
+    import shutil
+
+    def _run():
+        patches = json.loads(patches_json)
+        if not isinstance(patches, list) or not patches:
+            return json.dumps({"success": False, "error": "patches_json must be a non-empty array"})
+
+        # Group by file
+        by_file: dict[str, list] = {}
+        for p in patches:
+            fkey = p.get("file", "")
+            by_file.setdefault(fkey, []).append(p)
+
+        results = []
+        total_ok = 0
+        total_fail = 0
+
+        for file_rel, file_patches in by_file.items():
+            fpath = _resolve_file(file_rel)
+            if not fpath.is_file():
+                for p in file_patches:
+                    results.append({"method": p.get("method"), "file": file_rel,
+                                    "success": False, "error": "File not found"})
+                    total_fail += 1
+                continue
+
+            # Backup
+            backup = _project.patch_backup_dir / fpath.name
+            _project.patch_backup_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(fpath, backup)
+
+            text = fpath.read_text(encoding="utf-8", errors="replace")
+            lines = text.splitlines()
+
+            for p in file_patches:
+                method_q = p.get("method", "")
+                ret_type = p.get("return_type", "boolean")
+                value = p.get("value")
+                desc = p.get("description", "")
+
+                # Find the method
+                def _match(header, q, _re=_re):
+                    m = _re.search(r'(\S+)\(', header)
+                    if not m:
+                        return False
+                    name = m.group(1)
+                    if '(' in q:
+                        sig = header[header.index(name):]
+                        return q in sig
+                    return name == q
+
+                m_start = -1
+                m_end = -1
+                for i, ln in enumerate(lines):
+                    s = ln.strip()
+                    if s.startswith(".method") and _match(s, method_q):
+                        m_start = i
+                    if m_start >= 0 and s == ".end method":
+                        m_end = i
+                        break
+
+                if m_start < 0:
+                    results.append({"method": method_q, "file": file_rel,
+                                    "success": False, "error": f"Method not found: {method_q}"})
+                    total_fail += 1
+                    continue
+
+                # Build replacement instructions
+                if ret_type == "void":
+                    inject = "    return-void"
+                elif ret_type == "boolean":
+                    v = "0x1" if value else "0x0"
+                    inject = f"    const/4 v0, {v}\n\n    return v0"
+                elif ret_type == "int":
+                    iv = int(value)
+                    if -8 <= iv <= 7:
+                        inject = f"    const/4 v0, {hex(iv)}\n\n    return v0"
+                    elif -32768 <= iv <= 32767:
+                        inject = f"    const/16 v0, {hex(iv)}\n\n    return v0"
+                    else:
+                        inject = f"    const v0, {hex(iv)}\n\n    return v0"
+                elif ret_type == "long":
+                    inject = f"    const-wide v0, {hex(int(value))}\n\n    return-wide v0"
+                else:
+                    inject = "    const/4 v0, 0x0\n\n    return v0"
+
+                # Find .locals or .registers line
+                locals_line = -1
+                for i in range(m_start + 1, min(m_start + 15, m_end)):
+                    if _re.match(r'\s*\.(locals|registers)\s+\d+', lines[i]):
+                        locals_line = i
+                        break
+
+                if locals_line < 0:
+                    results.append({"method": method_q, "file": file_rel,
+                                    "success": False, "error": "No .locals/.registers found"})
+                    total_fail += 1
+                    continue
+
+                # Replace everything between locals_line+1 and m_end with our injection
+                new_body = [lines[i] for i in range(m_start, locals_line + 1)]
+                new_body.append("")
+                new_body.append(f"    # APK-AGI batch patch: {desc}")
+                new_body.append(inject)
+                new_body.append("")
+                new_body.append(".end method")
+
+                # Replace in lines
+                lines[m_start:m_end + 1] = new_body
+
+                results.append({"method": method_q, "file": file_rel,
+                                "success": True, "description": desc})
+                total_ok += 1
+
+                # Record to patch journal
+                _patch_journal.append({
+                    "success": True, "target_file": file_rel,
+                    "description": desc, "steps_applied": 1, "steps_total": 1,
+                    "diff_text": f"Forced {method_q} -> {ret_type}({value})",
+                    "errors": [], "tool": "batch_patch_methods",
+                })
+
+            # Write once per file
+            fpath.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        return json.dumps({
+            "success": total_fail == 0,
+            "total": len(patches),
+            "succeeded": total_ok,
+            "failed": total_fail,
+            "results": results,
+        }, ensure_ascii=False, indent=2)
+
+    return _safe_call(_run, "batch_patch_methods")
+
+
+@tool
+def trace_data_pipeline(class_descriptor: str) -> str:
+    """Trace the FULL lifecycle of an entity class through the app.
+
+    Combines multiple analyses into a single comprehensive view:
+    1. Where the class is INSTANTIATED (new-instance, deserialization, check-cast)
+    2. Where each FIELD is read/written (iget/iput across entire codebase)
+    3. Where the class appears as METHOD PARAMETERS or RETURN TYPES
+    4. Which classes HOLD REFERENCES to it (field declarations)
+
+    Returns a complete data-flow map showing how entity data flows from
+    creation (API response / JSON parse) -> storage -> consumption (UI / logic).
+
+    Use this to understand the full premium state pipeline and find every
+    point where data needs to be patched.
+
+    Args:
+        class_descriptor: Smali class descriptor, e.g. 'Lcom/app/entity/UserInfo;'
+
+    Returns: JSON with sections: instantiation_points, field_flow (per field
+    with read/write counts and locations), reference_holders, and analysis_hint.
+    """
+    import re as _re
+
+    def _run():
+        escaped = _re.escape(class_descriptor)
+
+        # 1. Parse the entity class itself to learn its fields
+        fields: list[dict] = []
+        entity_file = None
+        for smali_dir in _get_all_smali_dirs():
+            cls_path = class_descriptor.strip("L;").replace("/", "/") + ".smali"
+            candidate = smali_dir / cls_path
+            if candidate.is_file():
+                entity_file = candidate
+                text = candidate.read_text(encoding="utf-8", errors="replace")
+                for line in text.splitlines():
+                    m = _re.match(r'\.field\s+(.+?)\s+([\w$]+):(\S+)', line.strip())
+                    if m:
+                        fields.append({
+                            "access": m.group(1),
+                            "name": m.group(2),
+                            "type": m.group(3),
+                        })
+                break
+
+        if not entity_file:
+            return json.dumps({"success": False,
+                               "error": f"Entity class file not found for {class_descriptor}"})
+
+        # 2. Scan codebase for instantiations, field access, references
+        instantiations = []
+        field_reads: dict[str, list] = {f["name"]: [] for f in fields}
+        field_writes: dict[str, list] = {f["name"]: [] for f in fields}
+        reference_holders = []
+
+        inst_pats = [
+            (_re.compile(rf'new-instance\s+\w+,\s*{escaped}'), "new-instance"),
+            (_re.compile(rf'invoke-direct\s+.*{escaped}-><init>'), "constructor-call"),
+            (_re.compile(rf'check-cast\s+\w+,\s*{escaped}'), "deserialization"),
+        ]
+        field_pat = _re.compile(
+            rf'((?:iget|iput|sget|sput)[\w-]*)\s+.*{escaped}->([\w$]+):'
+        )
+        ref_pat = _re.compile(rf'\.field\s+.*:{escaped}')
+
+        for smali_dir in _get_all_smali_dirs():
+            for smali_file in smali_dir.rglob("*.smali"):
+                rel = str(smali_file.relative_to(smali_dir)).replace("\\", "/")
+                if any(rel.startswith(p) for p in (
+                    "android/", "androidx/", "com/google/", "kotlin/",
+                    "kotlinx/", "io/reactivex/", "okhttp3/", "retrofit2/",
+                    "com/squareup/", "org/", "io/netty/",
+                )):
+                    continue
+
+                try:
+                    text = smali_file.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+
+                file_lines = text.splitlines()
+                current_method = "(class-level)"
+
+                for i, line in enumerate(file_lines):
+                    s = line.strip()
+                    if s.startswith(".method"):
+                        current_method = s[:80]
+                    elif s == ".end method":
+                        current_method = "(class-level)"
+
+                    # (a) instantiations
+                    for pat, ptype in inst_pats:
+                        if pat.search(s):
+                            instantiations.append({
+                                "file": rel, "line": i + 1, "type": ptype,
+                                "method": current_method,
+                            })
+                            break
+
+                    # (b) field access
+                    fm = field_pat.search(s)
+                    if fm:
+                        op = fm.group(1)
+                        fname = fm.group(2)
+                        is_write = op.startswith(("iput", "sput"))
+                        entry = {"file": rel, "line": i + 1,
+                                 "method": current_method, "op": op}
+                        if is_write and fname in field_writes:
+                            field_writes[fname].append(entry)
+                        elif fname in field_reads:
+                            field_reads[fname].append(entry)
+
+                    # (c) reference holders
+                    if s.startswith(".field") and class_descriptor in s:
+                        if ref_pat.match(s):
+                            reference_holders.append({
+                                "file": rel, "field_decl": s[:100],
+                            })
+
+        # Build field summary
+        field_summary = []
+        for f in fields:
+            fn = f["name"]
+            field_summary.append({
+                "field": fn,
+                "type": f["type"],
+                "read_count": len(field_reads.get(fn, [])),
+                "write_count": len(field_writes.get(fn, [])),
+                "readers": [r["file"] + ":" + str(r["line"]) for r in field_reads.get(fn, [])[:10]],
+                "writers": [w["file"] + ":" + str(w["line"]) for w in field_writes.get(fn, [])[:10]],
+            })
+
+        return json.dumps({
+            "success": True,
+            "class": class_descriptor,
+            "entity_file": str(entity_file),
+            "total_fields": len(fields),
+            "total_instantiations": len(instantiations),
+            "total_reference_holders": len(reference_holders),
+            "instantiation_points": instantiations[:30],
+            "field_flow": field_summary,
+            "reference_holders": reference_holders[:20],
+            "analysis_hint": (
+                "Fields with write_count > 0 from external classes indicate data "
+                "being SET from API/deserialization. Override these with "
+                "generate_constructor_override. Fields with read_count > 0 from "
+                "external classes indicate direct field access bypassing getters."
+            ),
+        }, ensure_ascii=False, indent=2)[:15000]
+
+    return _safe_call(_run, "trace_data_pipeline",
+                      _cache_hint=class_descriptor)
+
+
+@tool
+def map_ui_gates(search_terms: str) -> str:
+    """Map UI elements to the code that controls them — find ALL premium UI gates.
+
+    Given search terms related to premium/upgrade UI, this tool:
+    1. Searches string resources (res/values/strings.xml) for matching text
+    2. Finds the resource IDs for those strings
+    3. Searches layouts (res/layout/) for views using those IDs
+    4. Traces from resource IDs to Java/smali code that references them
+    5. Returns a map: UI string -> resource ID -> layout file -> controlling code
+
+    This finds upgrade dialogs, paywall screens, locked feature overlays,
+    and premium-only buttons that need to be suppressed or bypassed.
+
+    Args:
+        search_terms: Comma-separated terms to search for in string resources and layouts.
+            e.g. 'upgrade,premium,pro,subscribe,unlock,purchase,vip'
+
+    Returns: JSON with ui_gates array: each with string_value, resource_id,
+    layout_files, code_references (smali files that use the ID).
+    """
+    import re as _re
+    import xml.etree.ElementTree as ET
+
+    def _run():
+        terms = [t.strip().lower() for t in search_terms.split(",") if t.strip()]
+        if not terms:
+            return json.dumps({"success": False, "error": "No search terms provided"})
+
+        apk_dir = _project.apktool_dir
+
+        # 1. Search string resources
+        string_matches: dict[str, str] = {}  # name -> value
+        for sf in sorted(apk_dir.glob("res/values*/strings.xml")):
+            try:
+                tree = ET.parse(str(sf))  # noqa: S314
+                for elem in tree.getroot():
+                    if elem.tag == "string" and elem.text:
+                        name = elem.get("name", "")
+                        val = elem.text.strip()
+                        if name not in string_matches and any(
+                            t in val.lower() or t in name.lower() for t in terms
+                        ):
+                            string_matches[name] = val
+            except ET.ParseError:
+                pass
+
+        # 2. Find resource IDs from public.xml
+        res_ids: dict[str, str] = {}  # name -> hex id
+        public_xml = apk_dir / "res" / "values" / "public.xml"
+        if public_xml.is_file():
+            try:
+                tree = ET.parse(str(public_xml))  # noqa: S314
+                for elem in tree.getroot():
+                    name = elem.get("name", "")
+                    if name in string_matches:
+                        res_ids[name] = elem.get("id", "")
+            except ET.ParseError:
+                pass
+
+        # 3. Search layouts for resource references
+        layout_refs: dict[str, list[str]] = {}
+        if (apk_dir / "res").is_dir():
+            for lf in (apk_dir / "res").rglob("*.xml"):
+                if "layout" not in lf.parent.name:
+                    continue
+                try:
+                    content = lf.read_text(encoding="utf-8", errors="replace").lower()
+                except OSError:
+                    continue
+                for rname in string_matches:
+                    if f"@string/{rname.lower()}" in content or rname.lower() in content:
+                        layout_refs.setdefault(rname, []).append(
+                            str(lf.relative_to(apk_dir)).replace("\\", "/")
+                        )
+
+        # 4. Search smali code for resource ID references and term strings
+        code_refs: dict[str, list[dict]] = {}
+        id_to_name = {v: k for k, v in res_ids.items()}
+        all_search = set()
+        for name in string_matches:
+            all_search.add(name)
+        for hex_id in id_to_name:
+            if hex_id:
+                all_search.add(hex_id)
+        for t in terms:
+            all_search.add(t)
+
+        if all_search:
+            combined = "|".join(_re.escape(p) for p in all_search if p)
+            if combined:
+                pat = _re.compile(combined, _re.IGNORECASE)
+                for smali_dir in _get_all_smali_dirs():
+                    for smali_file in smali_dir.rglob("*.smali"):
+                        rel = str(smali_file.relative_to(smali_dir)).replace("\\", "/")
+                        if any(rel.startswith(p) for p in (
+                            "android/", "androidx/", "com/google/", "kotlin/",
+                            "kotlinx/", "io/reactivex/", "okhttp3/",
+                        )):
+                            continue
+                        try:
+                            text = smali_file.read_text(encoding="utf-8", errors="replace")
+                        except OSError:
+                            continue
+                        current_method = ""
+                        for i, line in enumerate(text.splitlines()):
+                            s = line.strip()
+                            if s.startswith(".method"):
+                                current_method = s[:80]
+                            elif s == ".end method":
+                                current_method = ""
+                            if pat.search(s):
+                                matched_name = "unknown"
+                                for name in string_matches:
+                                    if name.lower() in s.lower():
+                                        matched_name = name
+                                        break
+                                if matched_name == "unknown":
+                                    for hex_id, name in id_to_name.items():
+                                        if hex_id in s:
+                                            matched_name = name
+                                            break
+                                if matched_name == "unknown":
+                                    for t in terms:
+                                        if t.lower() in s.lower():
+                                            matched_name = f"term:{t}"
+                                            break
+                                code_refs.setdefault(matched_name, []).append({
+                                    "file": rel, "line": i + 1,
+                                    "method": current_method,
+                                    "instruction": s[:100],
+                                })
+
+        # Build output
+        ui_gates = []
+        all_names = set(string_matches.keys()) | {
+            k for k in code_refs if k.startswith("term:")}
+        for name in sorted(all_names):
+            ui_gates.append({
+                "resource_name": name,
+                "string_value": string_matches.get(name, ""),
+                "resource_id": res_ids.get(name, ""),
+                "layout_files": layout_refs.get(name, []),
+                "code_references": code_refs.get(name, [])[:10],
+            })
+
+        return json.dumps({
+            "success": True,
+            "search_terms": terms,
+            "total_string_matches": len(string_matches),
+            "total_ui_gates": len(ui_gates),
+            "ui_gates": ui_gates[:30],
+            "hint": (
+                "For each code_reference, use analyze_method_deep to understand "
+                "the gating logic, then patch with batch_patch_methods to suppress."
+            ),
+        }, ensure_ascii=False, indent=2)[:15000]
+
+    return _safe_call(_run, "map_ui_gates", _cache_hint=search_terms)
+
+
+@tool
+def patch_shared_prefs_reads(
+    pref_key: str,
+    forced_value: str,
+    value_type: str = "boolean",
+) -> str:
+    """Find ALL SharedPreferences reads for a specific key and patch them to return a forced value.
+
+    Many apps store premium/license state in SharedPreferences. This tool:
+    1. Searches the entire codebase for getString/getBoolean/getInt calls
+       with the target key as a const-string argument
+    2. For each call site, patches the code to ignore the SharedPreferences read
+       and use the forced value instead
+    3. Reports all patch locations
+
+    This is more thorough than inject_startup_hook for prefs because it patches
+    EVERY read site individually.
+
+    Args:
+        pref_key: The SharedPreferences key to intercept, e.g. 'is_premium', 'sub_type'
+        forced_value: The value to force. For boolean: 'true'/'false'. For int: '1'.
+            For string: the literal string value.
+        value_type: Type of the preference: 'boolean', 'int', 'string', 'long', 'float'
+
+    Returns: JSON with total_sites_found, total_patched, details per patch site.
+    """
+    import re as _re
+    import shutil
+
+    def _run():
+        escaped_key = _re.escape(pref_key)
+        getter_map = {
+            "boolean": "getBoolean", "int": "getInt", "string": "getString",
+            "long": "getLong", "float": "getFloat",
+        }
+        getter_name = getter_map.get(value_type, "getBoolean")
+
+        sites_found = []
+        sites_patched = []
+
+        for smali_dir in _get_all_smali_dirs():
+            for smali_file in smali_dir.rglob("*.smali"):
+                rel = str(smali_file.relative_to(smali_dir)).replace("\\", "/")
+                if any(rel.startswith(p) for p in (
+                    "android/", "androidx/", "com/google/", "kotlin/",
+                    "kotlinx/", "io/reactivex/",
+                )):
+                    continue
+
+                try:
+                    text = smali_file.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+
+                if pref_key not in text:
+                    continue
+
+                lines = text.splitlines()
+                modified = False
+                current_method = ""
+
+                for i, line in enumerate(lines):
+                    s = line.strip()
+                    if s.startswith(".method"):
+                        current_method = s[:80]
+                    elif s == ".end method":
+                        current_method = ""
+
+                    km = _re.match(
+                        rf'const-string(?:/jumbo)?\s+(\w+),\s*"{escaped_key}"', s
+                    )
+                    if not km:
+                        continue
+
+                    sites_found.append({
+                        "file": rel, "line": i + 1, "method": current_method,
+                    })
+
+                    # Look ahead for the SharedPreferences getter call
+                    for j in range(i + 1, min(i + 20, len(lines))):
+                        sj = lines[j].strip()
+                        if ("invoke-" in sj and
+                                (getter_name in sj or "SharedPreferences" in sj)):
+                            for k in range(j + 1, min(j + 5, len(lines))):
+                                sk = lines[k].strip()
+                                mr = _re.match(r'move-result(?:-object|-wide)?\s+(\w+)', sk)
+                                if mr:
+                                    result_reg = mr.group(1)
+                                    if not modified:
+                                        _project.patch_backup_dir.mkdir(parents=True, exist_ok=True)
+                                        shutil.copy2(smali_file,
+                                                     _project.patch_backup_dir / smali_file.name)
+
+                                    if value_type == "boolean":
+                                        v = "0x1" if forced_value.lower() == "true" else "0x0"
+                                        lines[k] = f"    const/4 {result_reg}, {v}  # APK-AGI: forced {pref_key}={forced_value}"
+                                    elif value_type == "int":
+                                        iv = int(forced_value)
+                                        if -8 <= iv <= 7:
+                                            lines[k] = f"    const/4 {result_reg}, {hex(iv)}  # APK-AGI: forced {pref_key}"
+                                        else:
+                                            lines[k] = f"    const/16 {result_reg}, {hex(iv)}  # APK-AGI: forced {pref_key}"
+                                    elif value_type == "string":
+                                        lines[k] = f'    const-string {result_reg}, "{forced_value}"  # APK-AGI: forced {pref_key}'
+                                    elif value_type == "long":
+                                        lines[k] = f"    const-wide {result_reg}, {hex(int(forced_value))}  # APK-AGI: forced {pref_key}"
+
+                                    modified = True
+                                    sites_patched.append({
+                                        "file": rel, "line": k + 1,
+                                        "method": current_method,
+                                        "original": sk,
+                                    })
+                                    break
+                            break
+
+                if modified:
+                    smali_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                    _patch_journal.append({
+                        "success": True, "target_file": rel,
+                        "description": f"Forced SharedPrefs '{pref_key}'={forced_value}",
+                        "steps_applied": len([s for s in sites_patched if s["file"] == rel]),
+                        "steps_total": len([s for s in sites_found if s["file"] == rel]),
+                        "diff_text": f"SharedPrefs {pref_key} -> {forced_value} ({value_type})",
+                        "errors": [], "tool": "patch_shared_prefs_reads",
+                    })
+
+        return json.dumps({
+            "success": len(sites_patched) > 0,
+            "pref_key": pref_key,
+            "forced_value": forced_value,
+            "value_type": value_type,
+            "total_sites_found": len(sites_found),
+            "total_patched": len(sites_patched),
+            "sites_found": sites_found[:30],
+            "sites_patched": sites_patched[:30],
+        }, ensure_ascii=False, indent=2)[:15000]
+
+    return _safe_call(_run, "patch_shared_prefs_reads")
+
+
+@tool
+def identify_server_checks() -> str:
+    """Map ALL network/API calls that may enforce server-side premium validation.
+
+    Scans the codebase for:
+    1. HTTP client usage (OkHttp, Retrofit, HttpURLConnection, Volley, Ktor)
+    2. API endpoint URLs and paths (from const-string and annotations)
+    3. Response handling code that sets premium/license state
+    4. Server-side verification callbacks
+
+    Returns a map of network calls with their endpoints, response handlers,
+    and which entity fields they populate — showing WHERE server responses
+    flow into the premium state pipeline.
+
+    Returns: JSON with network_clients (detected HTTP libraries), api_endpoints
+    (URL strings found), response_handlers (code that processes API responses).
+    """
+    import re as _re
+
+    def _run():
+        http_patterns = {
+            "okhttp": _re.compile(r'Lokhttp3/|Lcom/squareup/okhttp/'),
+            "retrofit": _re.compile(r'Lretrofit2/|Lretrofit/'),
+            "httpurlconnection": _re.compile(r'Ljava/net/HttpURLConnection;|Ljava/net/URL;'),
+            "volley": _re.compile(r'Lcom/android/volley/'),
+            "ktor": _re.compile(r'Lio/ktor/'),
+        }
+
+        response_patterns = [
+            _re.compile(r'onResponse|onSuccess|onNext|onComplete', _re.IGNORECASE),
+            _re.compile(r'parseResponse|handleResponse|processResponse', _re.IGNORECASE),
+            _re.compile(r'fromJson|deserialize|decode', _re.IGNORECASE),
+        ]
+
+        url_pat = _re.compile(r'const-string.*"(https?://[^"]+|/api/[^"]+|/v\d+/[^"]+)"')
+        path_pat = _re.compile(
+            r'const-string.*"(/(?:user|auth|license|premium|subscribe|purchase|'
+            r'billing|account|verify|validate|check|status|plan|membership|order|pay)[^"]*)"',
+            _re.IGNORECASE
+        )
+        retrofit_annot = _re.compile(
+            r'value\s*=\s*"([^"]*(?:user|auth|license|premium|subscribe|purchase|'
+            r'billing|account|verify|status|plan|membership)[^"]*)"',
+            _re.IGNORECASE
+        )
+
+        network_clients: dict[str, int] = {}
+        api_endpoints: list[dict] = []
+        response_handlers: list[dict] = []
+        seen_urls: set[str] = set()
+
+        for smali_dir in _get_all_smali_dirs():
+            for smali_file in smali_dir.rglob("*.smali"):
+                rel = str(smali_file.relative_to(smali_dir)).replace("\\", "/")
+                if any(rel.startswith(p) for p in (
+                    "android/", "androidx/", "com/google/", "kotlin/",
+                    "kotlinx/", "io/reactivex/", "okhttp3/", "retrofit2/",
+                    "com/squareup/", "org/", "io/netty/",
+                )):
+                    continue
+
+                try:
+                    text = smali_file.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+
+                for name, pat in http_patterns.items():
+                    if pat.search(text):
+                        network_clients[name] = network_clients.get(name, 0) + 1
+
+                lines = text.splitlines()
+                current_method = ""
+                for i, line in enumerate(lines):
+                    s = line.strip()
+                    if s.startswith(".method"):
+                        current_method = s[:80]
+                    elif s == ".end method":
+                        current_method = ""
+
+                    for pat in (url_pat, path_pat):
+                        um = pat.search(s)
+                        if um and um.group(1) not in seen_urls:
+                            seen_urls.add(um.group(1))
+                            api_endpoints.append({
+                                "url": um.group(1), "file": rel,
+                                "line": i + 1, "method": current_method,
+                            })
+
+                    am = retrofit_annot.search(s)
+                    if am and am.group(1) not in seen_urls:
+                        seen_urls.add(am.group(1))
+                        api_endpoints.append({
+                            "url": am.group(1), "file": rel,
+                            "line": i + 1, "method": current_method,
+                            "type": "retrofit_annotation",
+                        })
+
+                    for rpat in response_patterns:
+                        if rpat.search(s) and "invoke" in s:
+                            response_handlers.append({
+                                "file": rel, "line": i + 1,
+                                "method": current_method,
+                                "instruction": s[:100],
+                            })
+                            break
+
+        return json.dumps({
+            "success": True,
+            "network_clients": network_clients,
+            "total_api_endpoints": len(api_endpoints),
+            "total_response_handlers": len(response_handlers),
+            "api_endpoints": api_endpoints[:40],
+            "response_handlers": response_handlers[:30],
+            "analysis_hint": (
+                "Look at api_endpoints with premium/license/billing paths. "
+                "Trace their response handlers to find where server data flows "
+                "into entity classes. Use trace_data_pipeline on the entity class."
+            ),
+        }, ensure_ascii=False, indent=2)[:15000]
+
+    return _safe_call(_run, "identify_server_checks", _cache_hint="server_checks")
+
+
+# ---------------------------------------------------------------------------
+# Cross-reference map — complete x-ref for any class/method
+# ---------------------------------------------------------------------------
+
+
+@tool
+def cross_reference_map(target: str) -> str:
+    """Build a comprehensive cross-reference map for a class or method.
+    Given a class descriptor (e.g. 'Lcom/app/Premium;') or a method name
+    (e.g. 'isPremium'), returns: incoming calls, outgoing calls, field reads,
+    field writes, string constants used, and resource references — all in one call.
+
+    When to use: When you need a **complete picture** of how a class or method
+    is used across the entire codebase. Replaces multiple graph_callers +
+    graph_callees + trace_field_access calls. Use this as the first deep-dive
+    after identifying the entity class.
+
+    Args:
+        target: A class descriptor (Lcom/...; format) or method name.
+
+    Returns: JSON — incoming_calls, outgoing_calls, field_reads, field_writes,
+    string_constants, resource_refs, summary.
+    """
+    def _run():
+        apk_dir = _project.apktool_dir
+        smali_dirs = [d for d in apk_dir.iterdir() if d.is_dir() and d.name.startswith("smali")]
+        if not smali_dirs:
+            return json.dumps({"success": False, "error": "No smali directories. Run apktool_decompile first."})
+
+        is_class = target.startswith("L") and target.endswith(";")
+        incoming_calls: list[dict] = []
+        outgoing_calls: list[dict] = []
+        field_reads: list[dict] = []
+        field_writes: list[dict] = []
+        string_constants: list[str] = []
+        resource_refs: list[dict] = []
+
+        # Patterns
+        if is_class:
+            class_prefix = target[1:-1]  # e.g. com/app/Premium
+            pat_invoke = re.compile(r"invoke-\w+.*" + re.escape(target) + r"->")
+            pat_field_r = re.compile(r"[is]get-\w+.*" + re.escape(target) + r"->")
+            pat_field_w = re.compile(r"[is]put-\w+.*" + re.escape(target) + r"->")
+        else:
+            pat_invoke = re.compile(r"invoke-\w+.*->" + re.escape(target) + r"\(")
+            pat_field_r = None
+            pat_field_w = None
+
+        target_file_found = False
+        target_outgoing: list[str] = []
+
+        for sd in smali_dirs:
+            for sf in sd.rglob("*.smali"):
+                try:
+                    content = sf.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    continue
+                lines = content.splitlines()
+                rel = str(sf.relative_to(apk_dir))
+                current_method = ""
+                in_target = False
+
+                for i, line in enumerate(lines):
+                    s = line.strip()
+
+                    if s.startswith(".method"):
+                        current_method = s
+                        # Check if we're reading the target class's own file
+                        if is_class and class_prefix in rel.replace("\\", "/"):
+                            in_target = True
+                            target_file_found = True
+                        elif not is_class and target in s:
+                            in_target = True
+                            target_file_found = True
+                        else:
+                            in_target = False
+
+                    elif s.startswith(".end method"):
+                        in_target = False
+
+                    # Collect outgoing calls FROM the target
+                    if in_target and "invoke-" in s:
+                        target_outgoing.append(s[:120])
+
+                    if in_target and s.startswith("const-string"):
+                        parts = s.split('"')
+                        if len(parts) >= 2:
+                            string_constants.append(parts[1])
+
+                    # Incoming references TO the target from other files
+                    if not in_target:
+                        if pat_invoke.search(s):
+                            incoming_calls.append({"file": rel, "line": i + 1, "method": current_method[:80], "instruction": s[:120]})
+                        if pat_field_r and pat_field_r.search(s):
+                            field_reads.append({"file": rel, "line": i + 1, "method": current_method[:60], "instruction": s[:120]})
+                        if pat_field_w and pat_field_w.search(s):
+                            field_writes.append({"file": rel, "line": i + 1, "method": current_method[:60], "instruction": s[:120]})
+
+                    # Resource references (R$ patterns)
+                    if in_target and "sget" in s and "/R$" in s:
+                        resource_refs.append({"line": i + 1, "instruction": s[:120]})
+
+        # Deduplicate outgoing by call target
+        seen_out = set()
+        for inv in target_outgoing:
+            # Extract the called method signature
+            arrow_idx = inv.find("->")
+            if arrow_idx >= 0:
+                call_target = inv[inv.rfind(" ", 0, arrow_idx) + 1:]
+                if call_target not in seen_out:
+                    seen_out.add(call_target)
+                    outgoing_calls.append({"instruction": call_target[:120]})
+
+        string_constants = list(set(string_constants))
+
+        return json.dumps({
+            "success": True,
+            "target": target,
+            "target_file_found": target_file_found,
+            "summary": {
+                "incoming_calls": len(incoming_calls),
+                "outgoing_calls": len(outgoing_calls),
+                "field_reads": len(field_reads),
+                "field_writes": len(field_writes),
+                "string_constants": len(string_constants),
+                "resource_refs": len(resource_refs),
+            },
+            "incoming_calls": incoming_calls[:50],
+            "outgoing_calls": outgoing_calls[:50],
+            "field_reads": field_reads[:30],
+            "field_writes": field_writes[:30],
+            "string_constants": string_constants[:30],
+            "resource_refs": resource_refs[:20],
+        }, ensure_ascii=False, indent=2)[:25000]
+
+    return _safe_call(_run, "cross_reference_map")
+
+
+# ---------------------------------------------------------------------------
+# Deobfuscation helper — auto-suggest meaningful names
+# ---------------------------------------------------------------------------
+
+
+@tool
+def deobfuscate_names(class_descriptor: str) -> str:
+    """Analyze an obfuscated class and suggest human-readable names for it and its methods.
+    Based on: Android API calls made, string constants used, field types, return types,
+    and common patterns (e.g. boolean getters named isPremium, void setters, etc.).
+
+    When to use: When the target class has obfuscated names (single-letter classes like
+    'La/b/c;' or methods like 'a()', 'b(Z)V'). Run this early to understand what
+    obfuscated classes actually DO, then refer to them by suggested names in your analysis.
+
+    Args:
+        class_descriptor: Full smali descriptor e.g. 'Lcom/app/a;'
+
+    Returns: JSON — class_suggested_name, method_suggestions (list of {original, suggested,
+    reason}), field_suggestions, confidence.
+    """
+    def _run():
+        apk_dir = _project.apktool_dir
+        class_path = class_descriptor[1:-1]  # Remove L and ;
+        smali_file = None
+        for sd in apk_dir.iterdir():
+            if sd.is_dir() and sd.name.startswith("smali"):
+                candidate = sd / (class_path + ".smali")
+                if candidate.is_file():
+                    smali_file = candidate
+                    break
+
+        if not smali_file:
+            return json.dumps({"success": False, "error": f"Class file not found for {class_descriptor}"})
+
+        content = smali_file.read_text(encoding="utf-8", errors="replace")
+        lines = content.splitlines()
+
+        # Analyze methods
+        methods: list[dict] = []
+        current_method = ""
+        method_body: list[str] = []
+        fields: list[dict] = []
+
+        for line in lines:
+            s = line.strip()
+            if s.startswith(".field"):
+                # Parse field type
+                parts = s.split()
+                if len(parts) >= 3:
+                    fname = parts[-1].split(":")[0] if ":" in parts[-1] else parts[-1]
+                    ftype = parts[-1].split(":")[-1] if ":" in parts[-1] else ""
+                    fields.append({"name": fname, "type": ftype, "declaration": s[:100]})
+            elif s.startswith(".method"):
+                current_method = s
+                method_body = []
+            elif s.startswith(".end method"):
+                if current_method:
+                    methods.append({"signature": current_method, "body": method_body})
+                current_method = ""
+            elif current_method:
+                method_body.append(s)
+
+        # Suggest names based on patterns
+        method_suggestions: list[dict] = []
+        android_api_hints: list[str] = []
+        class_behavior_signals: list[str] = []
+
+        for m in methods:
+            sig = m["signature"]
+            body = m["body"]
+            body_text = "\n".join(body)
+
+            # Extract method name
+            name_match = re.search(r"(\w+)\(", sig)
+            method_name = name_match.group(1) if name_match else ""
+
+            # Skip constructors and well-named methods
+            if method_name in ("<init>", "<clinit>") or len(method_name) > 3:
+                continue
+
+            suggestion = None
+            reason = ""
+
+            # Detect return type
+            ret_type = sig.rsplit(")", 1)[-1].strip() if ")" in sig else ""
+
+            # Pattern: boolean return + field check → "isSomething"
+            if ret_type == "Z":
+                for b in body:
+                    if "iget-boolean" in b:
+                        field_ref = b.split("->")[-1] if "->" in b else ""
+                        field_name = field_ref.split(":")[0]
+                        suggestion = f"is{field_name.capitalize()}" if len(field_name) <= 3 else f"is_{field_name}"
+                        reason = f"boolean getter reading field {field_name}"
+                        break
+
+            # Pattern: void + SharedPreferences
+            if not suggestion and "SharedPreferences" in body_text:
+                if "putBoolean" in body_text or "putString" in body_text or "putInt" in body_text:
+                    suggestion = "savePreferences"
+                    reason = "writes to SharedPreferences"
+                    class_behavior_signals.append("preferences_writer")
+                elif "getBoolean" in body_text or "getString" in body_text:
+                    suggestion = "loadPreferences"
+                    reason = "reads from SharedPreferences"
+                    class_behavior_signals.append("preferences_reader")
+
+            # Pattern: invoke on billing/purchase classes
+            if not suggestion:
+                for b in body:
+                    if "billing" in b.lower() or "purchase" in b.lower() or "BillingClient" in b:
+                        suggestion = "handlePurchase"
+                        reason = "interacts with billing API"
+                        class_behavior_signals.append("billing_handler")
+                        break
+                    if "HttpURLConnection" in b or "OkHttpClient" in b or "Retrofit" in b:
+                        suggestion = "makeNetworkCall"
+                        reason = "performs network request"
+                        class_behavior_signals.append("network_client")
+                        break
+
+            # Pattern: Android API calls
+            for b in body:
+                if "invoke-" in b:
+                    if "Landroid/content/Intent;" in b:
+                        android_api_hints.append("intent_handler")
+                    elif "Landroid/app/AlertDialog" in b or "Landroid/app/Dialog" in b:
+                        android_api_hints.append("dialog_builder")
+                    elif "Landroid/widget/Toast" in b:
+                        android_api_hints.append("toast_shower")
+                    elif "Landroid/view/View" in b:
+                        android_api_hints.append("view_manipulator")
+
+            if suggestion:
+                method_suggestions.append({
+                    "original": method_name,
+                    "signature": sig[:80],
+                    "suggested": suggestion,
+                    "reason": reason,
+                })
+
+        # Field suggestions
+        field_suggestions: list[dict] = []
+        for f in fields:
+            if len(f["name"]) <= 2:
+                ftype = f["type"]
+                suggestion = None
+                if ftype == "Z":
+                    suggestion = "isEnabled"
+                elif ftype == "Ljava/lang/String;":
+                    suggestion = "textValue"
+                elif ftype == "I":
+                    suggestion = "intValue"
+                elif ftype == "J":
+                    suggestion = "timestamp"
+                elif "List" in ftype:
+                    suggestion = "itemList"
+                if suggestion:
+                    field_suggestions.append({"original": f["name"], "type": ftype, "suggested": suggestion})
+
+        # Class name suggestion
+        class_name = class_path.split("/")[-1]
+        class_suggestion = None
+        if len(class_name) <= 3:
+            if "billing_handler" in class_behavior_signals:
+                class_suggestion = "BillingManager"
+            elif "network_client" in class_behavior_signals:
+                class_suggestion = "NetworkHelper"
+            elif "preferences_writer" in class_behavior_signals or "preferences_reader" in class_behavior_signals:
+                class_suggestion = "PreferencesManager"
+            elif "dialog_builder" in android_api_hints:
+                class_suggestion = "DialogHelper"
+            elif any("iget-boolean" in "\n".join(m["body"]) for m in methods):
+                class_suggestion = "StateEntity"
+
+        return json.dumps({
+            "success": True,
+            "class_descriptor": class_descriptor,
+            "class_name": class_name,
+            "class_suggested_name": class_suggestion,
+            "total_methods": len(methods),
+            "total_fields": len(fields),
+            "method_suggestions": method_suggestions[:20],
+            "field_suggestions": field_suggestions[:20],
+            "android_api_hints": list(set(android_api_hints))[:10],
+            "behavior_signals": list(set(class_behavior_signals))[:10],
+            "confidence": "high" if len(method_suggestions) >= 3 else ("medium" if method_suggestions else "low"),
+        }, ensure_ascii=False, indent=2)
+
+    return _safe_call(_run, "deobfuscate_names")
+
+
+# ---------------------------------------------------------------------------
+# Dynamic lifecycle checks — find runtime re-validation
+# ---------------------------------------------------------------------------
+
+
+@tool
+def find_dynamic_checks() -> str:
+    """Find premium/license re-validation that happens at Android lifecycle points.
+    Many apps re-check premium status in onResume(), onStart(), onWindowFocusChanged(),
+    onAttachedToWindow(), or periodic timers. These dynamic checks can UNDO patched
+    values when the user navigates back to the screen.
+
+    When to use: After patching premium getters, if the app REVERTS to free mode when
+    backgrounded/resumed or after a few seconds. This tool finds the lifecycle hooks
+    that re-validate, so you can patch them too.
+
+    Returns: JSON — lifecycle_checks (array with file, method, lifecycle_hook,
+    premium_indicator, line), timer_checks, broadcast_checks.
+    """
+    def _run():
+        apk_dir = _project.apktool_dir
+        smali_dirs = [d for d in apk_dir.iterdir() if d.is_dir() and d.name.startswith("smali")]
+        if not smali_dirs:
+            return json.dumps({"success": False, "error": "No smali directories."})
+
+        lifecycle_hooks = [
+            "onResume", "onStart", "onRestart", "onWindowFocusChanged",
+            "onAttachedToWindow", "onConfigurationChanged", "onNewIntent",
+        ]
+        premium_indicators = re.compile(
+            r"premium|isPro|isVip|isPaid|isTrial|isExpired|isFree|"
+            r"subscription|license|purchas|billing|getType|getPlan|"
+            r"TRIER|TRIAL|FREE|PREMIUM|PRO|VIP",
+            re.IGNORECASE,
+        )
+        timer_patterns = re.compile(
+            r"Handler|Runnable|postDelayed|scheduleAtFixedRate|Timer|"
+            r"CountDownTimer|AlarmManager|WorkManager",
+        )
+        broadcast_patterns = re.compile(
+            r"BroadcastReceiver|onReceive|registerReceiver|"
+            r"PACKAGE_REPLACED|MY_PACKAGE_REPLACED",
+        )
+
+        lifecycle_checks: list[dict] = []
+        timer_checks: list[dict] = []
+        broadcast_checks: list[dict] = []
+
+        for sd in smali_dirs:
+            for sf in sd.rglob("*.smali"):
+                try:
+                    content = sf.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    continue
+
+                lines = content.splitlines()
+                rel = str(sf.relative_to(apk_dir))
+                current_method = ""
+
+                for i, line in enumerate(lines):
+                    s = line.strip()
+
+                    if s.startswith(".method"):
+                        current_method = s
+                    elif s.startswith(".end method"):
+                        current_method = ""
+
+                    if not current_method:
+                        continue
+
+                    # Check lifecycle hooks
+                    for hook in lifecycle_hooks:
+                        if hook in current_method:
+                            # Look for premium indicators in the next 30 lines
+                            window = "\n".join(lines[i:i + 30])
+                            prem_matches = premium_indicators.findall(window)
+                            if prem_matches:
+                                lifecycle_checks.append({
+                                    "file": rel,
+                                    "line": i + 1,
+                                    "method": current_method[:80],
+                                    "lifecycle_hook": hook,
+                                    "premium_indicators": list(set(prem_matches))[:5],
+                                })
+                            break
+
+                    # Timer-based checks
+                    if timer_patterns.search(s) and premium_indicators.search(
+                        "\n".join(lines[max(0, i - 5):i + 10])
+                    ):
+                        timer_checks.append({
+                            "file": rel, "line": i + 1,
+                            "method": current_method[:80],
+                            "instruction": s[:100],
+                        })
+
+                    # Broadcast receiver checks
+                    if broadcast_patterns.search(s) and premium_indicators.search(
+                        "\n".join(lines[max(0, i - 5):i + 10])
+                    ):
+                        broadcast_checks.append({
+                            "file": rel, "line": i + 1,
+                            "method": current_method[:80],
+                            "instruction": s[:100],
+                        })
+
+        return json.dumps({
+            "success": True,
+            "total_lifecycle_checks": len(lifecycle_checks),
+            "total_timer_checks": len(timer_checks),
+            "total_broadcast_checks": len(broadcast_checks),
+            "lifecycle_checks": lifecycle_checks[:30],
+            "timer_checks": timer_checks[:20],
+            "broadcast_checks": broadcast_checks[:10],
+            "analysis_hint": (
+                "Lifecycle checks (especially onResume) can reset premium state. "
+                "Patch them to skip the re-validation call, or patch the underlying "
+                "field/method they call. Timer-based checks are periodic — patch the "
+                "scheduled method or remove the timer registration."
+            ),
+        }, ensure_ascii=False, indent=2)[:15000]
+
+    return _safe_call(_run, "find_dynamic_checks")
+
+
+# ---------------------------------------------------------------------------
+# Extract ALL URLs/endpoints from the APK
+# ---------------------------------------------------------------------------
+
+
+@tool
+def extract_all_urls() -> str:
+    """Extract ALL URLs and API endpoints from the entire APK codebase.
+    Searches: const-string URLs, Retrofit @GET/@POST annotations, WebView.loadUrl
+    calls, deeplinks from manifest, and resource XML URLs.
+    Each URL is mapped to its code location (file + line + method).
+
+    When to use: For a complete map of all network endpoints. Use early for recon,
+    or after patching to find server-side validation endpoints you may have missed.
+
+    Returns: JSON — total_urls, urls (array of {url, file, line, method, type}),
+    url_domains (unique domain list), deeplinks (from manifest).
+    """
+    def _run():
+        apk_dir = _project.apktool_dir
+        url_pattern = re.compile(r'https?://[^\s"<>\')]+', re.IGNORECASE)
+        retrofit_pattern = re.compile(r'@(?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s*\(\s*"([^"]+)"')
+        webview_pattern = re.compile(r'const-string\s+\w+,\s*"(https?://[^"]+)"')
+
+        urls: list[dict] = []
+        seen_urls: set[str] = set()
+        deeplinks: list[dict] = []
+
+        # --- Scan smali files ---
+        smali_dirs = [d for d in apk_dir.iterdir() if d.is_dir() and d.name.startswith("smali")]
+        for sd in smali_dirs:
+            for sf in sd.rglob("*.smali"):
+                try:
+                    content = sf.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    continue
+                lines = content.splitlines()
+                rel = str(sf.relative_to(apk_dir))
+                current_method = ""
+                for i, line in enumerate(lines):
+                    s = line.strip()
+                    if s.startswith(".method"):
+                        current_method = s.split()[-1] if s.split() else s
+                    elif s.startswith(".end method"):
+                        current_method = ""
+
+                    if s.startswith("const-string"):
+                        # Extract the string value
+                        quote_start = s.find('"')
+                        quote_end = s.rfind('"')
+                        if quote_start != -1 and quote_end > quote_start:
+                            val = s[quote_start + 1:quote_end]
+                            url_match = url_pattern.match(val)
+                            if url_match and val not in seen_urls:
+                                seen_urls.add(val)
+                                url_type = "api_endpoint"
+                                if "loadUrl" in "\n".join(lines[max(0, i):i + 5]):
+                                    url_type = "webview"
+                                elif any(kw in val.lower() for kw in ("api", "v1", "v2", "graphql", "rest")):
+                                    url_type = "api_endpoint"
+                                elif any(kw in val.lower() for kw in (".js", ".css", ".html", ".htm")):
+                                    url_type = "web_resource"
+                                urls.append({
+                                    "url": val[:200],
+                                    "file": rel,
+                                    "line": i + 1,
+                                    "method": current_method[:60],
+                                    "type": url_type,
+                                })
+
+        # --- Scan manifest for deeplinks ---
+        manifest = apk_dir / "AndroidManifest.xml"
+        if manifest.is_file():
+            try:
+                mftext = manifest.read_text(encoding="utf-8", errors="replace")
+                # Find intent-filter data elements with scheme+host
+                import xml.etree.ElementTree as ET
+                root = ET.fromstring(mftext)
+                ns = {"android": "http://schemas.android.com/apk/res/android"}
+                for data in root.iter("data"):
+                    scheme = data.get(f"{{{ns['android']}}}scheme", "")
+                    host = data.get(f"{{{ns['android']}}}host", "")
+                    path = data.get(f"{{{ns['android']}}}path", "")
+                    pathPrefix = data.get(f"{{{ns['android']}}}pathPrefix", "")
+                    if scheme:
+                        deeplink_url = f"{scheme}://{host}{path or pathPrefix}"
+                        deeplinks.append({"url": deeplink_url, "scheme": scheme, "host": host})
+            except Exception:
+                pass
+
+        # --- Scan resource XMLs for URLs ---
+        res_dir = apk_dir / "res"
+        if res_dir.is_dir():
+            for xml_file in res_dir.rglob("*.xml"):
+                try:
+                    xml_text = xml_file.read_text(encoding="utf-8", errors="replace")
+                    for m in url_pattern.finditer(xml_text):
+                        u = m.group()
+                        if u not in seen_urls and not u.startswith("http://schemas."):
+                            seen_urls.add(u)
+                            urls.append({
+                                "url": u[:200],
+                                "file": str(xml_file.relative_to(apk_dir)),
+                                "line": 0,
+                                "method": "",
+                                "type": "resource_xml",
+                            })
+                except Exception:
+                    continue
+
+        # Unique domains
+        domains: set[str] = set()
+        for u in urls:
+            try:
+                from urllib.parse import urlparse
+                parsed = urlparse(u["url"])
+                if parsed.hostname:
+                    domains.add(parsed.hostname)
+            except Exception:
+                pass
+
+        return json.dumps({
+            "success": True,
+            "total_urls": len(urls),
+            "total_domains": len(domains),
+            "total_deeplinks": len(deeplinks),
+            "url_domains": sorted(domains)[:30],
+            "urls": urls[:80],
+            "deeplinks": deeplinks[:20],
+        }, ensure_ascii=False, indent=2)[:25000]
+
+    return _safe_call(_run, "extract_all_urls", _cache_hint="all_urls")
+
+
+# ---------------------------------------------------------------------------
+# Verify bypass completeness — post-patch verification
+# ---------------------------------------------------------------------------
+
+
+@tool
+def verify_bypass_completeness() -> str:
+    """Post-patch verification: re-scan the codebase for REMAINING premium/license
+    gates that are NOT yet patched. Checks: boolean premium getters still returning
+    dynamic values, SharedPreferences premium reads, entity field assignments to
+    non-premium values, and UI gate methods (showing upgrade/paywall dialogs).
+
+    When to use: After all patches are applied, BEFORE building the APK.
+    This is the final quality gate — any remaining gates it finds MUST be patched.
+
+    Returns: JSON — remaining_gates (array), remaining_prefs_checks, remaining_ui_gates,
+    patch_coverage_pct, verdict (PASS/FAIL).
+    """
+    def _run():
+        apk_dir = _project.apktool_dir
+        smali_dirs = [d for d in apk_dir.iterdir() if d.is_dir() and d.name.startswith("smali")]
+        if not smali_dirs:
+            return json.dumps({"success": False, "error": "No smali directories."})
+
+        premium_method_pat = re.compile(
+            r"\.method\s+.*(?:isPremium|isPro|isVip|isPaid|isTrial|isExpired|isFree|"
+            r"isSubscribed|hasSubscription|checkLicense|validateLicense|isLicensed|"
+            r"canAccess|isUnlocked|isActivated)",
+            re.IGNORECASE,
+        )
+        prefs_premium_pat = re.compile(
+            r'const-string\s+\w+,\s*"(?:is_premium|is_pro|premium|vip|paid|'
+            r'license_status|subscription_type|plan_type|user_type|account_type)"',
+            re.IGNORECASE,
+        )
+        ui_gate_pat = re.compile(
+            r"(?:upgrade|paywall|subscribe|go_pro|buy_premium|"
+            r"premium_required|locked_feature|trial_expired)",
+            re.IGNORECASE,
+        )
+
+        remaining_gates: list[dict] = []
+        remaining_prefs: list[dict] = []
+        remaining_ui: list[dict] = []
+        patched_methods: set[str] = set()
+
+        for sd in smali_dirs:
+            for sf in sd.rglob("*.smali"):
+                try:
+                    content = sf.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    continue
+                lines = content.splitlines()
+                rel = str(sf.relative_to(apk_dir))
+                current_method = ""
+                method_start = 0
+
+                for i, line in enumerate(lines):
+                    s = line.strip()
+
+                    if s.startswith(".method"):
+                        current_method = s
+                        method_start = i
+                    elif s.startswith(".end method"):
+                        # Check if this premium method was ALREADY patched
+                        if premium_method_pat.search(current_method):
+                            method_body = "\n".join(lines[method_start:i])
+                            # A patched method typically has const/4 + return as first instructions
+                            is_patched = bool(re.search(
+                                r"\.locals\s+\d+\s*\n\s*const(?:/4|/16)?\s+v0",
+                                method_body,
+                            ))
+                            if not is_patched:
+                                remaining_gates.append({
+                                    "file": rel,
+                                    "line": method_start + 1,
+                                    "method": current_method[:80],
+                                    "status": "NOT_PATCHED",
+                                })
+                            else:
+                                patched_methods.add(f"{rel}:{current_method[:60]}")
+                        current_method = ""
+                        continue
+
+                    # SharedPreferences premium reads
+                    if prefs_premium_pat.search(s):
+                        # Check if there's a const override right after
+                        lookahead = "\n".join(lines[i:i + 5])
+                        if "move-result" in lookahead and "const" not in "\n".join(lines[i + 1:i + 3]):
+                            remaining_prefs.append({
+                                "file": rel, "line": i + 1,
+                                "method": current_method[:60],
+                                "instruction": s[:100],
+                            })
+
+                    # UI gate strings
+                    if s.startswith("const-string") and ui_gate_pat.search(s):
+                        remaining_ui.append({
+                            "file": rel, "line": i + 1,
+                            "method": current_method[:60],
+                            "instruction": s[:100],
+                        })
+
+        total_gates = len(remaining_gates) + len(patched_methods)
+        patched_count = len(patched_methods)
+        coverage = (patched_count / total_gates * 100) if total_gates > 0 else 100.0
+        verdict = "PASS" if not remaining_gates and not remaining_prefs else "FAIL"
+
+        return json.dumps({
+            "success": True,
+            "verdict": verdict,
+            "patch_coverage_pct": round(coverage, 1),
+            "patched_methods": patched_count,
+            "remaining_gates": remaining_gates[:20],
+            "remaining_prefs_checks": remaining_prefs[:15],
+            "remaining_ui_gates": remaining_ui[:15],
+            "summary": (
+                f"Coverage: {coverage:.0f}%. "
+                f"{'ALL gates patched!' if verdict == 'PASS' else f'{len(remaining_gates)} methods + {len(remaining_prefs)} prefs reads still need patching.'}"
+            ),
+        }, ensure_ascii=False, indent=2)[:15000]
+
+    return _safe_call(_run, "verify_bypass_completeness")
 
 
 # ---------------------------------------------------------------------------
@@ -2218,7 +3799,18 @@ def apply_smali_patch(patch_plan_json: str) -> str:
             "error": "Patch plan has no steps. Add at least one step with operation and match_pattern.",
         })
 
-    plan = PatchPlan.from_dict(plan_data)
+    if not (plan_data.get("target_file") or plan_data.get("file") or plan_data.get("smali_file")):
+        return json.dumps({
+            "success": False,
+            "error": "Missing 'target_file' in patch plan JSON.",
+            "recovery_hint": 'Add "target_file": "smali_classes3/com/example/Foo.smali" to your JSON.',
+        })
+
+    try:
+        plan = PatchPlan.from_dict(plan_data)
+    except (ValueError, KeyError) as e:
+        return json.dumps({"success": False, "error": str(e)})
+
     engine = PatchEngine(
         apktool_dir=_project.apktool_dir,
         backup_dir=_project.patch_backup_dir,
@@ -2378,13 +3970,55 @@ def preview_smali_patch(patch_plan_json: str) -> str:
             "recovery_hint": "Check your JSON syntax — ensure all strings are properly quoted and brackets are balanced.",
         })
 
-    plan = PatchPlan.from_dict(plan_data)
+    if not (plan_data.get("target_file") or plan_data.get("file") or plan_data.get("smali_file")):
+        return json.dumps({
+            "success": False,
+            "error": "Missing 'target_file' in patch plan JSON.",
+            "recovery_hint": 'Add "target_file": "smali_classes3/com/example/Foo.smali" to your JSON.',
+        })
+
+    try:
+        plan = PatchPlan.from_dict(plan_data)
+    except (ValueError, KeyError) as e:
+        return json.dumps({"success": False, "error": str(e)})
+
     engine = PatchEngine(
         apktool_dir=_project.apktool_dir,
         backup_dir=_project.patch_backup_dir,
         diffs_dir=_project.patch_diffs_dir,
     )
     return engine.preview_plan(plan)[:8000]
+
+
+@tool
+def restore_smali_backup(smali_file: str) -> str:
+    """Restore a smali file to its ORIGINAL state (before any patches).
+
+    When a previous patch corrupted a file or caused unintended changes,
+    use this to undo ALL patches on that file and start fresh.
+
+    The backup is created automatically the FIRST time apply_smali_patch
+    touches a file — it preserves the original pre-patch version.
+
+    Args:
+        smali_file: path to the smali file to restore (same format as
+            target_file in apply_smali_patch, e.g. 'smali_classes3/R5/a.smali')
+
+    Returns: JSON with success, restored_file (the path that was restored),
+    backup_source (the backup file used).
+    """
+    from apk_agent.patch_engine import PatchEngine
+
+    def _run():
+        engine = PatchEngine(
+            apktool_dir=_project.apktool_dir,
+            backup_dir=_project.patch_backup_dir,
+            diffs_dir=_project.patch_diffs_dir,
+        )
+        result = engine.restore_backup(smali_file)
+        return json.dumps(result, ensure_ascii=False, indent=2)
+
+    return _safe_call(_run, "restore_smali_backup")
 
 
 # ---------------------------------------------------------------------------
@@ -4386,9 +6020,22 @@ ALL_TOOLS = [
     inject_smali_code,
     generate_constructor_override,
     inject_startup_hook,
+    # Bulk patching + Data-flow tracing + UI gate mapping
+    batch_patch_methods,
+    trace_data_pipeline,
+    map_ui_gates,
+    patch_shared_prefs_reads,
+    identify_server_checks,
+    # Cross-reference + Deobfuscation + Dynamic checks + URL extraction + Verification
+    cross_reference_map,
+    deobfuscate_names,
+    find_dynamic_checks,
+    extract_all_urls,
+    verify_bypass_completeness,
     # Patching
     apply_smali_patch,
     preview_smali_patch,
+    restore_smali_backup,
     # Automated bypass engine (APK Patcher)
     auto_patch_bypass,
     patch_flutter_ssl,
