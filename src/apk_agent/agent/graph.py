@@ -205,10 +205,10 @@ def agent_node(state: AgentState) -> dict:
         for f in findings:
             s = f.get("severity", "info")
             by_sev[s] = by_sev.get(s, 0) + 1
-        summary_parts.append(f"📋 Findings: {dict(by_sev)}")
-        # Show top critical/high
+        summary_parts.append(f"📋 Findings: {dict(by_sev)} ({len(findings)} total)")
+        # Show top critical/high (capped to avoid bloat)
         critical = [f for f in findings if f.get("severity") in ("CRITICAL", "critical", "HIGH", "high")]
-        for c in critical[:8]:
+        for c in critical[:5]:
             summary_parts.append(f"  • [{c.get('severity','')}] {c.get('name','')}: {c.get('file','')}")
     if patches:
         ok = sum(1 for p in patches if p.get("success"))
@@ -216,36 +216,37 @@ def agent_node(state: AgentState) -> dict:
 
     # Patch registry — full journal of every patch attempt (survives compaction)
     # (uses local `registry` which may have user-feedback updates from above)
+    # Cap at last 15 entries to prevent context bloat on long sessions.
     if registry:
-        summary_parts.append(f"\n🗂️ PATCH REGISTRY ({len(registry)} entries) — DO NOT re-apply patches that already succeeded:")
-        for entry in registry:
+        display_reg = registry[-15:] if len(registry) > 15 else registry
+        summary_parts.append(f"\n🗂️ PATCH REGISTRY (showing {len(display_reg)}/{len(registry)}) — DO NOT re-apply patches that already succeeded:")
+        for entry in display_reg:
             pid = entry.get("id", "?")
             tool = entry.get("tool", "?")
             target = entry.get("target", "?")
-            pattern_desc = entry.get("pattern", "")[:80]
+            pattern_desc = entry.get("pattern", "")[:60]
             status = entry.get("status", "?")
-            tool_ok = "✅" if entry.get("tool_success") else "❌"
             feedback = entry.get("user_feedback", "")
 
             status_icon = {"applied": "✅", "failed": "❌", "user_rejected": "🔄", "retrying": "🔄", "verified": "✔️"}.get(status, "❓")
             line = f"  {status_icon} #{pid} [{tool}] {target} — {pattern_desc}"
             if feedback:
-                line += f" | USER: {feedback[:60]}"
+                line += f" | USER: {feedback[:40]}"
             summary_parts.append(line)
 
         # Highlight patches the user rejected (need re-doing)
         rejected = [e for e in registry if e.get("status") in ("user_rejected", "retrying")]
         if rejected:
             summary_parts.append(f"\n  ⚠️ {len(rejected)} patch(es) need re-work based on user feedback!")
-            for e in rejected:
-                summary_parts.append(f"    → #{e['id']} {e['target']}: {e.get('user_feedback', '')[:100]}")
+            for e in rejected[:5]:
+                summary_parts.append(f"    → #{e['id']} {e['target']}: {e.get('user_feedback', '')[:60]}")
 
     # Scratchpad — persistent working memory that survives compaction
     scratchpad = state.get("scratchpad") or {}
     if scratchpad:
         summary_parts.append("📝 Scratchpad (working memory):")
-        for k, v in list(scratchpad.items())[:30]:
-            val_str = str(v)[:200]
+        for k, v in list(scratchpad.items())[:15]:
+            val_str = str(v)[:120]
             summary_parts.append(f"  • {k}: {val_str}")
 
     # Task plan — multi-objective decomposition
@@ -1028,7 +1029,7 @@ def build_graph(config: AppConfig, project: Project, checkpointer=None):
     # token_threshold: start compacting well before the context fills up
     # keep_recent: preserve only the last few exchanges (each exchange =
     #   AIMessage + ToolMessages can be 5-15 messages for parallel tool calls)
-    _compactor = Compactor(token_threshold=100_000, keep_recent=20)
+    _compactor = Compactor(token_threshold=100_000, keep_recent=14)
 
     # Build tool node
     tool_node = ToolNode(ALL_TOOLS)

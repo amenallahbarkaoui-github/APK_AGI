@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import traceback
 import uuid
+import threading
+import concurrent.futures
 from pathlib import Path
 from typing import Optional
 
@@ -79,9 +81,9 @@ def _log_file() -> Path:
 # ---------------------------------------------------------------------------
 # Global tool output cap — prevents context bloat from any single tool
 # ---------------------------------------------------------------------------
-_TOOL_OUTPUT_CAP = 10_000  # max chars per tool result (head + tail)
-_CAP_HEAD = 7_000
-_CAP_TAIL = 2_500
+_TOOL_OUTPUT_CAP = 8_000  # max chars per tool result (head + tail)
+_CAP_HEAD = 5_500
+_CAP_TAIL = 2_000
 
 
 def _cap_tool_output(result: str) -> str:
@@ -102,7 +104,7 @@ def _cap_tool_output(result: str) -> str:
 
 
 def _safe_call(func, tool_name: str, *args, **kwargs) -> str:
-    """Wrap any tool function with progress tracking, caching, and error recovery."""
+    """Wrap any tool function with progress tracking, caching, error recovery, and timeout."""
     # Check cache for expensive idempotent tools
     cache_key = None
     if tool_name in _CACHEABLE_TOOLS:
@@ -116,8 +118,24 @@ def _safe_call(func, tool_name: str, *args, **kwargs) -> str:
     task_id = f"tool_{tool_name}_{uuid.uuid4().hex[:4]}"
     set_current_task(task_id)
     progress_manager.start_task(task_id, tool_name)
+
+    # Tool execution timeout (seconds). Most tools finish in <30s.
+    # Long-running ones (auto_patch_bypass, apktool_build) may need more.
+    _TOOL_TIMEOUT = 300  # 5 minutes max
+
     try:
-        result = func(*args, **kwargs)
+        # Run tool with a timeout to prevent infinite hangs
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(func, *args, **kwargs)
+            try:
+                result = future.result(timeout=_TOOL_TIMEOUT)
+            except concurrent.futures.TimeoutError:
+                progress_manager.complete_task(task_id, success=False, error="Tool execution timed out")
+                return json.dumps({
+                    "success": False,
+                    "error": f"Tool '{tool_name}' timed out after {_TOOL_TIMEOUT}s.",
+                    "recovery_hint": "The tool took too long. Try a more targeted approach or smaller scope.",
+                })
         # Global output cap — prevent any single tool from bloating context.
         # Individual tool limits ([:N]) still apply first; this is a safety net.
         result = _cap_tool_output(result)
@@ -782,24 +800,39 @@ def search_in_code(
     if exclude_dirs:
         excl = [d.strip() for d in exclude_dirs.split(",")]
 
-    # When directory is "smali" or None with smali extensions, search ALL smali dirs
+    # Auto-detect smali search: explicit "smali" dir OR .smali in extensions with no dir
     low_dir = (directory or "").strip().lower().replace("\\", "/")
-    search_all_smali = low_dir in ("smali", "apktool/smali", "apktool")
+    has_smali_ext = exts and any(e.strip().lower() in (".smali", "smali") for e in exts)
+    search_all_smali = low_dir in ("smali", "apktool/smali", "apktool") or (
+        not low_dir and has_smali_ext
+    )
 
     def _run():
         if search_all_smali:
             # Search all smali dirs (smali/, smali_classes2/, smali_classes3/, ...)
             all_matches = []
-            for smali_d in _get_all_smali_dirs():
+            smali_dirs = _get_all_smali_dirs()
+            for smali_d in smali_dirs:
                 result = search_in_files(smali_d, pattern, file_extensions=exts,
                                           exclude_dirs=excl, max_results=max_results)
                 if isinstance(result, dict) and result.get("matches"):
                     all_matches.extend(result["matches"])
                 elif isinstance(result, list):
                     all_matches.extend(result)
+            # Also search jadx if extensions are mixed (not smali-only)
+            non_smali_exts = [e for e in (exts or []) if e.strip().lower() not in (".smali", "smali")]
+            if non_smali_exts or not exts:
+                try:
+                    jadx_result = search_in_files(_project.jadx_dir, pattern,
+                                                   file_extensions=non_smali_exts or None,
+                                                   exclude_dirs=excl, max_results=max_results)
+                    if isinstance(jadx_result, dict) and jadx_result.get("matches"):
+                        all_matches.extend(jadx_result["matches"])
+                except Exception:
+                    pass
             return json.dumps({"matches": all_matches[:max_results],
                               "total": len(all_matches),
-                              "smali_dirs_searched": len(_get_all_smali_dirs())},
+                              "smali_dirs_searched": len(smali_dirs)},
                              ensure_ascii=False, indent=2)[:15000]
         else:
             search_dir = _resolve_dir(directory, default="jadx")
@@ -1199,8 +1232,6 @@ def context_search(
     """
     from apk_agent.tools.advanced_search import search_with_context
 
-    d = _resolve_dir(directory, default="jadx")
-
     exts = None
     if file_extensions:
         exts = [e.strip() for e in file_extensions.split(",")]
@@ -1209,11 +1240,40 @@ def context_search(
     if exclude_dirs:
         excl = [d_.strip() for d_ in exclude_dirs.split(",")]
 
+    # Auto-detect smali: if extensions include .smali and no dir given,
+    # search all smali dirs instead of just jadx
+    low_dir = (directory or "").strip().lower().replace("\\", "/")
+    has_smali_ext = exts and any(e.strip().lower() in (".smali", "smali") for e in exts)
+    search_all_smali = low_dir in ("smali", "apktool/smali", "apktool") or (
+        not low_dir and has_smali_ext
+    )
+
     def _run():
-        result = search_with_context(d, pattern, context_lines=context_lines,
-                                      file_extensions=exts, exclude_dirs=excl,
-                                      exclude_packages=True)
-        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
+        if search_all_smali:
+            all_results = []
+            total = 0
+            files_searched = 0
+            for smali_d in _get_all_smali_dirs():
+                result = search_with_context(smali_d, pattern, context_lines=context_lines,
+                                              file_extensions=exts, exclude_dirs=excl,
+                                              exclude_packages=True)
+                if isinstance(result, dict):
+                    all_results.extend(result.get("results", []))
+                    total += result.get("total_matches", 0)
+                    files_searched += result.get("files_searched", 0)
+            return json.dumps({
+                "success": True,
+                "files_searched": files_searched,
+                "total_matches": total,
+                "truncated": len(all_results) > 50,
+                "results": all_results[:50],
+            }, ensure_ascii=False, indent=2)[:15000]
+        else:
+            d = _resolve_dir(directory, default="jadx")
+            result = search_with_context(d, pattern, context_lines=context_lines,
+                                          file_extensions=exts, exclude_dirs=excl,
+                                          exclude_packages=True)
+            return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
     return _safe_call(_run, "context_search")
 
 
@@ -1243,8 +1303,6 @@ def multi_search(
     """
     from apk_agent.tools.advanced_search import multi_pattern_search
 
-    d = _resolve_dir(directory, default="jadx")
-
     pattern_list = [p.strip() for p in patterns.split(",")]
 
     excl = None
@@ -1252,9 +1310,28 @@ def multi_search(
         excl = [d_.strip() for d_ in exclude_dirs.split(",")]
 
     def _run():
-        result = multi_pattern_search(d, pattern_list, logic=logic, exclude_dirs=excl,
-                                       exclude_packages=True)
-        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
+        # Search both jadx AND all smali dirs for code searches
+        all_results = []
+        dirs_to_search = [_project.jadx_dir]
+        low_dir = (directory or "").strip().lower().replace("\\", "/")
+        if directory and low_dir not in ("", "jadx"):
+            dirs_to_search = [_resolve_dir(directory, default="jadx")]
+        else:
+            # Also add all smali dirs for broader coverage
+            dirs_to_search.extend(_get_all_smali_dirs())
+
+        for d in dirs_to_search:
+            result = multi_pattern_search(d, pattern_list, logic=logic, exclude_dirs=excl,
+                                           exclude_packages=True)
+            if isinstance(result, dict) and result.get("results"):
+                all_results.extend(result["results"])
+
+        return json.dumps({
+            "patterns": pattern_list,
+            "logic": logic,
+            "total_matches": len(all_results),
+            "results": all_results[:50],
+        }, ensure_ascii=False, indent=2)[:15000]
     return _safe_call(_run, "multi_search")
 
 
@@ -1280,11 +1357,25 @@ def xref_search(
     """
     from apk_agent.tools.advanced_search import cross_reference_search
 
-    d = _resolve_dir(directory, default="jadx")
-
     def _run():
-        result = cross_reference_search(d, class_or_method, search_type=search_type)
-        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
+        all_refs = []
+        low_dir = (directory or "").strip().lower().replace("\\", "/")
+        if directory and low_dir not in ("", "jadx"):
+            dirs = [_resolve_dir(directory, default="jadx")]
+        else:
+            dirs = [_project.jadx_dir] + _get_all_smali_dirs()
+
+        for d in dirs:
+            result = cross_reference_search(d, class_or_method, search_type=search_type)
+            if isinstance(result, dict) and result.get("references"):
+                all_refs.extend(result["references"])
+
+        return json.dumps({
+            "success": True,
+            "target": class_or_method,
+            "search_type": search_type,
+            "references": all_refs[:50],
+        }, ensure_ascii=False, indent=2)[:15000]
     return _safe_call(_run, "xref_search")
 
 
@@ -2317,13 +2408,14 @@ def auto_patch_bypass(
                     return json.dumps({"success": False, "error": f"Unknown category '{c}'. Valid: {valid}"})
 
         from apk_agent.progress import report_progress
+        report_progress(2, "Starting auto-patch…")
         stats = run_smali_patches(
             smali_dirs=smali_dirs,
             categories=cats,
             backup_dir=_project.patch_backup_dir,
             custom_device_id=custom_device_id,
         )
-        return json.dumps(stats.to_dict(), ensure_ascii=False, indent=2)[:20000]
+        return json.dumps(stats.to_dict(), ensure_ascii=False, indent=2)[:4000]
     return _safe_call(_run, "auto_patch_bypass")
 
 

@@ -66,6 +66,23 @@ class PatchStats:
     categories_hit: set = field(default_factory=set)
 
     def to_dict(self) -> dict:
+        # Group details by category for compact output (avoid listing every file)
+        by_cat: dict[str, dict] = {}
+        for d in self.applied_details:
+            cat = d.get("category", "unknown")
+            if cat not in by_cat:
+                by_cat[cat] = {"patches": 0, "files": set(), "tags": set()}
+            by_cat[cat]["patches"] += d.get("matches", 1)
+            by_cat[cat]["files"].add(d.get("file", "?"))
+            by_cat[cat]["tags"].add(d.get("tag", ""))
+        cat_summary = {
+            cat: {
+                "patches": info["patches"],
+                "files_count": len(info["files"]),
+                "tags": sorted(info["tags"]),
+            }
+            for cat, info in by_cat.items()
+        }
         return {
             "success": self.files_patched > 0 or not self.errors,
             "files_scanned": self.files_scanned,
@@ -73,8 +90,8 @@ class PatchStats:
             "files_patched": self.files_patched,
             "patterns_applied": self.patterns_applied,
             "categories_hit": sorted(self.categories_hit),
-            "details": self.applied_details[:60],
-            "errors": self.errors[:20],
+            "per_category": cat_summary,
+            "errors": self.errors[:10],
         }
 
 
@@ -455,12 +472,29 @@ def _parallel_scan(
     workers = max_workers or min(cpu_count() or 4, 8)
     matched: list[tuple[Path, str]] = []
 
+    # Progress helper for scan phase
+    try:
+        from apk_agent.progress import report_progress as _rp
+    except Exception:
+        _rp = None
+
+    total = len(files)
+    done = 0
+    report_every = max(1, total // 20)  # update ~20 times during scan
+
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_scan_file, f, compiled): f for f in files}
         for fut in as_completed(futures):
             result = fut.result()
             if result is not None:
                 matched.append(result)
+            done += 1
+            if _rp and done % report_every == 0:
+                pct = 5 + (done / total) * 35  # 5-40%
+                try:
+                    _rp(pct, f"Scanned {done}/{total} files ({len(matched)} hits)")
+                except Exception:
+                    pass
 
     return matched
 
@@ -579,16 +613,45 @@ def run_smali_patches(
         stats.errors.append("No .smali files found in the given directories")
         return stats
 
+    # Progress helper (safe import — works even outside agent context)
+    try:
+        from apk_agent.progress import report_progress as _rp
+    except Exception:
+        _rp = None
+
+    def _report(pct: float, detail: str = "") -> None:
+        if _rp:
+            try:
+                _rp(pct, detail)
+            except Exception:
+                pass
+
+    _report(5, f"Scanning {len(files)} smali files…")
+
     # Phase 1: parallel scan to find matching files
     matched = _parallel_scan(files, patterns, max_workers=max_workers)
     stats.files_matched = len(matched)
 
+    _report(40, f"Scan done — {len(matched)} files matched")
+
     if not matched:
         return stats
 
+    # Pre-compile regexes once for the patch phase
+    compiled = [p.compiled() for p in patterns]
+
     # Phase 2: apply patches (sequential for file safety)
-    for path in matched:
-        results = _apply_patterns_to_file(path, patterns, backup_dir=backup_dir)
+    total_matched = len(matched)
+    for idx, (file_path, content) in enumerate(matched):
+        if idx % max(1, total_matched // 10) == 0:
+            pct = 40 + (idx / total_matched) * 55  # 40-95%
+            _report(pct, f"Patching {idx}/{total_matched} files…")
+        results = _apply_patterns_to_file(
+            file_path, patterns,
+            backup_dir=backup_dir,
+            preloaded_content=content,
+            compiled_cache=compiled,
+        )
         actual_patches = [r for r in results if "matches" in r]
         if actual_patches:
             stats.files_patched += 1
@@ -600,6 +663,7 @@ def run_smali_patches(
         for e in errors:
             stats.errors.append(f"{e.get('file', '?')}: {e.get('error', '?')}")
 
+    _report(100, f"Done — {stats.patterns_applied} patches applied")
     return stats
 
 

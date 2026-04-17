@@ -164,7 +164,7 @@ Produce a structured summary following the format described in your instructions
 
 # Configurable thresholds (GLM-5.1 context window: 204,800 tokens, max output: 131,072)
 DEFAULT_TOKEN_THRESHOLD = 100_000  # Start compacting — leaves ~105k headroom for response + tools
-KEEP_RECENT_MESSAGES = 20  # Keep the last N messages for immediate context
+KEEP_RECENT_MESSAGES = 14  # Keep the last N messages for immediate context
 MIN_MESSAGES_TO_COMPACT = 30  # Don't compact if fewer messages than this
 
 
@@ -189,15 +189,28 @@ class Compactor:
         have been added since the last compaction.  This prevents the expensive
         compaction LLM call from firing on every turn when the context stays
         near the threshold.
+
+        Emergency override: if token count exceeds 150% of threshold, compact
+        immediately regardless of cooldown — context is critically full.
         """
         if len(messages) < MIN_MESSAGES_TO_COMPACT:
             return False
 
-        # Cooldown — require 10+ new messages since last compaction
+        self.last_token_count = count_message_tokens(messages)
+
+        # Emergency: always compact if >150% of threshold (context critically full)
+        if self.last_token_count >= int(self.token_threshold * 1.5):
+            logger.warning(
+                "Emergency compaction: %d tokens (%.0f%% of threshold)",
+                self.last_token_count,
+                self.last_token_count / self.token_threshold * 100,
+            )
+            return True
+
+        # Normal cooldown — require 10+ new messages since last compaction
         if self._last_compact_msg_count and len(messages) - self._last_compact_msg_count < 10:
             return False
 
-        self.last_token_count = count_message_tokens(messages)
         return self.last_token_count >= self.token_threshold
 
     def estimate_tokens(self, messages: list[BaseMessage]) -> int:
