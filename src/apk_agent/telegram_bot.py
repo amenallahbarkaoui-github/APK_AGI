@@ -7,6 +7,7 @@ module-level graph/tool globals.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -14,7 +15,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -36,10 +37,14 @@ from apk_agent.workspace import Project, ProjectManager
 logger = logging.getLogger("apk_agent.telegram")
 
 _PROCESS_STATUS_FILE = ".telegram-bot-process.json"
+_LOCK_FILE = ".telegram-bot.lock"
 _STATE_FILE = ".telegram-bot-state.json"
 _MAX_TEXT_CHARS = 3500
 _MAX_DOWNLOADABLE_TELEGRAM_FILE_BYTES = 20 * 1_000_000
 _MAX_SENDABLE_DOCUMENT_BYTES = 49 * 1024 * 1024
+_MAX_STATUS_EVENTS = 8
+_STATUS_TEXT_LIMIT = 3900
+_OUTBOUND_DEDUPE_WINDOW_SEC = 6.0
 
 
 def _now_iso() -> str:
@@ -73,6 +78,10 @@ def _status_file(workspace_root: Path) -> Path:
     return workspace_root / _PROCESS_STATUS_FILE
 
 
+def _lock_file(workspace_root: Path) -> Path:
+    return workspace_root / _LOCK_FILE
+
+
 def _state_file(workspace_root: Path) -> Path:
     return workspace_root / _STATE_FILE
 
@@ -93,13 +102,82 @@ def _write_process_status(workspace_root: Path, payload: dict[str, Any]) -> None
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def _read_lock_pid(lock_path: Path) -> int:
+    if not lock_path.is_file():
+        return 0
+    try:
+        return int(lock_path.read_text(encoding="utf-8").strip() or 0)
+    except Exception:
+        return 0
+
+
+def _active_bridge_pid(workspace_root: Path) -> int:
+    lock_pid = _read_lock_pid(_lock_file(workspace_root))
+    if lock_pid and _pid_is_alive(lock_pid):
+        return lock_pid
+
+    status = _read_process_status(workspace_root)
+    status_pid = int(status.get("pid", 0) or 0)
+    if status_pid and _pid_is_alive(status_pid):
+        return status_pid
+    return 0
+
+
+@dataclass
+class TelegramProcessLock:
+    path: Path
+    fd: int
+    owner_pid: int
+
+    def release(self) -> None:
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+        try:
+            if _read_lock_pid(self.path) == self.owner_pid:
+                self.path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _acquire_process_lock(workspace_root: Path) -> TelegramProcessLock:
+    lock_path = _lock_file(workspace_root)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_CREAT | os.O_EXCL | os.O_RDWR
+
+    while True:
+        try:
+            fd = os.open(str(lock_path), flags)
+        except FileExistsError:
+            existing_pid = _read_lock_pid(lock_path)
+            if existing_pid and _pid_is_alive(existing_pid):
+                raise RuntimeError(f"Telegram bridge already running (PID {existing_pid}).")
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                continue
+            except PermissionError as exc:
+                active_pid = _active_bridge_pid(workspace_root)
+                if active_pid and _pid_is_alive(active_pid):
+                    raise RuntimeError(f"Telegram bridge already running (PID {active_pid}).") from exc
+                raise RuntimeError("Telegram bridge already running (lock file is in use).") from exc
+            except OSError as exc:
+                raise RuntimeError(f"Could not clear stale Telegram lock: {exc}") from exc
+            continue
+        break
+
+    os.write(fd, str(os.getpid()).encode("utf-8"))
+    return TelegramProcessLock(path=lock_path, fd=fd, owner_pid=os.getpid())
+
+
 def ensure_telegram_bot_running(config: AppConfig, *, verbose: bool = False) -> tuple[bool, str]:
     """Ensure the Telegram bot bridge background process is running."""
     if not config.telegram_enabled:
         return False, "Telegram bridge is not configured."
 
-    status = _read_process_status(config.workspace_path)
-    pid = int(status.get("pid", 0) or 0)
+    pid = _active_bridge_pid(config.workspace_path)
     if pid and _pid_is_alive(pid):
         return False, f"Telegram bridge already running (PID {pid})."
 
@@ -142,6 +220,9 @@ class TelegramChatState:
     busy: bool = False
     last_artifact_path: str = ""
     last_artifact_mtime: float = 0.0
+    status_message_id: int = 0
+    status_text: str = ""
+    status_recent_events: list[str] = field(default_factory=list)
 
 
 class TelegramStateStore:
@@ -190,6 +271,9 @@ class TelegramStateStore:
                 busy=raw.get("busy", False),
                 last_artifact_path=raw.get("last_artifact_path", ""),
                 last_artifact_mtime=float(raw.get("last_artifact_mtime", 0.0) or 0.0),
+                status_message_id=int(raw.get("status_message_id", 0) or 0),
+                status_text=str(raw.get("status_text", "") or ""),
+                status_recent_events=list(raw.get("status_recent_events", []) or [])[-_MAX_STATUS_EVENTS:],
             )
 
     def save_chat(self, chat_id: int, state: TelegramChatState) -> None:
@@ -249,7 +333,8 @@ class TelegramApi:
             timeout=timeout_sec + 15,
         )
 
-    def send_message(self, chat_id: int, text: str, *, reply_markup: dict[str, Any] | None = None) -> None:
+    def send_message(self, chat_id: int, text: str, *, reply_markup: dict[str, Any] | None = None, disable_notification: bool = False) -> dict[str, Any] | None:
+        last_result: dict[str, Any] | None = None
         for chunk in _chunk_text(text):
             body: dict[str, Any] = {
                 "chat_id": chat_id,
@@ -258,7 +343,30 @@ class TelegramApi:
             }
             if reply_markup:
                 body["reply_markup"] = reply_markup
-            self._request("sendMessage", json_body=body)
+            if disable_notification:
+                body["disable_notification"] = True
+            last_result = self._request("sendMessage", json_body=body)
+        return last_result
+
+    def edit_message_text(self, chat_id: int, message_id: int, text: str) -> Any:
+        return self._request(
+            "editMessageText",
+            json_body={
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": text,
+                "disable_web_page_preview": True,
+            },
+        )
+
+    def send_chat_action(self, chat_id: int, action: str) -> Any:
+        return self._request(
+            "sendChatAction",
+            json_body={
+                "chat_id": chat_id,
+                "action": action,
+            },
+        )
 
     def send_document(self, chat_id: int, file_path: Path, *, caption: str = "") -> None:
         with file_path.open("rb") as handle:
@@ -308,6 +416,13 @@ def _chunk_text(text: str, limit: int = _MAX_TEXT_CHARS) -> list[str]:
     return chunks
 
 
+def _shorten(text: str, *, max_chars: int = 160) -> str:
+    normalized = " ".join(str(text or "").split())
+    if len(normalized) <= max_chars:
+        return normalized
+    return normalized[: max_chars - 3].rstrip() + "..."
+
+
 def _summarize_tool_content(content: str, *, max_chars: int = 1000) -> str:
     content = str(content or "").strip()
     if len(content) <= max_chars:
@@ -352,32 +467,201 @@ class TelegramBotService:
         self.stop_event = threading.Event()
         self.worker_lock = threading.Lock()
         self.active_chat_id: int | None = None
+        self._outbound_lock = threading.Lock()
+        self._status_lock = threading.Lock()
+        self._recent_messages: dict[tuple[int, str], float] = {}
+        self._process_lock: TelegramProcessLock | None = None
+
+    def _prune_recent_messages(self, now: float) -> None:
+        expire_before = now - max(30.0, _OUTBOUND_DEDUPE_WINDOW_SEC * 6)
+        stale_keys = [key for key, ts in self._recent_messages.items() if ts < expire_before]
+        for key in stale_keys:
+            self._recent_messages.pop(key, None)
+
+    def _send_message(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        reply_markup: dict[str, Any] | None = None,
+        dedupe_key: str | None = None,
+        dedupe_window_sec: float = _OUTBOUND_DEDUPE_WINDOW_SEC,
+        force: bool = False,
+        disable_notification: bool = False,
+    ) -> dict[str, Any] | None:
+        text = str(text or "").strip()
+        if not text:
+            return None
+
+        fingerprint_material = dedupe_key or text
+        if reply_markup:
+            fingerprint_material += "\n" + json.dumps(reply_markup, sort_keys=True, ensure_ascii=False)
+        fingerprint = hashlib.sha1(fingerprint_material.encode("utf-8")).hexdigest()
+        now = time.monotonic()
+
+        with self._outbound_lock:
+            self._prune_recent_messages(now)
+            if not force:
+                last_sent = self._recent_messages.get((chat_id, fingerprint))
+                if last_sent is not None and (now - last_sent) < dedupe_window_sec:
+                    return None
+            self._recent_messages[(chat_id, fingerprint)] = now
+
+        return self.api.send_message(
+            chat_id,
+            text,
+            reply_markup=reply_markup,
+            disable_notification=disable_notification,
+        )
+
+    def _send_chat_action(self, chat_id: int, action: str) -> None:
+        try:
+            self.api.send_chat_action(chat_id, action)
+        except Exception as exc:
+            logger.debug("Failed to send chat action %s to %s: %s", action, chat_id, exc)
+
+    def _append_status_event(self, state: TelegramChatState, event: str) -> None:
+        event = _shorten(event, max_chars=160)
+        if not event:
+            return
+        if state.status_recent_events and state.status_recent_events[-1] == event:
+            return
+        state.status_recent_events.append(event)
+        state.status_recent_events = state.status_recent_events[-_MAX_STATUS_EVENTS:]
+
+    def _build_status_text(self, state: TelegramChatState, headline: str, detail: str = "") -> str:
+        lines = [
+            "APK Agent Live Status",
+            f"Project: {state.current_project_id or 'none'}",
+            f"Thinking: {'ON' if state.thinking_enabled else 'OFF'} | Auto: {'ON' if state.auto_mode else 'OFF'} | Busy: {'YES' if state.busy else 'NO'}",
+        ]
+
+        if headline:
+            lines.append(f"Stage: {_shorten(headline, max_chars=220)}")
+
+        if detail:
+            for raw_line in str(detail).splitlines():
+                raw_line = raw_line.strip()
+                if raw_line:
+                    lines.append(_shorten(raw_line, max_chars=240))
+
+        if state.status_recent_events:
+            lines.append("Recent activity:")
+            for event in state.status_recent_events[-6:]:
+                lines.append(f"- {event}")
+
+        text = "\n".join(lines)
+        if len(text) > _STATUS_TEXT_LIMIT:
+            text = text[: _STATUS_TEXT_LIMIT - 3].rstrip() + "..."
+        return text
+
+    def _set_status(
+        self,
+        chat_id: int,
+        state: TelegramChatState,
+        headline: str,
+        detail: str = "",
+        *,
+        record_event: str | None = None,
+        extra_events: list[str] | None = None,
+        force_new: bool = False,
+    ) -> None:
+        with self._status_lock:
+            if extra_events:
+                for event in extra_events:
+                    self._append_status_event(state, event)
+            elif record_event:
+                self._append_status_event(state, record_event)
+
+            status_text = self._build_status_text(state, headline, detail)
+            if state.status_message_id and not force_new and status_text == state.status_text:
+                return
+
+            if state.status_message_id and not force_new:
+                try:
+                    self.api.edit_message_text(chat_id, state.status_message_id, status_text)
+                except Exception as exc:
+                    lower = str(exc).lower()
+                    if "message is not modified" in lower:
+                        state.status_text = status_text
+                        self.state_store.save_chat(chat_id, state)
+                        return
+                    logger.debug("Status edit failed for chat %s: %s", chat_id, exc)
+                    state.status_message_id = 0
+
+            if not state.status_message_id or force_new:
+                result = self._send_message(
+                    chat_id,
+                    status_text,
+                    dedupe_key=f"status:{chat_id}:{hashlib.sha1(status_text.encode('utf-8')).hexdigest()}",
+                    force=True,
+                    disable_notification=True,
+                )
+                if result and result.get("message_id"):
+                    state.status_message_id = int(result["message_id"])
+
+            state.status_text = status_text
+            self.state_store.save_chat(chat_id, state)
 
     def run_forever(self) -> None:
-        me = self.api.get_me()
-        _write_process_status(
-            self.config.workspace_path,
-            {
-                "pid": os.getpid(),
-                "started_at": _now_iso(),
-                "status": "running",
-                "username": me.get("username", ""),
-                "workspace_root": str(self.config.workspace_path),
-            },
-        )
-        logger.info("Telegram bridge started as @%s", me.get("username", "unknown"))
+        try:
+            self._process_lock = _acquire_process_lock(self.config.workspace_path)
+        except RuntimeError as exc:
+            logger.warning("Telegram bridge refused to start: %s", exc)
+            return
 
-        offset = self.state_store.get_last_update_id()
-        while not self.stop_event.is_set():
-            try:
-                updates = self.api.get_updates(offset, self.config.telegram_poll_timeout_sec)
-                for update in updates:
-                    offset = max(offset, int(update["update_id"]) + 1)
-                    self.state_store.set_last_update_id(offset)
-                    self._handle_update(update)
-            except Exception as exc:
-                logger.exception("Telegram polling error: %s", exc)
-                time.sleep(3)
+        me: dict[str, Any] = {}
+        final_status = "stopped"
+        final_error = ""
+
+        try:
+            me = self.api.get_me()
+            _write_process_status(
+                self.config.workspace_path,
+                {
+                    "pid": os.getpid(),
+                    "started_at": _now_iso(),
+                    "status": "running",
+                    "username": me.get("username", ""),
+                    "workspace_root": str(self.config.workspace_path),
+                },
+            )
+            logger.info("Telegram bridge started as @%s", me.get("username", "unknown"))
+
+            offset = self.state_store.get_last_update_id()
+            while not self.stop_event.is_set():
+                try:
+                    updates = self.api.get_updates(offset, self.config.telegram_poll_timeout_sec)
+                    for update in updates:
+                        offset = max(offset, int(update["update_id"]) + 1)
+                        self.state_store.set_last_update_id(offset)
+                        self._handle_update(update)
+                except Exception as exc:
+                    error_text = str(exc)
+                    if "getupdates failed (409)" in error_text.lower():
+                        final_status = "conflict"
+                        final_error = error_text
+                        logger.error("Another Telegram poller is active; stopping current bridge: %s", exc)
+                        break
+                    logger.exception("Telegram polling error: %s", exc)
+                    time.sleep(3)
+        finally:
+            current_status = _read_process_status(self.config.workspace_path)
+            if int(current_status.get("pid", 0) or 0) in {0, os.getpid()}:
+                payload = {
+                    "pid": os.getpid(),
+                    "started_at": current_status.get("started_at", _now_iso()),
+                    "status": final_status,
+                    "username": me.get("username", current_status.get("username", "")),
+                    "workspace_root": str(self.config.workspace_path),
+                }
+                if final_error:
+                    payload["error"] = final_error
+                _write_process_status(self.config.workspace_path, payload)
+
+            self.api.close()
+            if self._process_lock is not None:
+                self._process_lock.release()
 
     def _handle_update(self, update: dict[str, Any]) -> None:
         message = update.get("message") or {}
@@ -388,7 +672,7 @@ class TelegramBotService:
 
         if chat_id not in self.allowed_chat_ids:
             try:
-                self.api.send_message(chat_id, "Access denied for this chat.")
+                self._send_message(chat_id, "Access denied for this chat.")
             except Exception:
                 pass
             return
@@ -399,7 +683,7 @@ class TelegramBotService:
 
         text = (message.get("text") or "").strip()
         if not text:
-            self.api.send_message(chat_id, "Send an APK/XAPK file or a text command like /help.")
+            self._send_message(chat_id, "Send an APK/XAPK file or a text command like /help.")
             return
 
         if text.startswith("/"):
@@ -413,7 +697,7 @@ class TelegramBotService:
         state = self.state_store.get_chat(chat_id, self.config.thinking_enabled)
 
         if cmd == "/start":
-            self.api.send_message(
+            self._send_message(
                 chat_id,
                 "APK Agent Telegram bridge is ready.\n\n"
                 "1. Send an APK or XAPK file.\n"
@@ -422,10 +706,17 @@ class TelegramBotService:
                 "Commands: /help /status /new /thinking /auto",
                 reply_markup=_reply_keyboard(),
             )
+            self._set_status(
+                chat_id,
+                state,
+                "Waiting for APK upload",
+                "Send an APK or XAPK file to create a project.",
+                record_event="Bridge ready",
+            )
             return
 
         if cmd == "/help":
-            self.api.send_message(
+            self._send_message(
                 chat_id,
                 "Commands:\n"
                 "/status - show current project and modes\n"
@@ -440,20 +731,25 @@ class TelegramBotService:
             state.current_project_id = ""
             state.pending_interrupt = False
             state.awaiting_mode_choice = False
+            state.busy = False
             state.last_artifact_path = ""
             state.last_artifact_mtime = 0.0
-            self.state_store.save_chat(chat_id, state)
-            self.api.send_message(chat_id, "Current project cleared. Send a new APK or XAPK file.")
+            state.status_recent_events = []
+            self._set_status(
+                chat_id,
+                state,
+                "Waiting for APK upload",
+                "Current project cleared. Send a new APK or XAPK file.",
+                record_event="Session reset",
+            )
             return
 
         if cmd == "/status":
-            busy = "yes" if state.busy else "no"
-            thinking = "ON" if state.thinking_enabled else "OFF"
-            auto_mode = "ON" if state.auto_mode else "OFF"
-            project_line = state.current_project_id or "none"
-            self.api.send_message(
+            self._set_status(
                 chat_id,
-                f"Project: {project_line}\nThinking: {thinking}\nAuto: {auto_mode}\nBusy: {busy}\nPending interrupt: {'yes' if state.pending_interrupt else 'no'}",
+                "Current bridge state",
+                f"Pending interrupt: {'yes' if state.pending_interrupt else 'no'}",
+                record_event=None,
             )
             return
 
@@ -461,39 +757,49 @@ class TelegramBotService:
             if arg in {"on", "off"}:
                 state.thinking_enabled = arg == "on"
                 state.awaiting_mode_choice = False
-                self.state_store.save_chat(chat_id, state)
-                self.api.send_message(chat_id, f"Thinking mode is now {'ON' if state.thinking_enabled else 'OFF'}.")
+                self._set_status(
+                    chat_id,
+                    state,
+                    "Setting updated",
+                    f"Thinking mode is now {'ON' if state.thinking_enabled else 'OFF'}.",
+                    record_event=f"Thinking mode -> {'ON' if state.thinking_enabled else 'OFF'}",
+                )
             else:
-                self.api.send_message(chat_id, f"Thinking mode is {'ON' if state.thinking_enabled else 'OFF'}. Use /thinking on or /thinking off.")
+                self._send_message(chat_id, f"Thinking mode is {'ON' if state.thinking_enabled else 'OFF'}. Use /thinking on or /thinking off.")
             return
 
         if cmd == "/auto":
             if arg in {"on", "off"}:
                 state.auto_mode = arg == "on"
-                self.state_store.save_chat(chat_id, state)
-                self.api.send_message(chat_id, f"Auto mode is now {'ON' if state.auto_mode else 'OFF'}.")
+                self._set_status(
+                    chat_id,
+                    state,
+                    "Setting updated",
+                    f"Auto mode is now {'ON' if state.auto_mode else 'OFF'}.",
+                    record_event=f"Auto mode -> {'ON' if state.auto_mode else 'OFF'}",
+                )
             else:
-                self.api.send_message(chat_id, f"Auto mode is {'ON' if state.auto_mode else 'OFF'}. Use /auto on or /auto off.")
+                self._send_message(chat_id, f"Auto mode is {'ON' if state.auto_mode else 'OFF'}. Use /auto on or /auto off.")
             return
 
-        self.api.send_message(chat_id, "Unknown command. Use /help.")
+        self._send_message(chat_id, "Unknown command. Use /help.")
 
     def _handle_document(self, chat_id: int, message: dict[str, Any]) -> None:
         state = self.state_store.get_chat(chat_id, self.config.thinking_enabled)
         if state.busy:
-            self.api.send_message(chat_id, "A task is already running. Wait for it to finish before uploading another APK.")
+            self._send_message(chat_id, "A task is already running. Wait for it to finish before uploading another APK.")
             return
 
         doc = message["document"]
         file_name = doc.get("file_name") or f"upload-{doc.get('file_unique_id', 'apk')}.apk"
         suffix = Path(file_name).suffix.lower()
         if suffix not in {".apk", ".xapk"}:
-            self.api.send_message(chat_id, "Only .apk and .xapk files are supported.")
+            self._send_message(chat_id, "Only .apk and .xapk files are supported.")
             return
 
         upload_size = int(doc.get("file_size") or 0)
         if upload_size > _MAX_DOWNLOADABLE_TELEGRAM_FILE_BYTES:
-            self.api.send_message(
+            self._send_message(
                 chat_id,
                 "Telegram cloud download is limited to 20 MB per file for bots.\n"
                 f"`{file_name}` is about {upload_size / (1024 * 1024):.1f} MB, so Telegram will reject getFile before APK Agent can import it.\n"
@@ -504,14 +810,32 @@ class TelegramBotService:
         chat_upload_dir = self.config.workspace_path / "telegram_uploads" / str(chat_id)
         download_path = chat_upload_dir / file_name
 
-        self.api.send_message(chat_id, f"Downloading `{file_name}` from Telegram...")
+        state.status_recent_events = []
+        self._set_status(
+            chat_id,
+            state,
+            "Receiving APK upload",
+            f"File: {file_name}\nSize: {upload_size / (1024 * 1024):.1f} MB",
+            record_event=f"Upload received: {file_name}",
+        )
         try:
+            self._set_status(chat_id, state, "Preparing Telegram download", f"Resolving remote file path for {file_name}.", record_event="Resolved Telegram file metadata")
             telegram_file = self.api.get_file(doc["file_id"])
+            self._send_chat_action(chat_id, "upload_document")
+            self._set_status(chat_id, state, "Downloading APK from Telegram", f"Downloading {file_name} from Telegram cloud.", record_event=f"Downloading {file_name}")
             self.api.download_file(telegram_file["file_path"], download_path)
+            self._set_status(chat_id, state, "Importing APK into workspace", f"Creating project from {file_name}.", record_event="Importing APK into workspace")
             project = self.pm.create_project(download_path, self.config.max_apk_size_mb)
         except Exception as exc:
             logger.exception("Failed to import Telegram APK")
-            self.api.send_message(chat_id, f"Failed to import APK: {exc}")
+            self._set_status(
+                chat_id,
+                state,
+                "APK import failed",
+                str(exc),
+                record_event=f"Import failed: {_shorten(str(exc), max_chars=120)}",
+            )
+            self._send_message(chat_id, f"Failed to import APK: {exc}")
             return
         finally:
             try:
@@ -526,14 +850,21 @@ class TelegramBotService:
         state.busy = False
         state.last_artifact_path = ""
         state.last_artifact_mtime = 0.0
-        self.state_store.save_chat(chat_id, state)
+        self._set_status(
+            chat_id,
+            state,
+            "APK imported successfully",
+            f"Project: {project.id}\nFile: {project.apk_name}\nChoose thinking mode, then send your task.",
+            record_event=f"Project ready: {project.id}",
+        )
 
-        self.api.send_message(
+        self._send_message(
             chat_id,
             f"APK received successfully.\nProject: {project.id}\nFile: {project.apk_name}\n\n"
             f"Thinking is currently {'ON' if state.thinking_enabled else 'OFF'}.\n"
             "Reply with `thinking on` or `thinking off`, then send your task.",
             reply_markup=_reply_keyboard(),
+            dedupe_key=f"apk-ready:{project.id}",
         )
 
     def _handle_text(self, chat_id: int, text: str) -> None:
@@ -543,22 +874,34 @@ class TelegramBotService:
         if lowered in {"thinking on", "thinking off"}:
             state.thinking_enabled = lowered.endswith("on")
             state.awaiting_mode_choice = False
-            self.state_store.save_chat(chat_id, state)
-            self.api.send_message(chat_id, f"Thinking mode is now {'ON' if state.thinking_enabled else 'OFF'}. Now send your task.")
+            self._set_status(
+                chat_id,
+                state,
+                "Setting updated",
+                f"Thinking mode is now {'ON' if state.thinking_enabled else 'OFF'}. Now send your task.",
+                record_event=f"Thinking mode -> {'ON' if state.thinking_enabled else 'OFF'}",
+            )
             return
 
         if not state.current_project_id:
-            self.api.send_message(chat_id, "No active project yet. Send an APK or XAPK file first.")
+            self._send_message(chat_id, "No active project yet. Send an APK or XAPK file first.")
             return
 
         if state.busy:
-            self.api.send_message(chat_id, "A task is already running. Wait for the current run to finish.")
+            self._send_message(chat_id, "A task is already running. Wait for the current run to finish.")
             return
 
         resume = state.pending_interrupt
         state.awaiting_mode_choice = False
         state.busy = True
         self.state_store.save_chat(chat_id, state)
+        self._set_status(
+            chat_id,
+            state,
+            "Queued user request",
+            f"Request: {_shorten(text, max_chars=220)}",
+            record_event=f"User request: {_shorten(text, max_chars=120)}",
+        )
 
         thread = threading.Thread(
             target=self._run_turn_worker,
@@ -571,8 +914,13 @@ class TelegramBotService:
         if not self.worker_lock.acquire(blocking=False):
             state = self.state_store.get_chat(chat_id, self.config.thinking_enabled)
             state.busy = False
-            self.state_store.save_chat(chat_id, state)
-            self.api.send_message(chat_id, "Another Telegram task is running right now. Try again in a moment.")
+            self._set_status(
+                chat_id,
+                state,
+                "Bridge busy",
+                "Another Telegram task is already running globally. Try again in a moment.",
+                record_event="Global worker busy",
+            )
             return
 
         self.active_chat_id = chat_id
@@ -580,11 +928,17 @@ class TelegramBotService:
             self._run_turn(chat_id, text, resume=resume)
         except Exception as exc:
             logger.exception("Telegram turn failed")
-            self.api.send_message(chat_id, f"Agent run failed: {exc}")
             state = self.state_store.get_chat(chat_id, self.config.thinking_enabled)
             state.pending_interrupt = False
             state.busy = False
-            self.state_store.save_chat(chat_id, state)
+            self._set_status(
+                chat_id,
+                state,
+                "Agent run failed",
+                str(exc),
+                record_event=f"Run failed: {_shorten(str(exc), max_chars=120)}",
+            )
+            self._send_message(chat_id, f"Agent run failed: {exc}")
         finally:
             self.active_chat_id = None
             self.worker_lock.release()
@@ -615,9 +969,16 @@ class TelegramBotService:
             session_meta.touch()
             stream_input = self._build_input_state(graph, graph_config, text, project)
 
+        state.status_recent_events = []
         state.pending_interrupt = False
-        self.state_store.save_chat(chat_id, state)
-        self.api.send_message(chat_id, f"Starting task on project {project.id}...")
+        self._send_chat_action(chat_id, "typing")
+        self._set_status(
+            chat_id,
+            state,
+            "Starting task",
+            f"Project: {project.id}\nRequest: {_shorten(text, max_chars=240)}",
+            record_event=f"Task started: {_shorten(text, max_chars=120)}",
+        )
 
         while True:
             interrupt_info: dict[str, Any] | None = None
@@ -628,7 +989,7 @@ class TelegramBotService:
                 events = graph.stream(stream_input, config=graph_config, stream_mode="updates")
 
             for event in events:
-                interrupt_info = self._process_stream_event(chat_id, event)
+                interrupt_info = self._process_stream_event(chat_id, state, event)
                 if interrupt_info:
                     break
 
@@ -636,6 +997,14 @@ class TelegramBotService:
                 break
 
             if state.auto_mode:
+                prompt_preview = _shorten(interrupt_info.get("prompt", ""), max_chars=220)
+                self._set_status(
+                    chat_id,
+                    state,
+                    "Auto-approving agent prompt",
+                    prompt_preview,
+                    record_event="Auto approval sent to agent",
+                )
                 stream_input = interrupt_info["response"]
                 is_resume = True
                 continue
@@ -643,13 +1012,31 @@ class TelegramBotService:
             state.pending_interrupt = True
             state.busy = False
             self.state_store.save_chat(chat_id, state)
+            self._set_status(
+                chat_id,
+                state,
+                "Waiting for your reply",
+                interrupt_info.get("prompt", ""),
+                record_event="Awaiting Telegram reply",
+            )
+            self._send_message(
+                chat_id,
+                interrupt_info.get("prompt", ""),
+                dedupe_key=f"interrupt:{hashlib.sha1(str(interrupt_info.get('prompt', '')).encode('utf-8')).hexdigest()}",
+            )
             session_meta.touch()
             save_session_meta(session_meta, project.workspace_path)
             return
 
         state.pending_interrupt = False
         state.busy = False
-        self.state_store.save_chat(chat_id, state)
+        self._set_status(
+            chat_id,
+            state,
+            "Task completed",
+            "Checking final signed APK and preparing delivery.",
+            record_event="Task finished",
+        )
         session_meta.touch()
         save_session_meta(session_meta, project.workspace_path)
         self._send_final_artifact_if_ready(chat_id, project, state)
@@ -709,28 +1096,58 @@ class TelegramBotService:
         save_session_meta(meta, project.workspace_path)
         return meta
 
-    def _process_stream_event(self, chat_id: int, event: dict[str, Any]) -> dict[str, Any] | None:
+    def _process_stream_event(self, chat_id: int, state: TelegramChatState, event: dict[str, Any]) -> dict[str, Any] | None:
         for node_name, node_output in event.items():
             if node_name == "agent":
                 messages = node_output.get("messages", [])
                 for msg in messages:
                     if isinstance(msg, AIMessage):
                         if msg.content and isinstance(msg.content, str) and msg.content.strip():
-                            self.api.send_message(chat_id, msg.content)
+                            self._send_message(
+                                chat_id,
+                                msg.content,
+                                dedupe_key=f"ai:{hashlib.sha1(msg.content.encode('utf-8')).hexdigest()}",
+                                dedupe_window_sec=12.0,
+                            )
                         if msg.tool_calls:
                             tool_names = [tc.get("name", "tool") for tc in msg.tool_calls]
-                            if len(tool_names) == 1:
-                                self.api.send_message(chat_id, f"Running tool: {tool_names[0]}")
-                            else:
-                                self.api.send_message(chat_id, "Running tools in parallel:\n" + "\n".join(f"- {name}" for name in tool_names))
+                            headline = "Running tool" if len(tool_names) == 1 else f"Running {len(tool_names)} tools in parallel"
+                            detail = "Current tool: " + tool_names[0] if len(tool_names) == 1 else "Current tools:\n" + "\n".join(f"- {name}" for name in tool_names[:6])
+                            self._send_chat_action(chat_id, "typing")
+                            self._set_status(
+                                chat_id,
+                                state,
+                                headline,
+                                detail,
+                                extra_events=[f"Tool scheduled: {name}" for name in tool_names],
+                            )
 
             elif node_name == "tools":
                 tool_messages = [m for m in node_output.get("messages", []) if isinstance(m, ToolMessage)]
                 if tool_messages:
-                    self.api.send_message(chat_id, _format_tool_batch(tool_messages))
+                    summaries: list[str] = []
+                    for tool_msg in tool_messages:
+                        content = str(tool_msg.content or "")
+                        lower = content[:200].lower()
+                        failed = '"success": false' in lower or '"error"' in lower[:120] or lower.startswith("error")
+                        summaries.append(f"{tool_msg.name or 'tool'}: {'failed' if failed else 'ok'}")
+
+                    self._set_status(
+                        chat_id,
+                        state,
+                        "Tool results received",
+                        "\n".join(summaries[-4:]),
+                        extra_events=summaries,
+                    )
 
             elif node_name == "nudge":
-                self.api.send_message(chat_id, "Agent was nudged to keep executing tools.")
+                self._set_status(
+                    chat_id,
+                    state,
+                    "Agent nudged to continue",
+                    "The orchestration layer asked the agent to keep executing tools.",
+                    record_event="Agent nudged",
+                )
 
             elif node_name == "__interrupt__":
                 interrupts = node_output
@@ -742,30 +1159,65 @@ class TelegramBotService:
                             response = "Proceed with your best judgment."
                         else:
                             response = "yes"
-                        self.api.send_message(chat_id, value_str)
-                        return {"interrupt": True, "response": response}
+                        return {"interrupt": True, "prompt": value_str, "response": response}
         return None
 
     def _send_final_artifact_if_ready(self, chat_id: int, project: Project, state: TelegramChatState) -> None:
         signed_apk = Path(project.workspace_path) / "outputs" / "patched-signed.apk"
         if not signed_apk.is_file():
+            self._set_status(
+                chat_id,
+                state,
+                "Task completed",
+                "No final signed APK was found in outputs/patched-signed.apk.",
+                record_event="No signed artifact produced",
+            )
             return
 
         stat = signed_apk.stat()
         if signed_apk.resolve().as_posix() == state.last_artifact_path and stat.st_mtime <= state.last_artifact_mtime:
+            self._set_status(
+                chat_id,
+                state,
+                "Done",
+                f"Final APK already sent earlier: {signed_apk.name}",
+                record_event=f"Artifact already sent: {signed_apk.name}",
+            )
             return
 
         if stat.st_size > _MAX_SENDABLE_DOCUMENT_BYTES:
-            self.api.send_message(
+            self._send_message(
                 chat_id,
                 "Final signed APK is ready, but Telegram refused to send files larger than 49 MB.\n"
                 f"Local path: {signed_apk}",
             )
+            self._set_status(
+                chat_id,
+                state,
+                "Final artifact ready locally",
+                f"Telegram send limit exceeded. Local path: {signed_apk}",
+                record_event=f"Signed APK ready locally: {signed_apk.name}",
+            )
         else:
+            self._send_chat_action(chat_id, "upload_document")
+            self._set_status(
+                chat_id,
+                state,
+                "Uploading final APK",
+                f"Sending {signed_apk.name} back to Telegram.",
+                record_event=f"Uploading {signed_apk.name}",
+            )
             self.api.send_document(
                 chat_id,
                 signed_apk,
                 caption=f"Final patched APK for project {project.id}",
+            )
+            self._set_status(
+                chat_id,
+                state,
+                "Done",
+                f"Final patched APK sent successfully: {signed_apk.name}",
+                record_event=f"Final APK sent: {signed_apk.name}",
             )
 
         state.last_artifact_path = signed_apk.resolve().as_posix()

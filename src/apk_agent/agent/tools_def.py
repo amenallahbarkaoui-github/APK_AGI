@@ -1923,20 +1923,63 @@ def analyze_subscription_model(smali_file: str) -> str:
                     field_deps[sig] = read_fields[:5]
 
                 if is_gate:
-                    # Build a recommended patch
+                    # Build a recommended patch with SEMANTIC AWARENESS
+                    # Determine if the method semantics are POSITIVE (isPremium → force TRUE)
+                    # or NEGATIVE (isExpired, isTrial, isFree → force FALSE)
+                    _NEGATIVE_SEMANTICS = (
+                        "expire", "trial", "free", "locked", "restrict", "limit",
+                        "block", "disable", "invalid", "revoke", "cancel", "trier",
+                        "unpaid", "demo", "basic", "lite",
+                    )
+                    _POSITIVE_SEMANTICS = (
+                        "premium", "pro", "vip", "paid", "active", "valid", "unlock",
+                        "enable", "subscrib", "license", "purchased", "own", "lifetime",
+                        "svip", "gold", "diamond", "elite",
+                    )
+                    # Check method name and string constants for semantic hints
+                    name_lower = mname.lower()
+                    str_lower = " ".join(str_consts).lower() if str_consts else ""
+                    combined_text = f"{name_lower} {str_lower}"
+
+                    is_negative = any(neg in combined_text for neg in _NEGATIVE_SEMANTICS)
+                    is_positive = any(pos in combined_text for pos in _POSITIVE_SEMANTICS)
+
+                    # If STRING_EQUALITY, check the compared string for semantics
+                    if "STRING_EQUALITY" in str(behaviors) and str_consts:
+                        for sc in str_consts:
+                            sc_lower = sc.lower()
+                            if any(neg in sc_lower for neg in ("trier", "free", "trial", "basic", "lite", "demo")):
+                                is_negative = True
+                            if any(pos in sc_lower for pos in ("svip", "vip", "pro", "premium", "gold")):
+                                is_positive = True
+
                     if ret == "Z":
+                        if is_negative and not is_positive:
+                            force_value = "0x0"
+                            force_label = "FALSE"
+                            reason = "Negative semantic (expiry/trial/free check) → force FALSE to negate restriction"
+                        elif is_positive and not is_negative:
+                            force_value = "0x1"
+                            force_label = "TRUE"
+                            reason = "Positive semantic (premium/pro/active check) → force TRUE to affirm privilege"
+                        else:
+                            # Ambiguous or obfuscated — default TRUE but flag for jadx verification
+                            force_value = "0x1"
+                            force_label = "TRUE"
+                            reason = "Ambiguous semantics — VERIFY with jadx source whether TRUE or FALSE means 'unlocked'"
                         method_info["recommended_patch"] = {
                             "operation": "replace_block",
                             "match_pattern": f".method {access} {sig}",
-                            "strategy": "Insert 'const/4 v0, 0x1\\n    return v0' after .locals/.registers line to force TRUE",
-                            "note": "Check with jadx source if TRUE or FALSE is the 'unlocked' value",
+                            "strategy": f"Insert 'const/4 v0, {force_value}\\n    return v0' after .locals/.registers line to force {force_label}",
+                            "note": reason,
+                            "semantic_hint": "negative" if is_negative else ("positive" if is_positive else "ambiguous"),
                         }
                     elif ret == "I":
                         method_info["recommended_patch"] = {
                             "operation": "replace_block",
                             "match_pattern": f".method {access} {sig}",
                             "strategy": "Insert 'const/4 v0, 0x2\\n    return v0' (or the premium int value) after .locals line",
-                            "note": "Read jadx source to determine which int value = premium",
+                            "note": "Read jadx source to determine which int value = premium tier",
                         }
                     gate_methods.append(method_info)
                     if str_consts:
@@ -2389,6 +2432,23 @@ def batch_patch_methods(patches_json: str) -> str:
         total_ok = 0
         total_fail = 0
 
+        def _match_method(header: str, query: str) -> bool:
+            """Match a method header against a query string.
+            Supports both name-only ('isPremium') and signature ('isPremium()Z') queries.
+            """
+            m = _re.search(r'(\S+)\(', header)
+            if not m:
+                return False
+            name = m.group(1)
+            if '(' in query:
+                # Signature match: extract from method name to end
+                try:
+                    sig = header[header.index(name):]
+                    return query in sig
+                except ValueError:
+                    return False
+            return name == query
+
         for file_rel, file_patches in by_file.items():
             fpath = _resolve_file(file_rel)
             if not fpath.is_file():
@@ -2398,13 +2458,33 @@ def batch_patch_methods(patches_json: str) -> str:
                     total_fail += 1
                 continue
 
-            # Backup
-            backup = _project.patch_backup_dir / fpath.name
+            # Backup — use relative path hash to avoid filename collisions
+            backup = _project.patch_backup_dir / (file_rel.replace("/", "_").replace("\\", "_"))
             _project.patch_backup_dir.mkdir(parents=True, exist_ok=True)
             shutil.copy2(fpath, backup)
 
             text = fpath.read_text(encoding="utf-8", errors="replace")
             lines = text.splitlines()
+
+            # Pre-index ALL methods in the file to avoid index-shift problems.
+            # We collect (start, end, header) for every method.
+            method_ranges: list[tuple[int, int, str]] = []
+            cur_start = -1
+            cur_header = ""
+            for i, ln in enumerate(lines):
+                s = ln.strip()
+                if s.startswith(".method"):
+                    cur_start = i
+                    cur_header = s
+                elif s == ".end method" and cur_start >= 0:
+                    method_ranges.append((cur_start, i, cur_header))
+                    cur_start = -1
+                    cur_header = ""
+
+            # Track already-patched method indices to avoid double-patching
+            patched_indices: set[int] = set()
+            # Track cumulative line offset from previous patches in this file
+            line_offset = 0
 
             for p in file_patches:
                 method_q = p.get("method", "")
@@ -2412,32 +2492,27 @@ def batch_patch_methods(patches_json: str) -> str:
                 value = p.get("value")
                 desc = p.get("description", "")
 
-                # Find the method
-                def _match(header, q, _re=_re):
-                    m = _re.search(r'(\S+)\(', header)
-                    if not m:
-                        return False
-                    name = m.group(1)
-                    if '(' in q:
-                        sig = header[header.index(name):]
-                        return q in sig
-                    return name == q
-
-                m_start = -1
-                m_end = -1
-                for i, ln in enumerate(lines):
-                    s = ln.strip()
-                    if s.startswith(".method") and _match(s, method_q):
-                        m_start = i
-                    if m_start >= 0 and s == ".end method":
-                        m_end = i
+                # Find the FIRST unpatched method matching the query
+                found_idx = -1
+                for midx, (m_start_orig, m_end_orig, m_header) in enumerate(method_ranges):
+                    if midx in patched_indices:
+                        continue
+                    if _match_method(m_header, method_q):
+                        found_idx = midx
                         break
 
-                if m_start < 0:
+                if found_idx < 0:
                     results.append({"method": method_q, "file": file_rel,
                                     "success": False, "error": f"Method not found: {method_q}"})
                     total_fail += 1
                     continue
+
+                patched_indices.add(found_idx)
+                m_start_orig, m_end_orig, _ = method_ranges[found_idx]
+
+                # Adjust for cumulative line offset from previous patches
+                m_start = m_start_orig + line_offset
+                m_end = m_end_orig + line_offset
 
                 # Build replacement instructions
                 if ret_type == "void":
@@ -2472,15 +2547,18 @@ def batch_patch_methods(patches_json: str) -> str:
                     continue
 
                 # Replace everything between locals_line+1 and m_end with our injection
+                old_len = m_end - m_start + 1
                 new_body = [lines[i] for i in range(m_start, locals_line + 1)]
                 new_body.append("")
                 new_body.append(f"    # APK-AGI batch patch: {desc}")
                 new_body.append(inject)
                 new_body.append("")
                 new_body.append(".end method")
+                new_len = len(new_body)
 
-                # Replace in lines
+                # Replace in lines and track cumulative offset
                 lines[m_start:m_end + 1] = new_body
+                line_offset += (new_len - old_len)
 
                 results.append({"method": method_q, "file": file_rel,
                                 "success": True, "description": desc})
@@ -3454,11 +3532,18 @@ def find_dynamic_checks() -> str:
             "onResume", "onStart", "onRestart", "onWindowFocusChanged",
             "onAttachedToWindow", "onConfigurationChanged", "onNewIntent",
         ]
+        # Named premium indicators (for non-obfuscated code)
         premium_indicators = re.compile(
             r"premium|isPro|isVip|isPaid|isTrial|isExpired|isFree|"
             r"subscription|license|purchas|billing|getType|getPlan|"
             r"TRIER|TRIAL|FREE|PREMIUM|PRO|VIP",
             re.IGNORECASE,
+        )
+        # Behavioral premium indicators (for obfuscated code)
+        # These catch calls to known entity classes or billing APIs inside lifecycle hooks
+        behavioral_indicators = re.compile(
+            r"BillingClient|Purchase|SharedPreferences|getBoolean|getString|getInt|"
+            r"invoke-.*->(?:a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z)\(\)Z",
         )
         timer_patterns = re.compile(
             r"Handler|Runnable|postDelayed|scheduleAtFixedRate|Timer|"
@@ -3498,22 +3583,29 @@ def find_dynamic_checks() -> str:
                     # Check lifecycle hooks
                     for hook in lifecycle_hooks:
                         if hook in current_method:
-                            # Look for premium indicators in the next 30 lines
-                            window = "\n".join(lines[i:i + 30])
+                            # Look for premium indicators in a wider window (50 lines)
+                            window = "\n".join(lines[i:i + 50])
                             prem_matches = premium_indicators.findall(window)
-                            if prem_matches:
+                            # Also check behavioral indicators for obfuscated code
+                            behavioral_matches = behavioral_indicators.findall(window)
+                            if prem_matches or behavioral_matches:
+                                all_indicators = list(set(prem_matches))[:5]
+                                if behavioral_matches and not prem_matches:
+                                    all_indicators = ["[behavioral:" + m[:30] + "]" for m in behavioral_matches[:3]]
                                 lifecycle_checks.append({
                                     "file": rel,
                                     "line": i + 1,
                                     "method": current_method[:80],
                                     "lifecycle_hook": hook,
-                                    "premium_indicators": list(set(prem_matches))[:5],
+                                    "premium_indicators": all_indicators,
+                                    "detection_type": "named" if prem_matches else "behavioral",
                                 })
                             break
 
-                    # Timer-based checks
-                    if timer_patterns.search(s) and premium_indicators.search(
-                        "\n".join(lines[max(0, i - 5):i + 10])
+                    # Timer-based checks (wider window: ±10/+15 lines)
+                    if timer_patterns.search(s) and (
+                        premium_indicators.search("\n".join(lines[max(0, i - 10):i + 15]))
+                        or behavioral_indicators.search("\n".join(lines[max(0, i - 10):i + 15]))
                     ):
                         timer_checks.append({
                             "file": rel, "line": i + 1,
@@ -3696,13 +3788,14 @@ def verify_bypass_completeness() -> str:
     """Post-patch verification: re-scan the codebase for REMAINING premium/license
     gates that are NOT yet patched. Checks: boolean premium getters still returning
     dynamic values, SharedPreferences premium reads, entity field assignments to
-    non-premium values, and UI gate methods (showing upgrade/paywall dialogs).
+    non-premium values, UI gate methods (showing upgrade/paywall dialogs), and
+    behavioral gate methods in known entity classes (catches obfuscated code).
 
     When to use: After all patches are applied, BEFORE building the APK.
     This is the final quality gate — any remaining gates it finds MUST be patched.
 
     Returns: JSON — remaining_gates (array), remaining_prefs_checks, remaining_ui_gates,
-    patch_coverage_pct, verdict (PASS/FAIL).
+    behavioral_remaining (obfuscated gates), patch_coverage_pct, verdict (PASS/FAIL).
     """
     def _run():
         import re
@@ -3729,10 +3822,26 @@ def verify_bypass_completeness() -> str:
             re.IGNORECASE,
         )
 
+        # Behavioral gate patterns (for obfuscated code detection)
+        _BEHAVIORAL_GATE = [
+            re.compile(r'invoke-.*(?:Calendar|Date|TimeUnit|before\(|after\(|compareTo\()', re.I),
+            re.compile(r'iget-boolean|sget-boolean'),
+            re.compile(r'const-string.*invoke-.*equals\(', re.DOTALL),
+        ]
+
         remaining_gates: list[dict] = []
         remaining_prefs: list[dict] = []
         remaining_ui: list[dict] = []
+        behavioral_remaining: list[dict] = []
         patched_methods: set[str] = set()
+
+        # Collect files that were patched (from patch journal) to check their
+        # entity classes for remaining obfuscated gates
+        patched_files: set[str] = set()
+        for entry in _patch_journal:
+            tf = entry.get("target_file", "")
+            if tf:
+                patched_files.add(tf)
 
         for sd in smali_dirs:
             for sf in sd.rglob("*.smali"):
@@ -3744,6 +3853,22 @@ def verify_bypass_completeness() -> str:
                 rel = str(sf.relative_to(apk_dir))
                 current_method = ""
                 method_start = 0
+
+                # Skip library code
+                rel_fwd = rel.replace("\\", "/")
+                parts = rel_fwd.split("/")
+                if len(parts) > 1:
+                    top = parts[1] if parts[0].startswith("smali") else parts[0]
+                    if top in ("android", "androidx", "com", "kotlin", "kotlinx",
+                               "org", "io", "java", "javax", "dalvik", "sun"):
+                        # Check more specifically for com/
+                        if top == "com" and len(parts) > 2:
+                            sub = parts[2] if parts[0].startswith("smali") else parts[1]
+                            if sub in ("google", "facebook", "squareup", "adjust",
+                                       "android", "crashlytics", "firebase"):
+                                continue
+                        elif top != "com":
+                            continue
 
                 for i, line in enumerate(lines):
                     s = line.strip()
@@ -3757,7 +3882,7 @@ def verify_bypass_completeness() -> str:
                             method_body = "\n".join(lines[method_start:i])
                             # A patched method typically has const/4 + return as first instructions
                             is_patched = bool(re.search(
-                                r"\.locals\s+\d+\s*\n\s*const(?:/4|/16)?\s+v0",
+                                r"\.locals\s+\d+\s*\n\s*(?:#[^\n]*\n\s*)?const(?:/4|/16)?\s+v0",
                                 method_body,
                             ))
                             if not is_patched:
@@ -3769,6 +3894,33 @@ def verify_bypass_completeness() -> str:
                                 })
                             else:
                                 patched_methods.add(f"{rel}:{current_method[:60]}")
+
+                        # Behavioral check for OBFUSCATED gate methods in entity classes
+                        # (files that we've already patched — these are likely entity classes
+                        # with remaining unpatched methods)
+                        elif rel in patched_files or any(pf in rel for pf in patched_files):
+                            # Check if this Z/I-returning method has gate behavior
+                            ret_match = re.search(r'\)([ZI])\s*$', current_method)
+                            if ret_match:
+                                method_body = "\n".join(lines[method_start:i])
+                                is_patched = bool(re.search(
+                                    r"\.locals\s+\d+\s*\n\s*(?:#[^\n]*\n\s*)?const(?:/4|/16)?\s+v0",
+                                    method_body,
+                                ))
+                                if not is_patched:
+                                    has_gate_behavior = any(
+                                        pat.search(method_body) for pat in _BEHAVIORAL_GATE
+                                    )
+                                    if has_gate_behavior:
+                                        behavioral_remaining.append({
+                                            "file": rel,
+                                            "line": method_start + 1,
+                                            "method": current_method[:80],
+                                            "return_type": "boolean" if ret_match.group(1) == "Z" else "int",
+                                            "status": "BEHAVIORAL_GATE_NOT_PATCHED",
+                                            "hint": "Obfuscated method with gate behavior in a known entity class",
+                                        })
+
                         current_method = ""
                         continue
 
@@ -3794,7 +3946,8 @@ def verify_bypass_completeness() -> str:
         total_gates = len(remaining_gates) + len(patched_methods)
         patched_count = len(patched_methods)
         coverage = (patched_count / total_gates * 100) if total_gates > 0 else 100.0
-        verdict = "PASS" if not remaining_gates and not remaining_prefs else "FAIL"
+        # Include behavioral gates in verdict — if entity classes have unpatched gates, FAIL
+        verdict = "PASS" if not remaining_gates and not remaining_prefs and not behavioral_remaining else "FAIL"
 
         return json.dumps({
             "success": True,
@@ -3802,11 +3955,15 @@ def verify_bypass_completeness() -> str:
             "patch_coverage_pct": round(coverage, 1),
             "patched_methods": patched_count,
             "remaining_gates": remaining_gates[:20],
+            "behavioral_remaining": behavioral_remaining[:15],
             "remaining_prefs_checks": remaining_prefs[:15],
             "remaining_ui_gates": remaining_ui[:15],
             "summary": (
                 f"Coverage: {coverage:.0f}%. "
-                f"{'ALL gates patched!' if verdict == 'PASS' else f'{len(remaining_gates)} methods + {len(remaining_prefs)} prefs reads still need patching.'}"
+                + ("ALL named gates patched. " if not remaining_gates else f"{len(remaining_gates)} named methods still need patching. ")
+                + (f"⚠️ {len(behavioral_remaining)} OBFUSCATED gate methods detected in entity classes — patch these too! " if behavioral_remaining else "")
+                + (f"{len(remaining_prefs)} prefs reads still need patching. " if remaining_prefs else "")
+                + ("Verdict: " + verdict)
             ),
         }, ensure_ascii=False, indent=2)[:15000]
 
