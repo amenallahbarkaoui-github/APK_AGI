@@ -52,8 +52,17 @@ _compactor: Compactor | None = None
 # Per-session tracking.  Keyed by thread_id so sessions don't interfere.
 _session_tool_trackers: dict[str, dict[str, int]] = {}
 _session_nudge_counts: dict[str, int] = {}
-_LOOP_WARN_THRESHOLD = 3   # inject warning after this many repetitions
-_LOOP_BLOCK_THRESHOLD = 5  # force different approach after this many
+_LOOP_WARN_THRESHOLD = 6   # inject warning after this many repetitions
+_LOOP_BLOCK_THRESHOLD = 15  # force different approach after this many
+
+# Tools that should NEVER be blocked — only warned.  Build/sign/patch
+# tools legitimately need retries when the agent fixes smali errors.
+_NEVER_BLOCK_TOOLS: set[str] = {
+    "apktool_build", "apktool_decode", "sign_apk", "zipalign_apk",
+    "apply_smali_patch", "apply_multi_patch", "batch_patch_methods",
+    "inject_smali_code", "override_constructor_field", "add_startup_hook",
+    "write_file", "read_file",
+}
 
 # The active thread_id, set by build_graph / the CLI before each run
 _active_thread_id: str = "__default__"
@@ -99,7 +108,7 @@ def _check_tool_loops(tool_calls: list[dict]) -> str | None:
         tracker[key] += 1
         count = tracker[key]
 
-        if count >= _LOOP_BLOCK_THRESHOLD:
+        if count >= _LOOP_BLOCK_THRESHOLD and name not in _NEVER_BLOCK_TOOLS:
             warnings.append(
                 f"🚫 BLOCKED: You have called `{name}` with the same/similar arguments "
                 f"{count} times and got the same results each time. "
@@ -262,8 +271,30 @@ def agent_node(state: AgentState) -> dict:
         state_msg = "\n".join(summary_parts)
         # Insert after system prompt
         insert_idx = 1 if isinstance(messages[0], SystemMessage) else 0
+
+        # Count total tool calls so far (rough proxy for analysis depth)
+        _total_tool_msgs = sum(1 for m in state["messages"] if isinstance(m, ToolMessage))
+        _total_patches = len(patches)
+
+        # Build a depth-enforcement reminder based on current state
+        depth_reminder = "⚡ REMINDER: Execute tools NOW. Batch independent tools in parallel."
+        if _total_patches == 0 and _total_tool_msgs < 15:
+            depth_reminder = (
+                "🔴 DEPTH CHECK: You have made only {tc} tool calls and 0 patches. "
+                "You MUST complete thorough analysis (15+ tool calls) BEFORE your first patch. "
+                "Use map_feature_checks, analyze_subscription_model, trace_field_access, "
+                "cross_reference_map, and READ JADX SOURCE for every target class. "
+                "DO NOT RUSH. Discover the FULL architecture first."
+            ).format(tc=_total_tool_msgs)
+        elif _total_patches > 0 and _total_tool_msgs < 20:
+            depth_reminder = (
+                "⚠️ DEPTH WARNING: You started patching after only {tc} tool calls. "
+                "Make sure you have mapped ALL check points — not just the first one you found. "
+                "Use verify_bypass_completeness() BEFORE building."
+            ).format(tc=_total_tool_msgs)
+
         messages.insert(insert_idx, HumanMessage(
-            content=f"[DURABLE STATE — graph, scope, findings, patches & memory]\n{state_msg}\n\n⚡ REMINDER: Execute tools NOW. Do NOT send text-only messages announcing phases. Call tools in EVERY response. Batch independent tools in parallel."
+            content=f"[DURABLE STATE — graph, scope, findings, patches & memory]\n{state_msg}\n\n{depth_reminder}"
         ))
 
     # --- Auto-compact check ---
@@ -323,10 +354,10 @@ def agent_node(state: AgentState) -> dict:
 
     # Truncate large tool results in OLD messages only (preserve recent ones)
     # Keep head + tail so we don't lose summary headers or final findings
-    _MAX_CHARS = 2500
-    _HEAD = 1500
-    _TAIL = 800
-    _RECENT = 6  # never truncate the last N messages (covers current tool batch)
+    _MAX_CHARS = 4500
+    _HEAD = 3000
+    _TAIL = 1200
+    _RECENT = 10  # never truncate the last N messages (covers current tool batch)
     cutoff = len(messages) - _RECENT
     for i, msg in enumerate(messages):
         if i >= cutoff:
@@ -470,7 +501,8 @@ def agent_node(state: AgentState) -> dict:
             for tc in response.tool_calls:
                 args_hash = _hash_tool_args(tc.get("args", {}))
                 key = f"{tc.get('name', '')}:{args_hash}"
-                if tracker.get(key, 0) < _LOOP_BLOCK_THRESHOLD:
+                tc_name = tc.get('name', '')
+                if tc_name in _NEVER_BLOCK_TOOLS or tracker.get(key, 0) < _LOOP_BLOCK_THRESHOLD:
                     filtered_calls.append(tc)
             if not filtered_calls:
                 # All calls blocked — strip tool_calls, force agent to rethink
@@ -1029,7 +1061,7 @@ def build_graph(config: AppConfig, project: Project, checkpointer=None):
     # token_threshold: start compacting well before the context fills up
     # keep_recent: preserve only the last few exchanges (each exchange =
     #   AIMessage + ToolMessages can be 5-15 messages for parallel tool calls)
-    _compactor = Compactor(token_threshold=100_000, keep_recent=14)
+    _compactor = Compactor(token_threshold=100_000, keep_recent=20)
 
     # Build tool node
     tool_node = ToolNode(ALL_TOOLS)

@@ -142,22 +142,72 @@ def inject_code_in_method(
 
     # --- determine register needs ----------------------------------------
     max_v = _highest_v_register(smali_code)
+
+    # Find current locals count
+    cur_locals = 0
+    for i in range(start, min(start + 20, end)):
+        m = re.match(r'\s*\.locals\s+(\d+)', lines[i])
+        if m:
+            cur_locals = int(m.group(1))
+            break
+        m = re.match(r'\s*\.registers\s+(\d+)', lines[i])
+        if m:
+            param_slots = _count_param_slots(header)
+            cur_locals = int(m.group(1)) - param_slots
+            break
+
     if max_v >= 0:
-        # Find current locals count
-        cur_locals = 0
-        for i in range(start, min(start + 20, end)):
-            m = re.match(r'\s*\.locals\s+(\d+)', lines[i])
-            if m:
-                cur_locals = int(m.group(1))
-                break
-            m = re.match(r'\s*\.registers\s+(\d+)', lines[i])
-            if m:
-                param_slots = _count_param_slots(header)
-                cur_locals = int(m.group(1)) - param_slots
-                break
         needed = max_v + 1
         if needed > cur_locals:
             _ensure_registers(lines, start, end, header, needed - cur_locals)
+            cur_locals = needed
+
+    # --- 4-bit register safety check for p0 in iput/iget instructions ---
+    # Dalvik iput/iget use 4-bit register encoding: both value and object
+    # registers must be v0-v15.  p0 maps to v{cur_locals}, so if
+    # cur_locals >= 16, any iput/iget using p0 will fail.
+    p0_as_v = cur_locals
+    p0_needs_alias = p0_as_v > 15
+
+    # Check if injected code uses p0 in 4-bit instructions
+    iput_iget_p0 = bool(re.search(
+        r'\b(iput|iget|iput-object|iget-object|iput-boolean|iget-boolean|'
+        r'iput-wide|iget-wide|iput-short|iget-short|iput-byte|iget-byte|'
+        r'iput-char|iget-char)\b.*\bp0\b', smali_code
+    ))
+
+    if p0_needs_alias and iput_iget_p0:
+        # Auto-fix: rewrite p0 in iput/iget to a low alias register
+        # Pick a safe alias register (use v0 or next available)
+        alias_v = max(max_v + 1 if max_v >= 0 else 0, 0)
+        if alias_v > 14:
+            alias_v = 0  # fall back to v0 — safe to reuse before return
+        alias_reg = f"v{alias_v}"
+
+        # Ensure we have enough locals for the alias
+        if alias_v >= cur_locals:
+            _ensure_registers(lines, start, end, header, alias_v + 1 - cur_locals)
+            # Re-find end
+            for i in range(start, len(lines)):
+                if lines[i].strip() == ".end method":
+                    end = i
+                    break
+
+        # Rewrite p0 in iput/iget instructions to alias_reg, and prepend
+        # move-object/from16 alias_reg, p0
+        new_lines = []
+        for raw_line in smali_code.strip().splitlines():
+            s = raw_line.strip()
+            if re.match(r'(iput|iget)', s) and 'p0' in s:
+                # Replace p0 with alias in this instruction
+                # p0 is the second register in iput (iput vA, p0, field)
+                # or the first register in iget (iget vA, p0, field)
+                new_lines.append(re.sub(r'\bp0\b', alias_reg, s))
+            else:
+                new_lines.append(s)
+
+        # Prepend the alias instruction
+        smali_code = f"move-object/from16 {alias_reg}, p0\n" + "\n".join(new_lines)
 
     # --- build injection lines -------------------------------------------
     inject_lines = ["    # === APK-AGI INJECTED CODE ==="]
@@ -235,17 +285,21 @@ def inject_code_in_method(
 # 2. override_constructor_fields
 # ---------------------------------------------------------------------------
 
-def _smali_value_instructions(scratch: str, field_name: str,
+def _smali_value_instructions(scratch: str, obj_reg: str, field_name: str,
                                class_desc: str, ftype: str, value) -> list[str]:
-    """Generate smali lines to set one field to *value* using *scratch* register."""
+    """Generate smali lines to set one field to *value* using *scratch* register.
+
+    *obj_reg* is the register holding ``this`` — usually ``p0`` but may be a
+    low v-register alias when p0 > v15.
+    """
     out: list[str] = []
     if ftype == "Ljava/lang/String;":
         out.append(f'const-string {scratch}, "{value}"')
-        out.append(f'iput-object {scratch}, p0, {class_desc}->{field_name}:{ftype}')
+        out.append(f'iput-object {scratch}, {obj_reg}, {class_desc}->{field_name}:{ftype}')
     elif ftype == "Z":
         val = "0x1" if value else "0x0"
         out.append(f'const/4 {scratch}, {val}')
-        out.append(f'iput-boolean {scratch}, p0, {class_desc}->{field_name}:{ftype}')
+        out.append(f'iput-boolean {scratch}, {obj_reg}, {class_desc}->{field_name}:{ftype}')
     elif ftype == "I":
         v = int(value)
         if -8 <= v <= 7:
@@ -254,15 +308,35 @@ def _smali_value_instructions(scratch: str, field_name: str,
             out.append(f'const/16 {scratch}, {hex(v)}')
         else:
             out.append(f'const {scratch}, {hex(v)}')
-        out.append(f'iput {scratch}, p0, {class_desc}->{field_name}:{ftype}')
+        out.append(f'iput {scratch}, {obj_reg}, {class_desc}->{field_name}:{ftype}')
     elif ftype == "J":
         v = int(value)
         out.append(f'const-wide {scratch}, {hex(v)}')
-        out.append(f'iput-wide {scratch}, p0, {class_desc}->{field_name}:{ftype}')
+        out.append(f'iput-wide {scratch}, {obj_reg}, {class_desc}->{field_name}:{ftype}')
     elif ftype.startswith("L") or ftype.startswith("["):
         out.append(f'const/4 {scratch}, 0x0')
-        out.append(f'iput-object {scratch}, p0, {class_desc}->{field_name}:{ftype}')
+        out.append(f'iput-object {scratch}, {obj_reg}, {class_desc}->{field_name}:{ftype}')
     return out
+
+
+def _is_synthetic_delegating(lines: list[str], m_start: int, m_end: int,
+                              class_desc: str) -> bool:
+    """Return True if this constructor is a synthetic that delegates to another
+    <init> of the same class via invoke-direct/range.  Such constructors should
+    NOT get field overrides because the target constructor already has them.
+    """
+    is_synthetic = "synthetic" in lines[m_start]
+    if not is_synthetic:
+        return False
+    # Look for invoke-direct/range {pX .. pY}, Lclass;-><init>(...)V
+    escaped = re.escape(class_desc)
+    for i in range(m_start + 1, m_end):
+        s = lines[i].strip()
+        if re.search(rf'invoke-direct/range\s+\{{.*\}},\s*{escaped}-><init>', s):
+            return True
+        if re.search(rf'invoke-direct\s+\{{.*\}},\s*{escaped}-><init>', s):
+            return True
+    return False
 
 
 def override_constructor_fields(
@@ -271,6 +345,16 @@ def override_constructor_fields(
     field_overrides: dict,
 ) -> dict:
     """Patch ALL constructors to force-set field values before ``return-void``.
+
+    Handles the Dalvik 4-bit register constraint: iput/iget instructions require
+    BOTH the value register AND the object register (``this``) to be v0-v15.
+    When ``.locals`` is large (≥16), ``p0`` maps to ``v16+`` which would cause
+    "Invalid register" build errors.  The fix:
+    - Always use low scratch registers (v0-v1) that are safe to reuse at method end
+    - When p0 > v15, emit ``move-object/from16 vN, p0`` to alias ``this`` into a
+      low register before the iput instructions.
+    - Skip synthetic constructors that delegate to the primary (they'd get the
+      overrides via the primary constructor).
 
     *field_overrides*: ``{"field": {"type": "Ljava/lang/String;", "value": "SVIP"}, ...}``
     """
@@ -287,13 +371,21 @@ def override_constructor_fields(
         return {"success": False, "error": "No constructors found in file"}
 
     has_wide = any(fi.get("type") in ("J", "D") for fi in field_overrides.values())
-    extra_regs = 2 if has_wide else 1
-
     patched = 0
+    skipped_synthetic = 0
     details = []
 
     # process in reverse so line numbers stay valid
     for m_start, m_end, m_header in reversed(constructors):
+        # --- Skip synthetic delegating constructors ---
+        if _is_synthetic_delegating(lines, m_start, m_end, class_descriptor):
+            skipped_synthetic += 1
+            details.append({
+                "constructor": m_header[:120],
+                "status": "skipped (synthetic — primary constructor handles overrides)",
+            })
+            continue
+
         # find last return-void
         return_line = -1
         for i in range(m_end - 1, m_start, -1):
@@ -301,21 +393,59 @@ def override_constructor_fields(
                 return_line = i
                 break
         if return_line < 0:
-            details.append({"constructor": m_header, "status": "skipped (no return-void)"})
+            details.append({"constructor": m_header[:120], "status": "skipped (no return-void)"})
             continue
 
-        scratch_v, _ = _ensure_registers(lines, m_start, m_end, m_header, extra_regs)
-        scratch = f"v{scratch_v}"
-
-        # re-find return-void (may have shifted by 0 since we only changed .locals line)
-        for i in range(m_end, m_start, -1):
-            if i < len(lines) and lines[i].strip() == "return-void":
-                return_line = i
+        # --- Determine current .locals count ---
+        cur_locals = 0
+        for i in range(m_start, min(m_start + 20, m_end)):
+            m_loc = re.match(r'\s*\.locals\s+(\d+)', lines[i])
+            if m_loc:
+                cur_locals = int(m_loc.group(1))
+                break
+            m_reg = re.match(r'\s*\.registers\s+(\d+)', lines[i])
+            if m_reg:
+                param_slots = _count_param_slots(m_header)
+                cur_locals = int(m_reg.group(1)) - param_slots
                 break
 
+        # p0 maps to v{cur_locals} (for instance methods)
+        p0_as_v = cur_locals
+
+        # --- Pick safe registers (must be v0-v15 for 4-bit instructions) ---
+        # We reuse v0 and optionally v1 at the END of the method (before return-void)
+        # which is safe — the original code is done executing at that point.
+        # For wide values we need two consecutive registers: v0+v1.
+        scratch = "v0"
+        # If we need a separate obj_reg (when p0 > v15), use v1 for it
+        # and v2/v3 for wide scratch. Keep everything ≤ v15.
+        if p0_as_v > 15:
+            obj_reg = "v1"
+            scratch = "v2" if not has_wide else "v2"
+            # Ensure we have enough locals (at least 4: v0, v1 for obj, v2+v3 for wide)
+            needed_locals = 4 if has_wide else 3
+        else:
+            obj_reg = "p0"
+            needed_locals = 2 if has_wide else 1
+
+        # Bump .locals if needed (only up, never down)
+        if cur_locals < needed_locals:
+            _ensure_registers(lines, m_start, m_end, m_header, needed_locals - cur_locals)
+            # Re-find return-void after potential line shift
+            for i in range(m_end + 5, m_start, -1):
+                if i < len(lines) and lines[i].strip() == "return-void":
+                    return_line = i
+                    break
+
+        # --- Build override instructions ---
         override_lines = ["    # === APK-AGI: FIELD VALUE OVERRIDES ==="]
+
+        # If p0 > v15, alias this into a low register
+        if p0_as_v > 15:
+            override_lines.append(f"    move-object/from16 {obj_reg}, p0")
+
         for fname, finfo in field_overrides.items():
-            for inst in _smali_value_instructions(scratch, fname,
+            for inst in _smali_value_instructions(scratch, obj_reg, fname,
                                                    class_descriptor,
                                                    finfo["type"], finfo["value"]):
                 override_lines.append(f"    {inst}")
@@ -326,11 +456,25 @@ def override_constructor_fields(
 
         patched += 1
         details.append({
-            "constructor": m_header,
+            "constructor": m_header[:120],
             "status": "patched",
             "scratch_register": scratch,
+            "obj_register": obj_reg,
+            "p0_maps_to": f"v{p0_as_v}",
             "injected_before_line": return_line + 1,
         })
+
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    return {
+        "success": True,
+        "file": str(path),
+        "constructors_found": len(constructors),
+        "constructors_patched": patched,
+        "constructors_skipped_synthetic": skipped_synthetic,
+        "fields_overridden": list(field_overrides.keys()),
+        "details": details,
+    }
 
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

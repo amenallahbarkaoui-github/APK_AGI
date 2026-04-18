@@ -133,7 +133,33 @@ def _print_tools_status(config: AppConfig) -> None:
     model_display = config.model_name.split("/")[-1] if "/" in config.model_name else config.model_name
     thinking_icon = "[bold green]●[/] ON" if config.thinking_enabled else "[bold red]○[/] OFF"
     console.print(f"[dim]Model:[/] [bold]{model_display}[/]  │  [dim]Thinking:[/] {thinking_icon}")
+    if config.telegram_enabled:
+        telegram_status = "[bold green]●[/] configured"
+    else:
+        telegram_status = "[dim]off[/]"
+    console.print(f"[dim]Telegram:[/] {telegram_status}")
     console.print()
+
+
+def _maybe_start_telegram_bridge(config: AppConfig, enabled_override: bool | None, verbose: bool) -> None:
+    """Start the Telegram bridge in a detached background process if enabled."""
+    should_start = config.telegram_auto_start if enabled_override is None else enabled_override
+    if not should_start:
+        return
+    if not config.telegram_enabled:
+        print_warning("Telegram bridge requested, but TELEGRAM_BOT_TOKEN / TELEGRAM_ALLOWED_CHAT_IDS are not fully configured.")
+        return
+
+    try:
+        from apk_agent.telegram_bot import ensure_telegram_bot_running
+
+        started, message = ensure_telegram_bot_running(config, verbose=verbose)
+        if started:
+            print_success(message)
+        else:
+            print_info(message)
+    except Exception as e:
+        print_warning(f"Failed to start Telegram bridge: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -339,8 +365,11 @@ def _ask_for_apk(pm: ProjectManager, config: AppConfig) -> Project | None:
 @click.option("--model", "-m", "model_name", default=None,
               help="Override model name (e.g. 'anthropic/claude-sonnet-4-6-20260218')")
 @click.option("--auto", "auto_mode", is_flag=True, help="Start in auto mode (no confirmations)")
+@click.option("--telegram/--no-telegram", "telegram_enabled", default=None,
+            help="Start/skip the Telegram bridge background process (default: from .env)")
 def main(apk_path: str | None, verbose: bool, project_id: str | None,
-         thinking_enabled: bool | None, model_name: str | None, auto_mode: bool) -> None:
+        thinking_enabled: bool | None, model_name: str | None, auto_mode: bool,
+        telegram_enabled: bool | None) -> None:
     """🔬 APK Agent — Interactive Static Android APK Reverse Engineering
 
     Run without arguments for the interactive menu.
@@ -364,6 +393,7 @@ def main(apk_path: str | None, verbose: bool, project_id: str | None,
     # Startup
     _print_startup()
     _print_tools_status(config)
+    _maybe_start_telegram_bridge(config, telegram_enabled, verbose)
 
     for w in warnings:
         if "not found" not in w.lower():  # Don't spam optional tool warnings

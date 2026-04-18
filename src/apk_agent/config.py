@@ -51,6 +51,12 @@ class AppConfig:
     # Thinking / reasoning mode
     thinking_enabled: bool = True  # user-toggleable deep thinking for the LLM
 
+    # Telegram bot bridge
+    telegram_bot_token: str = ""
+    telegram_allowed_chat_ids: tuple[int, ...] = field(default_factory=tuple)
+    telegram_auto_start: bool = False
+    telegram_poll_timeout_sec: int = 30
+
     # --- resolved tool paths (filled by validate) ---
     _resolved_tools: dict[str, str] = field(default_factory=dict, repr=False)
 
@@ -64,6 +70,17 @@ class AppConfig:
             load_dotenv(env_file)
         else:
             load_dotenv()
+
+        allowed_chat_ids_raw = os.getenv("TELEGRAM_ALLOWED_CHAT_IDS", "")
+        allowed_chat_ids: list[int] = []
+        for token in allowed_chat_ids_raw.replace(",", " ").split():
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                allowed_chat_ids.append(int(token))
+            except ValueError:
+                continue
 
         cfg = cls(
             api_key=os.getenv("API_KEY", os.getenv("OPENROUTER_API_KEY", "")),
@@ -84,6 +101,10 @@ class AppConfig:
             ),
             max_apk_size_mb=int(os.getenv("MAX_APK_SIZE_MB", "200")),
             thinking_enabled=os.getenv("THINKING_ENABLED", "true").lower() in ("true", "1", "yes"),
+            telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
+            telegram_allowed_chat_ids=tuple(allowed_chat_ids),
+            telegram_auto_start=os.getenv("TELEGRAM_AUTO_START", "false").lower() in ("true", "1", "yes"),
+            telegram_poll_timeout_sec=max(5, int(os.getenv("TELEGRAM_POLL_TIMEOUT_SEC", "30"))),
         )
         return cfg
 
@@ -172,6 +193,17 @@ class AppConfig:
                     f"Set {tool_name.upper()}_PATH in .env or install it."
                 )
 
+        if self.telegram_bot_token and not self.telegram_allowed_chat_ids:
+            warnings.append(
+                "TELEGRAM_BOT_TOKEN is set but TELEGRAM_ALLOWED_CHAT_IDS is empty — "
+                "Telegram bot will not accept any chats."
+            )
+        if self.telegram_allowed_chat_ids and not self.telegram_bot_token:
+            warnings.append(
+                "TELEGRAM_ALLOWED_CHAT_IDS is set but TELEGRAM_BOT_TOKEN is missing — "
+                "Telegram bot bridge cannot start."
+            )
+
         # Workspace dir
         ws = Path(self.workspace_root)
         ws.mkdir(parents=True, exist_ok=True)
@@ -181,6 +213,11 @@ class AppConfig:
     def get_tool_path(self, name: str) -> str:
         """Return resolved tool path."""
         return self._resolved_tools.get(name, "")
+
+    @property
+    def telegram_enabled(self) -> bool:
+        """Return True when the Telegram bridge is configured and authorized."""
+        return bool(self.telegram_bot_token and self.telegram_allowed_chat_ids)
 
     @property
     def workspace_path(self) -> Path:

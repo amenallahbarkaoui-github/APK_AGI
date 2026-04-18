@@ -164,7 +164,7 @@ Produce a structured summary following the format described in your instructions
 
 # Configurable thresholds (GLM-5.1 context window: 204,800 tokens, max output: 131,072)
 DEFAULT_TOKEN_THRESHOLD = 100_000  # Start compacting — leaves ~105k headroom for response + tools
-KEEP_RECENT_MESSAGES = 14  # Keep the last N messages for immediate context
+KEEP_RECENT_MESSAGES = 20  # Keep the last N messages for immediate context
 MIN_MESSAGES_TO_COMPACT = 30  # Don't compact if fewer messages than this
 
 

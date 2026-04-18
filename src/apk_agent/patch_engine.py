@@ -470,6 +470,44 @@ class PatchEngine:
 
             return None
 
+    def _line_matches(self, line: str, pat: str, pat_unesc: str, is_regex: bool) -> bool:
+        """Check if a line matches the pattern, with robust fallbacks.
+
+        Handles whitespace normalisation, CRLF, and partial matches for
+        long constructor/method signatures that the LLM may truncate.
+        """
+        stripped = line.rstrip("\r\n")
+        if is_regex:
+            try:
+                return bool(re.search(pat, stripped))
+            except re.error:
+                return False
+
+        # 1. Exact substring
+        if pat in stripped or (pat_unesc != pat and pat_unesc in stripped):
+            return True
+
+        # 2. Whitespace-normalised substring
+        norm_line = " ".join(stripped.split())
+        norm_pat = " ".join(pat.split())
+        norm_unesc = " ".join(pat_unesc.split()) if pat_unesc != pat else norm_pat
+        if norm_pat in norm_line or (norm_unesc != norm_pat and norm_unesc in norm_line):
+            return True
+
+        # 3. For long method signatures: match if the pattern is a prefix of
+        #    the line (LLM often truncates at 80 chars). Require at least 40
+        #    chars to avoid false positives on short patterns.
+        if len(norm_pat) >= 40:
+            if norm_line.startswith(norm_pat) or (norm_unesc != norm_pat and norm_line.startswith(norm_unesc)):
+                return True
+            # Also handle case where pattern starts with leading whitespace already stripped
+            if norm_pat.startswith(".method") and norm_line.startswith(".method"):
+                # Compare just the method signature part
+                if norm_line.startswith(norm_pat[:len(norm_pat)-3]):
+                    return True
+
+        return False
+
     def _op_replace_line(self, text: str, step: PatchStep) -> Optional[str]:
         """Replace lines containing the match pattern."""
         lines = text.splitlines(keepends=True)
@@ -478,18 +516,11 @@ class PatchEngine:
         pat = step.match_pattern
         pat_unesc = _unescape_smali(pat)
         for line in lines:
-            if step.is_regex:
-                if re.search(step.match_pattern, line):
-                    result_lines.append(step.replacement + "\n")
-                    found = True
-                else:
-                    result_lines.append(line)
+            if self._line_matches(line, pat, pat_unesc, step.is_regex):
+                result_lines.append(step.replacement + "\n")
+                found = True
             else:
-                if pat in line or (pat_unesc != pat and pat_unesc in line):
-                    result_lines.append(step.replacement + "\n")
-                    found = True
-                else:
-                    result_lines.append(line)
+                result_lines.append(line)
         return "".join(result_lines) if found else None
 
     def _op_replace_block(self, text: str, step: PatchStep) -> Optional[str]:
@@ -524,14 +555,9 @@ class PatchEngine:
         pat = step.match_pattern
         pat_unesc = _unescape_smali(pat)
         for line in lines:
-            if step.is_regex:
-                if re.search(step.match_pattern, line):
-                    found = True
-                    continue
-            else:
-                if pat in line or (pat_unesc != pat and pat_unesc in line):
-                    found = True
-                    continue
+            if self._line_matches(line, pat, pat_unesc, step.is_regex):
+                found = True
+                continue
             result_lines.append(line)
         return "".join(result_lines) if found else None
 

@@ -89,9 +89,9 @@ def _log_file() -> Path:
 # ---------------------------------------------------------------------------
 # Global tool output cap — prevents context bloat from any single tool
 # ---------------------------------------------------------------------------
-_TOOL_OUTPUT_CAP = 8_000  # max chars per tool result (head + tail)
-_CAP_HEAD = 5_500
-_CAP_TAIL = 2_000
+_TOOL_OUTPUT_CAP = 16_000  # max chars per tool result (head + tail)
+_CAP_HEAD = 11_000
+_CAP_TAIL = 4_000
 
 
 def _cap_tool_output(result: str) -> str:
@@ -917,6 +917,64 @@ def read_file(file_path: str, start_line: int = 0, end_line: int = 0) -> str:
     if not p.is_file():
         fname = Path(file_path.replace("\\", "/")).name
         nearby: list[str] = []
+
+        # --- Smart jadx path resolution ---
+        # jadx renames conflicting packages: "ui" → "p297ui", "a" → "a.1", etc.
+        # When the agent passes "jadx_src/sources/com/app/ui/Foo.java" but the
+        # real path is "jadx_src/sources/com/app/p297ui/Foo.java", a simple
+        # filename search gives too many false positives.  Instead, walk the
+        # requested path segments and try to find the closest existing directory
+        # at each level, tolerating jadx renames.
+        jadx_sources = _project.jadx_dir / "sources"
+        if jadx_sources.is_dir() and fname.endswith(".java"):
+            # Extract the package path the agent intended (e.g. "com/app/ui")
+            _stripped2 = file_path.replace("\\", "/").lstrip("/")
+            for _pfx2 in (
+                "decompiled/jadx_src/sources/",
+                "decompiled/jadx_src/",
+                "jadx_src/sources/",
+                "jadx_src/",
+            ):
+                if _stripped2.startswith(_pfx2):
+                    _stripped2 = _stripped2[len(_pfx2):]
+                    break
+            parts = _stripped2.split("/")
+            _cur = jadx_sources
+            _resolved = True
+            for i, seg in enumerate(parts[:-1]):  # all segments except filename
+                child = _cur / seg
+                if child.is_dir():
+                    _cur = child
+                else:
+                    # Try jadx-renamed variants: "ui" → "p*ui", "a" → "a.1"
+                    _found_alt = False
+                    if _cur.is_dir():
+                        for d in _cur.iterdir():
+                            if not d.is_dir():
+                                continue
+                            # Match "pNNNseg" pattern (jadx prefix rename)
+                            dname = d.name
+                            if dname.endswith(seg) and len(dname) > len(seg) and dname[0] == "p" and dname[1:-len(seg)].isdigit():
+                                _cur = d
+                                _found_alt = True
+                                break
+                            # Match "seg.N" pattern (jadx collision suffix)
+                            if dname.startswith(seg + ".") and dname[len(seg)+1:].isdigit():
+                                _cur = d
+                                _found_alt = True
+                                break
+                    if not _found_alt:
+                        _resolved = False
+                        break
+            if _resolved:
+                _final = _cur / parts[-1]
+                if _final.is_file():
+                    p = _final
+
+    # If still not found, fall back to filename-based search
+    if not p.is_file():
+        fname = Path(file_path.replace("\\", "/")).name
+        nearby: list[str] = []
         # Search jadx sources
         jadx_sources = _project.jadx_dir / "sources"
         if jadx_sources.is_dir():
@@ -933,13 +991,17 @@ def read_file(file_path: str, start_line: int = 0, end_line: int = 0) -> str:
                     if len(nearby) >= 8:
                         break
         if nearby:
-            return json.dumps({
-                "success": False,
-                "error": f"File not found: {file_path}",
-                "similar_files_found": nearby,
-                "hint": "The exact path doesn't exist. Try one of the similar files above, "
-                        "or read the .smali version instead.",
-            }, ensure_ascii=False, indent=2)
+            # If we have exactly 1 match, auto-resolve it instead of erroring
+            if len(nearby) == 1:
+                p = Path(nearby[0])
+            else:
+                return json.dumps({
+                    "success": False,
+                    "error": f"File not found: {file_path}",
+                    "similar_files_found": nearby,
+                    "hint": "The exact path doesn't exist. Try one of the similar files above, "
+                            "or read the .smali version instead.",
+                }, ensure_ascii=False, indent=2)
 
     result = _read(p, start_line=start_line, end_line=end_line)
     return json.dumps(result, ensure_ascii=False, indent=2)[:12000]
@@ -3050,6 +3112,8 @@ def cross_reference_map(target: str) -> str:
     string_constants, resource_refs, summary.
     """
     def _run():
+        import re
+
         apk_dir = _project.apktool_dir
         smali_dirs = [d for d in apk_dir.iterdir() if d.is_dir() and d.name.startswith("smali")]
         if not smali_dirs:
@@ -3186,6 +3250,8 @@ def deobfuscate_names(class_descriptor: str) -> str:
     reason}), field_suggestions, confidence.
     """
     def _run():
+        import re
+
         apk_dir = _project.apktool_dir
         class_path = class_descriptor[1:-1]  # Remove L and ;
         smali_file = None
@@ -3377,6 +3443,8 @@ def find_dynamic_checks() -> str:
     premium_indicator, line), timer_checks, broadcast_checks.
     """
     def _run():
+        import re
+
         apk_dir = _project.apktool_dir
         smali_dirs = [d for d in apk_dir.iterdir() if d.is_dir() and d.name.startswith("smali")]
         if not smali_dirs:
@@ -3501,6 +3569,8 @@ def extract_all_urls() -> str:
     url_domains (unique domain list), deeplinks (from manifest).
     """
     def _run():
+        import re
+
         apk_dir = _project.apktool_dir
         url_pattern = re.compile(r'https?://[^\s"<>\')]+', re.IGNORECASE)
         retrofit_pattern = re.compile(r'@(?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s*\(\s*"([^"]+)"')
@@ -3635,6 +3705,8 @@ def verify_bypass_completeness() -> str:
     patch_coverage_pct, verdict (PASS/FAIL).
     """
     def _run():
+        import re
+
         apk_dir = _project.apktool_dir
         smali_dirs = [d for d in apk_dir.iterdir() if d.is_dir() and d.name.startswith("smali")]
         if not smali_dirs:

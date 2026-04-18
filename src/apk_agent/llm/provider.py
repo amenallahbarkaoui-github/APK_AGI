@@ -107,11 +107,27 @@ def get_llm(config: "AppConfig", temperature: float = 1.0) -> ChatOpenAI:
     http_client = _PatchedHttpClient(timeout=httpx.Timeout(10.0, read=300.0))
     http_client._enable_thinking = enable_thinking
 
+    # ── Dynamic max_tokens based on model family ──────────────────
+    # 16K was the old blanket limit — far too low for complex autonomous
+    # agent work.  Models need room to reason deeply AND call many tools.
+    # Claude 4.x / Sonnet: 128K output capacity  → give 65K
+    # GLM-5.x / GLM-4.x:  131K output capacity  → give 65K
+    # GPT-4o/o1/o3:         16K-100K capacity    → give 32K
+    # Default (unknown):                         → give 32K
+    if any(tag in model_lower for tag in ("claude", "anthropic")):
+        max_tokens = 65_536
+    elif any(tag in model_lower for tag in ("glm-5", "glm-4")):
+        max_tokens = 65_536
+    elif any(tag in model_lower for tag in ("gpt-4o", "o1", "o3", "o4")):
+        max_tokens = 32_768
+    else:
+        max_tokens = 32_768
+
     return ChatOpenAI(
         model=config.model_name,
         api_key=config.api_key,
         base_url=config.api_base_url,
         temperature=1.0 if enable_thinking else temperature,
-        max_tokens=16384,
+        max_tokens=max_tokens,
         http_client=http_client,
     )
