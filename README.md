@@ -8,7 +8,7 @@
 
 <h1 align="center">🧠 APK AGI</h1>
 
-<img width="865" height="739" alt="image" src="https://github.com/user-attachments/assets/02f45160-3582-4413-8dd5-bb70f5ab66c7" />
+<img width="565" height="400" alt="image" src="https://github.com/user-attachments/assets/02f45160-3582-4413-8dd5-bb70f5ab66c7" />
 
 
 <h3 align="center">
