@@ -12,21 +12,35 @@ import traceback
 import uuid
 import threading
 import concurrent.futures
+from contextvars import copy_context
 from pathlib import Path
 from typing import Optional
 
 from langchain_core.tools import tool
 
+from apk_agent.agent.execution_context import (
+    CONFIG_PROXY,
+    PATCH_JOURNAL_PROXY,
+    PROJECT_PROXY,
+    SCRATCHPAD_PROXY,
+    TASK_PLAN_PROXY,
+    TOOL_CACHE_PROXY,
+    clear_runtime_slots,
+    get_active_execution_context,
+    get_runtime_slot,
+    set_active_execution_context,
+    set_runtime_slot,
+)
 from apk_agent.progress import progress_manager, set_current_task
 
 # We use a module-level config holder that gets set at graph construction time.
-_config = None
-_project = None
+_config = CONFIG_PROXY
+_project = PROJECT_PROXY
 
 # ---------------------------------------------------------------------------
 # Tool result cache — avoids re-running expensive scans with same args
 # ---------------------------------------------------------------------------
-_tool_cache: dict[str, str] = {}
+_tool_cache = TOOL_CACHE_PROXY
 _CACHEABLE_TOOLS = frozenset({
     "scan_vulnerabilities", "extract_strings", "search_in_code",
     "context_search", "multi_search", "xref_search",
@@ -41,43 +55,135 @@ _CACHEABLE_TOOLS = frozenset({
     "index_lookup_string", "index_lookup_package",
     "unified_scan", "run_taint_analysis", "find_hardcoded_crypto",
     "analyze_manifest_deep", "scan_cloud_secrets", "smali_index_stats",
+    "map_semantic_architecture", "recover_hidden_state_model",
+    "profile_guard_and_revalidation_surface",
+    "summarize_app_knowledge",
+    "summarize_behavior_graph",
+    "query_behavior_graph",
+    "locate_feature_controls",
+    "recover_state_transitions",
+    "map_security_surfaces",
+    "plan_runtime_hooks",
+    "analyze_network_behavior",
+    "recover_semantic_symbols",
 })
 
 
 def set_tool_context(config, project) -> None:
     """Set the config and project for tool execution. Called once per session."""
-    global _config, _project, _tool_cache, _smali_index, _scratchpad, _task_plan, _patch_journal
-    _config = config
-    _project = project
+    set_active_execution_context(config, project)
     _tool_cache.clear()  # fresh cache per session
-    _smali_index = None
-    _scratchpad = {}
-    _task_plan = []
-    _patch_journal = []
+    clear_runtime_slots(
+        "code_graph",
+        "code_index",
+        "smali_index",
+        "app_knowledge_pack",
+        "behavior_graph_pack",
+        "semantic_architecture_cache",
+        "hidden_state_model_cache",
+        "guard_surface_profile_cache",
+        "architecture_context_cache",
+    )
+    _scratchpad.clear()
+    _task_plan.clear()
+    _patch_journal.clear()
+
+
+def invalidate_graph_caches() -> None:
+    """Clear graph/index-derived runtime caches.
+
+    Kept as a compatibility helper for older graph/orchestrator code paths that
+    still import this symbol directly from tools_def.
+    """
+    _tool_cache.clear()
+    clear_runtime_slots(
+        "code_graph",
+        "code_index",
+        "smali_index",
+        "app_knowledge_pack",
+        "behavior_graph_pack",
+        "semantic_architecture_cache",
+        "hidden_state_model_cache",
+        "guard_surface_profile_cache",
+        "architecture_context_cache",
+    )
 
 
 # ---------------------------------------------------------------------------
 # Module-level scratchpad and task plan (read by graph.py for state sync)
 # ---------------------------------------------------------------------------
-_scratchpad: dict = {}
-_task_plan: list[dict] = []
+_scratchpad = SCRATCHPAD_PROXY
+_task_plan = TASK_PLAN_PROXY
 
 # ---------------------------------------------------------------------------
 # Patch journal — authoritative record of all patch operations this session.
 # Used by generate_report to produce accurate patch data instead of relying
 # on the LLM to reconstruct patch_results_json from memory.
 # ---------------------------------------------------------------------------
-_patch_journal: list[dict] = []
+_patch_journal = PATCH_JOURNAL_PROXY
 
 
 def _get_scratchpad() -> dict:
     """Return the current scratchpad dict."""
-    return _scratchpad
+    return dict(get_active_execution_context().scratchpad)
 
 
 def _get_task_plan() -> list[dict]:
     """Return the current task plan list."""
-    return _task_plan
+    return list(get_active_execution_context().task_plan)
+
+
+@tool
+def update_scratchpad(key: str, value: str = "", mode: str = "set") -> str:
+    """Persist free-form working notes, hypotheses, and runtime discoveries.
+
+    Use this when you want to save your own hypothesis, a suspicious class,
+    a recovered field, a patch decision, or any other free-form note that
+    should survive context compaction.
+
+    Args:
+        key: Scratchpad entry name, e.g. "planner_context" or "state_model"
+        value: Any free-form text to store.
+        mode: "set", "append", or "delete"
+
+    Returns: JSON with the updated entry and a compact scratchpad summary.
+    """
+    key = key.strip()
+    mode = mode.strip().lower()
+
+    def _run():
+        if not key:
+            return json.dumps({"success": False, "error": "key must not be empty"})
+
+        scratchpad = get_active_execution_context().scratchpad
+
+        if mode == "set":
+            scratchpad[key] = value
+        elif mode == "append":
+            existing = str(scratchpad.get(key, "")).strip()
+            addition = value.strip()
+            scratchpad[key] = f"{existing}\n{addition}".strip() if existing and addition else (addition or existing)
+        elif mode == "delete":
+            scratchpad.pop(key, None)
+        else:
+            return json.dumps({
+                "success": False,
+                "error": f"Unsupported mode: {mode}",
+                "supported_modes": ["set", "append", "delete"],
+            }, ensure_ascii=False, indent=2)
+
+        current_value = scratchpad.get(key)
+        scratchpad_preview = dict(list(scratchpad.items())[:20])
+        return json.dumps({
+            "success": True,
+            "mode": mode,
+            "key": key,
+            "value": current_value,
+            "scratchpad_size": len(scratchpad),
+            "scratchpad_preview": scratchpad_preview,
+        }, ensure_ascii=False, indent=2)[:12000]
+
+    return _safe_call(_run, "update_scratchpad")
 
 
 def _log_file() -> Path:
@@ -86,29 +192,234 @@ def _log_file() -> Path:
     return Path("tools.log")
 
 
+def _project_workspace_root() -> Path | None:
+    if not _project:
+        return None
+    workspace_path = getattr(_project, "workspace_path", "")
+    if not workspace_path:
+        return None
+    return Path(workspace_path)
+
+
+def _project_outputs_dir() -> Path:
+    if not _project:
+        raise RuntimeError("Project context not set.")
+    outputs_dir = getattr(_project, "outputs_dir", None)
+    if outputs_dir:
+        path = Path(outputs_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    workspace_root = _project_workspace_root()
+    if workspace_root is None:
+        raise AttributeError("outputs_dir")
+    path = workspace_root / "outputs"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _project_jadx_dir() -> Path | None:
+    if not _project:
+        return None
+    jadx_dir = getattr(_project, "jadx_dir", None)
+    if jadx_dir:
+        return Path(jadx_dir)
+    workspace_root = _project_workspace_root()
+    if workspace_root is None:
+        return None
+    return workspace_root / "decompiled" / "jadx_src"
+
+
 # ---------------------------------------------------------------------------
-# Global tool output cap — prevents context bloat from any single tool
+# Large tool output handling — preserve full data without flooding the model
 # ---------------------------------------------------------------------------
-_TOOL_OUTPUT_CAP = 16_000  # max chars per tool result (head + tail)
-_CAP_HEAD = 11_000
-_CAP_TAIL = 4_000
+_TOOL_OUTPUT_SPILL_THRESHOLD = 16_000
+_TOOL_OUTPUT_TEXT_PREVIEW = 3_800
+_TOOL_OUTPUT_TEXT_TAIL_PREVIEW = 2_200
 
 
-def _cap_tool_output(result: str) -> str:
-    """Truncate a tool result that exceeds the global cap.
+def _tool_payload_dir() -> Path:
+    if _project:
+        payload_dir = _project_outputs_dir() / "tool_payloads"
+    else:
+        payload_dir = Path("tool_payloads")
+    payload_dir.mkdir(parents=True, exist_ok=True)
+    return payload_dir
 
-    Keeps the head (usually JSON keys + first findings) and tail
-    (usually closing braces + summary fields) so structured output
-    remains parsable.
+
+def _json_scalar_preview(data: dict) -> dict:
+    preview: dict = {}
+    for key, value in data.items():
+        if isinstance(value, str):
+            preview[key] = value[:160]
+        elif isinstance(value, (int, float, bool)) or value is None:
+            preview[key] = value
+    return preview
+
+
+def _preview_json_item(value):
+    if isinstance(value, dict):
+        preview = _json_scalar_preview(value)
+        nested_sizes = {
+            key: len(item)
+            for key, item in value.items()
+            if isinstance(item, (list, dict))
+        }
+        if nested_sizes:
+            preview["collection_sizes"] = nested_sizes
+        return preview or {"type": "dict", "keys": list(value.keys())[:12]}
+    if isinstance(value, list):
+        return {"type": "list", "items": len(value)}
+    if isinstance(value, str):
+        return value[:160]
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return {"type": type(value).__name__}
+
+
+def _important_json_preview(data) -> dict:
+    if isinstance(data, dict):
+        preview: dict = {}
+        priority_keys = (
+            "findings", "vulnerabilities", "matches", "results", "methods",
+            "classes", "entity_classes", "candidate_state_fields", "surfaces",
+            "controls", "transitions", "runtime_hooks", "paths", "changes_made",
+            "patched_files", "gate_methods", "boolean_getters", "int_getters",
+            "billing_purchase_system", "behavioral_checks", "ir_behavioral_gates",
+            "summary", "instruction", "target_file", "target_class", "helper_file",
+            "app_packages", "target_packages", "excluded_packages",
+        )
+        for key in priority_keys:
+            if key not in data:
+                continue
+            value = data[key]
+            if isinstance(value, list):
+                preview[key] = [_preview_json_item(item) for item in value[:4]]
+                if len(value) > 4:
+                    preview[f"{key}_omitted"] = len(value) - 4
+            elif isinstance(value, dict):
+                preview[key] = _json_scalar_preview(value)
+                if not preview[key]:
+                    preview[key] = {"keys": list(value.keys())[:12]}
+            else:
+                preview[key] = _preview_json_item(value)
+
+        if preview:
+            return preview
+
+        for key, value in list(data.items())[:4]:
+            preview[key] = _preview_json_item(value)
+        return preview
+
+    if isinstance(data, list):
+        return {
+            "items_preview": [_preview_json_item(item) for item in data[:4]],
+            "items_omitted": max(0, len(data) - 4),
+        }
+
+    return {}
+
+
+def _summarize_spilled_json(data) -> dict:
+    if isinstance(data, dict):
+        collection_sizes = {}
+        for key, value in data.items():
+            if isinstance(value, (list, dict)):
+                collection_sizes[key] = len(value)
+        summary = {
+            "type": "dict",
+            "top_level_keys": list(data.keys())[:80],
+        }
+        scalar_preview = _json_scalar_preview(data)
+        if scalar_preview:
+            summary["scalar_preview"] = scalar_preview
+        if collection_sizes:
+            summary["collection_sizes"] = collection_sizes
+        return summary
+
+    if isinstance(data, list):
+        summary = {
+            "type": "list",
+            "items": len(data),
+        }
+        if data:
+            first = data[0]
+            if isinstance(first, dict):
+                summary["first_item_keys"] = list(first.keys())[:40]
+            else:
+                summary["first_item_type"] = type(first).__name__
+        return summary
+
+    return {"type": type(data).__name__}
+
+
+def _materialize_tool_output(tool_name: str, result: str) -> str:
+    """Preserve oversized tool results losslessly and return a compact reference.
+
+    Instead of blindly truncating head/tail, store the exact full payload on
+    disk and return a small envelope with a summary and a file path that the
+    agent can inspect later via read_file().
     """
-    if not isinstance(result, str) or len(result) <= _TOOL_OUTPUT_CAP:
+    if not isinstance(result, str) or len(result) <= _TOOL_OUTPUT_SPILL_THRESHOLD:
         return result
-    skipped = len(result) - _CAP_HEAD - _CAP_TAIL
-    return (
-        result[:_CAP_HEAD]
-        + f"\n\n... [{skipped} chars truncated — use more specific queries to narrow results] ...\n\n"
-        + result[-_CAP_TAIL:]
-    )
+
+    try:
+        suffix = ".json" if result.lstrip().startswith(("{", "[")) else ".txt"
+        output_path = _tool_payload_dir() / f"{tool_name}_{uuid.uuid4().hex[:10]}{suffix}"
+        output_path.write_text(result, encoding="utf-8")
+    except OSError:
+        return result
+
+    envelope = {
+        "tool_output_spilled": True,
+        "tool_name": tool_name,
+        "output_file": str(output_path.resolve()),
+        "output_chars": len(result),
+        "output_lines": result.count("\n") + 1,
+        "recovery_hint": (
+            "Full output preserved on disk. The preview is only a teaser. "
+            "Use read_file(output_file, start_line, end_line) to inspect any slice, "
+            "or search_in_code(pattern, directory=\"outputs/tool_payloads\", file_extensions=\".json,.txt\") "
+            "(or the parent directory of output_file) to search the full spilled payload."
+        ),
+    }
+
+    try:
+        data = json.loads(result)
+        envelope["content_format"] = "json"
+        envelope["summary"] = _summarize_spilled_json(data)
+        important_preview = _important_json_preview(data)
+        if important_preview:
+            envelope["important_preview"] = important_preview
+        if isinstance(data, dict) and "success" in data:
+            envelope["success"] = bool(data.get("success"))
+    except json.JSONDecodeError:
+        envelope["content_format"] = "text"
+        envelope["preview"] = result[:_TOOL_OUTPUT_TEXT_PREVIEW]
+        if len(result) > (_TOOL_OUTPUT_TEXT_PREVIEW + _TOOL_OUTPUT_TEXT_TAIL_PREVIEW):
+            envelope["preview_tail"] = result[-_TOOL_OUTPUT_TEXT_TAIL_PREVIEW:]
+
+    return json.dumps(envelope, ensure_ascii=False, indent=2)
+
+
+_DEFAULT_TOOL_TIMEOUT = 3000
+_TOOL_TIMEOUT_OVERRIDES: dict[str, int | None] = {
+    # Heavy full-project precomputation can legitimately take a very long time.
+    "apktool_decompile": 3600,
+    "apktool_build": 3600,
+    "build_graph_and_index": 5400,
+    "build_smali_index": 7200,
+    "unified_scan": 1800,
+    "analyze_data_flow": 1800,
+    "run_taint_analysis": 1800,
+    # These whole-project verification passes can legitimately run for a long time.
+    # `None` disables the timeout completely.
+    "find_dynamic_checks": None,
+    "verify_bypass_completeness": None,
+}
+
+
+def _tool_timeout_seconds(tool_name: str) -> int | None:
+    return _TOOL_TIMEOUT_OVERRIDES.get(tool_name, _DEFAULT_TOOL_TIMEOUT)
 
 
 def _safe_call(func, tool_name: str, *args, _cache_hint: str = "", **kwargs) -> str:
@@ -131,26 +442,31 @@ def _safe_call(func, tool_name: str, *args, _cache_hint: str = "", **kwargs) -> 
     set_current_task(task_id)
     progress_manager.start_task(task_id, tool_name)
 
-    # Tool execution timeout (seconds). Most tools finish in <30s.
-    # Long-running ones (auto_patch_bypass, apktool_build) may need more.
-    _TOOL_TIMEOUT = 300  # 5 minutes max
+    timeout_seconds = _tool_timeout_seconds(tool_name)
 
     try:
         # Run tool with a timeout to prevent infinite hangs
+        run_context = copy_context()
+
+        def _run_in_worker():
+            # report_progress() uses thread-local task binding, so the worker
+            # thread must register the current tool task before executing.
+            set_current_task(task_id)
+            return func(*args, **kwargs)
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(func, *args, **kwargs)
+            future = executor.submit(run_context.run, _run_in_worker)
             try:
-                result = future.result(timeout=_TOOL_TIMEOUT)
+                result = future.result(timeout=timeout_seconds)
             except concurrent.futures.TimeoutError:
                 progress_manager.complete_task(task_id, success=False, error="Tool execution timed out")
                 return json.dumps({
                     "success": False,
-                    "error": f"Tool '{tool_name}' timed out after {_TOOL_TIMEOUT}s.",
+                    "error": f"Tool '{tool_name}' timed out after {timeout_seconds}s.",
                     "recovery_hint": "The tool took too long. Try a more targeted approach or smaller scope.",
                 })
-        # Global output cap — prevent any single tool from bloating context.
-        # Individual tool limits ([:N]) still apply first; this is a safety net.
-        result = _cap_tool_output(result)
+        # Preserve full oversized results on disk and give the LLM a compact reference.
+        result = _materialize_tool_output(tool_name, result)
         progress_manager.complete_task(task_id, success=True)
         # Store in cache
         if cache_key is not None:
@@ -217,6 +533,10 @@ def _resolve_dir(directory: str | None, default: str = "jadx") -> Path:
     if low == "smali":
         return _project.apktool_dir / "smali"
 
+    remapped_smali_dir = _resolve_across_smali_roots(d)
+    if remapped_smali_dir is not None and remapped_smali_dir.is_dir():
+        return remapped_smali_dir
+
     # Handle "jadx_src/..." or "jadx/..." paths — strip prefix, resolve under jadx_dir.
     # jadx puts Java sources under jadx_src/sources/, so try with and without "sources/".
     if low.startswith("jadx_src/") or low.startswith("jadx/"):
@@ -279,7 +599,7 @@ def _resolve_dir(directory: str | None, default: str = "jadx") -> Path:
 
     p = Path(directory)
     if p.is_absolute():
-        return p
+        return _rebase_stale_absolute_path(p)
 
     # Try under decompiled/ first, then workspace root, then apktool subdir
     decompiled = Path(_project.workspace_path) / "decompiled" / d
@@ -299,6 +619,87 @@ def _resolve_dir(directory: str | None, default: str = "jadx") -> Path:
     return decompiled
 
 
+def _resolve_across_smali_roots(path_value: str | Path) -> Path | None:
+    """Try the same relative tail under every discovered smali root.
+
+    This lets callers pass an incorrect root like ``smali_classes2/...`` and
+    still resolve the real file or directory when it actually lives under a
+    different dex split such as ``smali`` or ``smali_classes3``.
+    """
+    rel_path = Path(str(path_value).replace("\\", "/").lstrip("/"))
+    parts = list(rel_path.parts)
+    if not parts:
+        return None
+
+    first = parts[0].lower()
+    if first != "smali" and not first.startswith("smali_classes"):
+        return None
+
+    inner = Path(*parts[1:]) if len(parts) > 1 else Path()
+    for smali_dir in _get_all_smali_dirs():
+        candidate = smali_dir / inner
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _rebase_stale_absolute_path(path: Path) -> Path:
+    """Rebase an absolute path from an old workspace/session onto the current project.
+
+    Some tool calls may carry absolute paths from a previous workspace instance
+    (for example an old `.../decompiled/apktool/...` tree). If that exact path no
+    longer exists, try to preserve the relative tail and remap it into the
+    current project's apktool/jadx/decompiled roots.
+    """
+    if not path.is_absolute() or path.exists() or _project is None:
+        return path
+
+    normalized = str(path).replace("\\", "/")
+    lowered = normalized.lower()
+    workspace_root = Path(_project.workspace_path)
+    candidate_bases = (
+        ("decompiled/apktool/", _project.apktool_dir),
+        ("decompiled/jadx_src/sources/", _project.jadx_dir / "sources"),
+        ("decompiled/jadx_src/", _project.jadx_dir),
+        ("decompiled/", workspace_root / "decompiled"),
+        ("apktool/", _project.apktool_dir),
+        ("jadx_src/sources/", _project.jadx_dir / "sources"),
+        ("jadx_src/", _project.jadx_dir),
+    )
+
+    for marker, base in candidate_bases:
+        idx = lowered.find(marker)
+        if idx < 0:
+            continue
+        rel = normalized[idx + len(marker):].lstrip("/")
+        candidate = base / Path(rel)
+        if candidate.exists():
+            return candidate
+        if base == _project.apktool_dir:
+            remapped = _resolve_across_smali_roots(rel)
+            if remapped is not None:
+                return remapped
+
+    return path
+
+
+def _resolve_project_path(path_value: str) -> Path:
+    """Resolve file or directory paths, including stale absolute paths."""
+    p = Path(path_value)
+    if p.is_absolute():
+        return _rebase_stale_absolute_path(p)
+
+    resolved = _resolve_file(path_value)
+    if resolved.exists():
+        return resolved
+
+    dir_resolved = _resolve_dir(path_value, default="apktool")
+    if dir_resolved.exists():
+        return dir_resolved
+
+    return Path(_project.workspace_path) / path_value
+
+
 def _resolve_file(file_path: str) -> Path:
     """Resolve a *file* argument from the LLM into an absolute path.
 
@@ -312,7 +713,7 @@ def _resolve_file(file_path: str) -> Path:
     """
     p = Path(file_path)
     if p.is_absolute():
-        return p
+        return _rebase_stale_absolute_path(p)
 
     fpath = file_path.replace("\\", "/").lstrip("/")
 
@@ -326,6 +727,10 @@ def _resolve_file(file_path: str) -> Path:
     candidate = _project.apktool_dir / fpath
     if candidate.is_file():
         return candidate
+
+    remapped_smali_file = _resolve_across_smali_roots(fpath)
+    if remapped_smali_file is not None and remapped_smali_file.is_file():
+        return remapped_smali_file
 
     # If path starts with "smali/", try other smali dirs (smali_classes2, etc.)
     if fpath.startswith("smali/"):
@@ -394,13 +799,16 @@ def apktool_decompile() -> str:
     """
     from apk_agent.tools.apktool import decompile
 
-    result = decompile(
-        apktool_bin=_config.get_tool_path("apktool") or "apktool",
-        apk_path=_project.apk_path,
-        output_dir=_project.apktool_dir,
-        log_file=_log_file(),
-    )
-    return result.to_llm_str()
+    def _run() -> str:
+        result = decompile(
+            apktool_bin=_config.get_tool_path("apktool") or "apktool",
+            apk_path=_project.apk_path,
+            output_dir=_project.apktool_dir,
+            log_file=_log_file(),
+        )
+        return result.to_llm_str()
+
+    return _safe_call(_run, "apktool_decompile")
 
 
 @tool
@@ -416,13 +824,16 @@ def jadx_decompile() -> str:
     """
     from apk_agent.tools.jadx import decompile
 
-    result = decompile(
-        jadx_bin=_config.get_tool_path("jadx") or "jadx",
-        apk_path=_project.apk_path,
-        output_dir=_project.jadx_dir,
-        log_file=_log_file(),
-    )
-    return result.to_llm_str()
+    def _run() -> str:
+        result = decompile(
+            jadx_bin=_config.get_tool_path("jadx") or "jadx",
+            apk_path=_project.apk_path,
+            output_dir=_project.jadx_dir,
+            log_file=_log_file(),
+        )
+        return result.to_llm_str()
+
+    return _safe_call(_run, "jadx_decompile")
 
 
 @tool
@@ -581,6 +992,18 @@ def apktool_build() -> str:
     """Rebuild the APK from the (possibly patched) apktool decompiled project.
     Run this after applying smali patches to produce a new unsigned APK.
 
+    SYNTAX:
+    - Call exactly: `apktool_build()`
+    - This tool takes NO arguments.
+    - Do NOT invent `/force build`, `apktool_build(force=true)`,
+      `apktool_build(rebuild=true)`, or `apktool_build(clean=true)`.
+
+    FORCE-REBUILD BEHAVIOR:
+    - Every call already performs a forced rebuild.
+    - It deletes apktool's `build/` cache before compiling.
+    - It calls apktool with `--force-all` internally.
+    - To retry a failed build, fix the reported problem and call `apktool_build()` again.
+
     When to use: After ALL patches are applied and you are ready to produce
     the modified APK. Follow with zipalign_apk_tool then sign_apk.
 
@@ -589,6 +1012,34 @@ def apktool_build() -> str:
     """
     import shutil as _shutil
     from apk_agent.tools.apktool import build
+    from apk_agent.tools.base import ToolResult
+    from apk_agent.tools.validation_pipeline import run_patch_validation_pipeline
+
+    validation_result = run_patch_validation_pipeline(
+        project_root=Path(_project.workspace_path),
+        apktool_dir=_project.apktool_dir,
+        backup_dir=_project.patch_backup_dir,
+        patch_journal=list(_patch_journal),
+    )
+    syntax = validation_result.get("syntax", {}) if isinstance(validation_result, dict) else {}
+    invalid_smali_count = int(syntax.get("invalid_smali_count", 0) or 0)
+
+    if invalid_smali_count > 0:
+        failure = ToolResult(
+            success=False,
+            exit_code=-4,
+            stdout="",
+            stderr="Pre-build syntax validation failed. Refusing to rebuild until patched smali is valid.",
+            command="apktool_build()",
+            artifacts={
+                "invalid_smali_count": invalid_smali_count,
+            },
+        )
+        return (
+            failure.to_llm_str()
+            + "\n\n--- pre-build validation ---\n"
+            + json.dumps(validation_result, ensure_ascii=False, indent=2)[:12000]
+        )
 
     # --- PRE-BUILD: verify patched files still contain our patches ---
     pre_warnings = _pre_build_patch_check()
@@ -609,6 +1060,12 @@ def apktool_build() -> str:
         force_all=True,
     )
     build_output = result.to_llm_str()
+    build_output += (
+        "\n\n--- pre-build validation ---\n"
+        f"mode={validation_result.get('prebuild_mode', 'syntax_only')}  "
+        f"invalid_smali={invalid_smali_count}  "
+        f"patched_files={validation_result.get('patched_files_count', 0)}"
+    )
 
     # --- POST-BUILD: verify patches survived the rebuild ---
     post_warnings = []
@@ -660,18 +1117,84 @@ def sign_apk() -> str:
     Run this after apktool_build (and optionally zipalign_apk_tool) succeeds.
 
     When to use: LAST step in the build pipeline (after apktool_build → zipalign_apk_tool).
-    Automatically uses the aligned APK if available, otherwise the unsigned APK.
+    Automatically uses a fresh aligned APK when possible, auto-zipaligning the
+    latest unsigned build if the aligned copy is missing or stale. Produces a
+    verified v1+v2+v3 signature before reporting success.
 
     Returns: Text summary with success/failure status and path to the signed APK
     (outputs/patched-signed.apk).
     """
+    from apk_agent.tools.base import ToolResult
+    from apk_agent.tools.cert_analyzer import analyze_certificate as _analyze_certificate
     from apk_agent.tools.signer import sign_apk as _sign
+    from apk_agent.tools.zipalign import verify_alignment, zipalign
+    from apk_agent.workspace import validate_apk
 
-    # Try aligned first, fall back to unsigned
     aligned = Path(_project.workspace_path) / "outputs" / "patched-aligned.apk"
     unsigned = Path(_project.workspace_path) / "outputs" / "patched-unsigned.apk"
-    input_apk = aligned if aligned.is_file() else unsigned
     signed = Path(_project.workspace_path) / "outputs" / "patched-signed.apk"
+    zipalign_bin = _config.get_tool_path("zipalign") or "zipalign"
+    input_apk = aligned if aligned.is_file() else unsigned
+    alignment_note = ""
+
+    if not unsigned.is_file() and not aligned.is_file():
+        return ToolResult(
+            success=False,
+            exit_code=-5,
+            stdout="",
+            stderr="No rebuilt APK found. Run apktool_build() successfully before sign_apk().",
+            command="sign_apk()",
+        ).to_llm_str()
+
+    if unsigned.is_file():
+        aligned_is_fresh = aligned.is_file()
+        if aligned_is_fresh:
+            try:
+                aligned_is_fresh = aligned.stat().st_mtime >= unsigned.stat().st_mtime
+            except OSError:
+                aligned_is_fresh = False
+
+        if not aligned_is_fresh:
+            align_result = zipalign(
+                zipalign_bin=zipalign_bin,
+                input_apk=unsigned,
+                output_apk=aligned,
+                log_file=_log_file(),
+            )
+            if not (align_result.success and aligned.is_file()):
+                return (
+                    ToolResult(
+                        success=False,
+                        exit_code=-6,
+                        stdout="",
+                        stderr="Zipalign failed. Refusing to sign an unaligned APK because Android may reject it as an invalid package.",
+                        command="sign_apk()",
+                    ).to_llm_str()
+                    + "\n\n--- zipalign details ---\n"
+                    + align_result.to_llm_str()
+                )
+            alignment_note = "Auto-zipaligned the latest unsigned APK before signing.\n"
+        input_apk = aligned
+
+    if input_apk == aligned:
+        alignment_check = verify_alignment(
+            zipalign_bin=zipalign_bin,
+            apk_path=aligned,
+            log_file=_log_file(),
+        )
+        if not alignment_check.success:
+            return (
+                ToolResult(
+                    success=False,
+                    exit_code=-7,
+                    stdout="",
+                    stderr="Aligned APK failed zipalign verification. Refusing to sign because the final package may install as invalid.",
+                    command="sign_apk()",
+                ).to_llm_str()
+                + "\n\n--- alignment verification ---\n"
+                + alignment_check.to_llm_str()
+            )
+        alignment_note += "Zipalign verification passed before signing.\n"
 
     result = _sign(
         signer_bin=_config.get_tool_path("apksigner") or "apksigner",
@@ -683,7 +1206,54 @@ def sign_apk() -> str:
         key_password=_config.keystore.key_password,
         log_file=_log_file(),
     )
-    return result.to_llm_str()
+    if not result.success:
+        return alignment_note + result.to_llm_str()
+
+    signed_path = Path(result.artifacts.get("signed_apk", signed)).resolve()
+    apk_errors = validate_apk(signed_path, _config.max_apk_size_mb)
+    cert_info = _analyze_certificate(signed_path)
+    verified_schemes_raw = str(result.artifacts.get("signature_schemes", "") or "").strip()
+    verified_schemes = {
+        part.strip().lower() for part in verified_schemes_raw.split(",") if part.strip()
+    }
+    if verified_schemes_raw:
+        cert_info["signature_verified"] = bool(result.artifacts.get("signature_verified", False))
+        cert_info["signature_schemes"] = verified_schemes_raw
+        cert_info["signature_scheme"] = verified_schemes_raw
+        cert_info["signature_scheme_source"] = "apksigner verify"
+        scheme_details = result.artifacts.get("signature_scheme_details")
+        if isinstance(scheme_details, dict) and scheme_details:
+            cert_info["signature_scheme_details"] = scheme_details
+    has_v1_signature = "v1" in verified_schemes or (
+        bool(cert_info.get("signing_files")) and "v1" in str(cert_info.get("signature_scheme", "")).lower()
+    )
+
+    if apk_errors or not has_v1_signature:
+        failure = ToolResult(
+            success=False,
+            exit_code=-8,
+            stdout="",
+            stderr="Final signed APK failed installability checks. Refusing to report success because Android may reject it as an invalid package.",
+            command="sign_apk()",
+            artifacts={
+                "signed_apk": str(signed_path),
+                "apk_structure_errors": apk_errors,
+                "v1_signature_detected": has_v1_signature,
+            },
+        )
+        return (
+            alignment_note
+            + failure.to_llm_str()
+            + "\n\n--- certificate analysis ---\n"
+            + json.dumps(cert_info, ensure_ascii=False, indent=2)[:5000]
+        )
+
+    return (
+        alignment_note
+        + result.to_llm_str()
+        + "\n\n--- certificate analysis ---\n"
+        + json.dumps(cert_info, ensure_ascii=False, indent=2)[:5000]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -856,6 +1426,104 @@ def identify_app_packages() -> str:
 
     return _safe_call(_run, "identify_app_packages")
 
+# ---------------------------------------------------------------------------
+# Resource-aware tools
+# ---------------------------------------------------------------------------
+
+
+@tool
+def find_resource_colors(color_family: str = "", exclude_third_party: bool = True) -> str:
+    """Parse Android color resources and return structured color mappings.
+
+    Understands `res/values*/colors.xml` instead of treating resource files as raw text.
+
+    Args:
+        color_family: Optional hue family filter: red, orange, yellow, green,
+            cyan, blue, purple, pink.
+        exclude_third_party: If true, skip common third-party resource prefixes.
+
+    Returns: JSON with extracted color entries, hue info, and file locations.
+    """
+    from apk_agent.tools.resource_tools import find_app_colors as _find
+
+    def _run():
+        result = _find(
+            _project.apktool_dir,
+            color_family=color_family.strip() or None,
+            exclude_third_party=exclude_third_party,
+        )
+        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
+
+    return _safe_call(_run, "find_resource_colors", _cache_hint=f"{color_family}:{exclude_third_party}")
+
+
+@tool
+def find_resource_styles(exclude_third_party: bool = True) -> str:
+    """Parse Android style/theme resources and extract color-related attributes.
+
+    Useful for patching themes intentionally instead of editing styles.xml blindly.
+
+    Args:
+        exclude_third_party: If true, skip known third-party/material library themes.
+
+    Returns: JSON with styles/themes and their color attributes.
+    """
+    from apk_agent.tools.resource_tools import find_app_styles as _find
+
+    def _run():
+        result = _find(_project.apktool_dir, exclude_third_party=exclude_third_party)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
+
+    return _safe_call(_run, "find_resource_styles", _cache_hint=str(exclude_third_party))
+
+
+@tool
+def replace_resource_colors(color_map_json: str) -> str:
+    """Bulk replace color hex values across Android resource XML files.
+
+    Applies structured color replacement across colors.xml, styles/themes,
+    layout XMLs, and drawable XMLs under `res/`.
+
+    Args:
+        color_map_json: JSON object mapping old hex colors to new hex colors.
+            Example: {"#FF6200EE": "#FF1F7A8C"}
+
+    Returns: JSON with files modified and replacement counts.
+    """
+    from apk_agent.tools.resource_tools import replace_colors as _replace
+
+    def _run():
+        try:
+            color_map = json.loads(color_map_json)
+        except json.JSONDecodeError as e:
+            return json.dumps({"success": False, "error": f"Invalid JSON: {e}"})
+        if not isinstance(color_map, dict):
+            return json.dumps({"success": False, "error": "color_map_json must be a JSON object."})
+        result = _replace(_project.apktool_dir, color_map)
+        return json.dumps(result, ensure_ascii=False, indent=2)
+
+    return _safe_call(_run, "replace_resource_colors")
+
+
+@tool
+def list_resource_drawables(color_filter: str = "") -> str:
+    """List drawable XML resources, optionally filtered by embedded hex color.
+
+    Args:
+        color_filter: Optional hex color like `#FF0000`.
+
+    Returns: JSON with drawable files and discovered inline colors.
+    """
+    from apk_agent.tools.resource_tools import list_drawables as _list
+
+    def _run():
+        result = _list(_project.apktool_dir, color_filter=color_filter.strip() or None)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
+
+    return _safe_call(_run, "list_resource_drawables", _cache_hint=color_filter)
+
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -1007,6 +1675,114 @@ def read_file(file_path: str, start_line: int = 0, end_line: int = 0) -> str:
     return json.dumps(result, ensure_ascii=False, indent=2)[:12000]
 
 
+def _find_broken_smali_descriptors(content: str) -> list[str]:
+    """Return descriptor fragments that look like object refs missing the `L` prefix.
+
+    This intentionally scans descriptor-shaped contexts only so valid method
+    signatures like `JLjava/...;` and string literals like `"application/json;"`
+    are not misclassified as broken smali.
+    """
+    import re as _re
+
+    sanitized = _re.sub(r'"(?:\\.|[^"\\])*"', '""', content)
+    broken: list[str] = []
+    seen: set[str] = set()
+
+    def _record(ref: str) -> None:
+        ref = ref.strip()
+        if ref and ref not in seen:
+            seen.add(ref)
+            broken.append(ref)
+
+    def _scan_descriptor_sequence(descriptor: str, *, allow_void: bool = False, single: bool = False) -> None:
+        descriptor = descriptor.strip()
+        if not descriptor:
+            return
+
+        index = 0
+        consumed = False
+
+        def _missing_l_fragment(start: int) -> str | None:
+            end = descriptor.find(";", start)
+            if end == -1:
+                return None
+            fragment = descriptor[start : end + 1].strip()
+            return fragment if "/" in fragment else None
+
+        while index < len(descriptor):
+            while index < len(descriptor) and descriptor[index] == "[":
+                index += 1
+
+            if index >= len(descriptor):
+                break
+
+            ch = descriptor[index]
+            if ch == "L":
+                end = descriptor.find(";", index + 1)
+                if end == -1:
+                    break
+                index = end + 1
+                consumed = True
+                continue
+
+            if ch == "V" and allow_void and index == 0:
+                index += 1
+                consumed = True
+                continue
+
+            if ch in "ZBCSIJFD":
+                index += 1
+                consumed = True
+                if single and index < len(descriptor):
+                    tail = _missing_l_fragment(index)
+                    if tail is not None:
+                        _record(descriptor)
+                        return
+                continue
+
+            fragment = _missing_l_fragment(index)
+            if fragment is not None:
+                _record(descriptor if single else fragment)
+            return
+
+        if not consumed:
+            fragment = _missing_l_fragment(0)
+            if fragment is not None:
+                _record(descriptor if single else fragment)
+
+    for raw_line in sanitized.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+
+        if line.startswith((".class", ".super", ".implements")):
+            _scan_descriptor_sequence(line.split()[-1], single=True)
+
+        field_def = _re.search(r'^\.field\b.*?:\s*([^=\s]+)', line)
+        if field_def:
+            _scan_descriptor_sequence(field_def.group(1), single=True)
+
+        method_def = _re.search(r'^\.method\b[^\(]*\(([^)]*)\)([^\s#]+)', line)
+        if method_def:
+            _scan_descriptor_sequence(method_def.group(1))
+            _scan_descriptor_sequence(method_def.group(2), allow_void=True, single=True)
+
+        if "->" not in line:
+            continue
+
+        for class_ref in _re.finditer(r'([^\s,{}()]+)->', line):
+            _scan_descriptor_sequence(class_ref.group(1), single=True)
+
+        for field_ref in _re.finditer(r'->[\w<>$-]+:([^\s,}#]+)', line):
+            _scan_descriptor_sequence(field_ref.group(1), single=True)
+
+        for method_ref in _re.finditer(r'->[\w<>$-]+\(([^)]*)\)([^\s,}#]+)', line):
+            _scan_descriptor_sequence(method_ref.group(1))
+            _scan_descriptor_sequence(method_ref.group(2), allow_void=True, single=True)
+
+    return broken
+
+
 @tool
 def write_file(file_path: str, content: str) -> str:
     """Write or overwrite a file in the decompiled project.
@@ -1030,7 +1806,7 @@ def write_file(file_path: str, content: str) -> str:
 
     p = Path(file_path)
     if not p.is_absolute():
-        p = Path(_project.workspace_path) / file_path
+        p = _resolve_file(file_path)
 
     # --- Smali validation guard ------------------------------------------
     if p.suffix == ".smali":
@@ -1040,22 +1816,8 @@ def write_file(file_path: str, content: str) -> str:
                 "error": "BLOCKED: .smali file has no .class directive — content is corrupt. "
                          "Use apply_smali_patch or inject_smali_code instead of write_file."})
 
-        # 2. Detect broken class descriptors: bare Package/Name; without L prefix
-        #    Valid: Lcom/app/Foo;  Invalid: com/app/Foo; (missing L)
-        #    Look for references like ", IF0/y;" or "->field:IF0/y;" where L is missing
-        broken_refs = _re.findall(
-            r'(?<![L\w/])([A-Za-z]\w*/\w[^\s;]*;)', content
-        )
-        # Filter: only flag if it looks like a class descriptor (has / and ends with ;)
-        # but doesn't start with L and isn't a known type prefix
-        real_broken = []
-        for ref in broken_refs:
-            # Skip if it starts with a known type like Ljava, or is just a path
-            if ref.startswith("L") or ref.startswith("["):
-                continue
-            # Must look like Package/Name; pattern (at least one /)
-            if "/" in ref and ref.endswith(";"):
-                real_broken.append(ref)
+        # 2. Detect broken class descriptors in descriptor-shaped contexts only.
+        real_broken = _find_broken_smali_descriptors(content)
         if real_broken:
             examples = ", ".join(real_broken[:5])
             return json.dumps({"success": False,
@@ -1248,9 +2010,21 @@ def map_feature_checks(
 def _map_feature_checks_impl(feature: str, extra_keywords: str) -> str:
     """Internal implementation of map_feature_checks."""
     import re as _re
+    from apk_agent.progress import report_progress
     from apk_agent.tools.index_cache import lookup_method, lookup_string, lookup_class
     from apk_agent.tools.code_graph import query_callers as _qc
     from apk_agent.tools.deep_analysis import analyze_shared_prefs as _asp
+
+    def _emit_progress(start_pct: float, end_pct: float, current: int, total: int, detail: str) -> None:
+        if total <= 0:
+            report_progress(end_pct, detail)
+            return
+        interval = max(1, total // 20)
+        if current == total or current % interval == 0:
+            pct = start_pct + (current / total) * (end_pct - start_pct)
+            report_progress(pct, detail)
+
+    report_progress(2, f"Preparing feature map for '{feature}'")
 
     # Build keyword list
     keywords = [feature.strip().lower()]
@@ -1272,7 +2046,24 @@ def _map_feature_checks_impl(feature: str, extra_keywords: str) -> str:
             if kw and kw not in keywords:
                 keywords.append(kw)
 
+    report_progress(6, f"Keyword expansion complete: {len(keywords)} search terms")
+
+    search_smali_dirs = _get_all_smali_dirs()
+
+    def _resolve_analysis_file(relative_path: str):
+        if not relative_path:
+            return None
+        candidate = _project.apktool_dir / relative_path
+        if candidate.is_file():
+            return candidate
+        for smali_dir in search_smali_dirs:
+            alt = smali_dir / relative_path
+            if alt.is_file():
+                return alt
+        return None
+
     # --- Step 1: Find boolean getters via index ---
+    report_progress(8, "Loading code index for feature discovery")
     idx = _ensure_index()
     boolean_getters: list[dict] = []
     int_getters: list[dict] = []
@@ -1282,7 +2073,8 @@ def _map_feature_checks_impl(feature: str, extra_keywords: str) -> str:
         # Method lookup: isPremium, isPro, isSubscribed, etc.
         getter_prefixes = ["is", "get", "has", "can", "check", "should", "verify"]
         searched_methods: set[str] = set()
-        for kw in keywords:
+        report_progress(12, f"Index getter lookup across {len(keywords)} keywords")
+        for kw_index, kw in enumerate(keywords, start=1):
             for prefix in getter_prefixes:
                 mname = f"{prefix}{kw.capitalize()}"
                 if mname in searched_methods:
@@ -1308,17 +2100,36 @@ def _map_feature_checks_impl(feature: str, extra_keywords: str) -> str:
                 if entry not in boolean_getters and entry not in int_getters:
                     int_getters.append(entry)
 
+            _emit_progress(
+                12,
+                20,
+                kw_index,
+                len(keywords),
+                f"Getter lookup: {kw_index}/{len(keywords)} keywords | {len(boolean_getters)} boolean + {len(int_getters)} fallback methods",
+            )
+
         # String lookup: "premium", "pro", "FREE", "PREMIUM", etc.
-        for kw in keywords:
+        report_progress(21, f"Index string lookup across {len(keywords)} keywords")
+        for kw_index, kw in enumerate(keywords, start=1):
             for variant in [kw, kw.upper(), kw.capitalize()]:
                 result = lookup_string(idx, variant)
                 for s in result.get("matches", result.get("string_matches", []))[:10]:
                     string_refs.append(s)
+            _emit_progress(
+                21,
+                28,
+                kw_index,
+                len(keywords),
+                f"String lookup: {kw_index}/{len(keywords)} keywords | {len(string_refs)} refs",
+            )
+    else:
+        report_progress(28, "Code index unavailable; skipping index lookups")
 
     # --- Step 2: SharedPreferences analysis ---
     shared_prefs_hits: list[dict] = []
+    report_progress(30, "Analyzing SharedPreferences and local flags")
     try:
-        search_dirs = _get_all_smali_dirs()
+        search_dirs = list(search_smali_dirs)
         jadx = _project.jadx_dir
         if jadx.is_dir():
             search_dirs.append(jadx)
@@ -1332,15 +2143,26 @@ def _map_feature_checks_impl(feature: str, extra_keywords: str) -> str:
                 shared_prefs_hits.append({"key": key_name, "refs": refs[:3]})
     except Exception:
         pass
+    report_progress(38, f"SharedPreferences analysis complete: {len(shared_prefs_hits)} matching keys")
 
     # --- Step 3: Graph callers for discovered methods ---
     callers_map: list[dict] = []
+    report_progress(40, "Loading code graph for caller tracing")
     G = _ensure_graph()
     if G:
         seen: set[str] = set()
-        for getter in (boolean_getters + int_getters)[:15]:
+        getters_to_trace = (boolean_getters + int_getters)[:15]
+        report_progress(44, f"Tracing callers for {len(getters_to_trace)} getter methods")
+        for getter_index, getter in enumerate(getters_to_trace, start=1):
             mname = getter.get("method", "").split("->")[-1].split("(")[0] if "->" in getter.get("method", "") else ""
             if not mname or mname in seen:
+                _emit_progress(
+                    44,
+                    52,
+                    getter_index,
+                    len(getters_to_trace),
+                    f"Caller tracing: {getter_index}/{len(getters_to_trace)} methods | {len(callers_map)} call chains",
+                )
                 continue
             seen.add(mname)
             cr = _qc(G, mname, depth=2)
@@ -1350,6 +2172,15 @@ def _map_feature_checks_impl(feature: str, extra_keywords: str) -> str:
                     "caller": chain.get("caller", ""),
                     "caller_file": chain.get("caller_file", ""),
                 })
+            _emit_progress(
+                44,
+                52,
+                getter_index,
+                len(getters_to_trace),
+                f"Caller tracing: {getter_index}/{len(getters_to_trace)} methods | {len(callers_map)} call chains",
+            )
+    else:
+        report_progress(52, "Code graph unavailable; skipping caller tracing")
 
     # --- Step 4: Paywall / UI gate methods ---
     paywall_methods: list[dict] = []
@@ -1357,13 +2188,21 @@ def _map_feature_checks_impl(feature: str, extra_keywords: str) -> str:
         paywall_names = ["showPaywall", "showUpgrade", "showPurchase", "showPremium",
                          "showSubscri", "openStore", "openBilling", "showPro",
                          "upgrade", "paywall", "locked"]
-        for pn in paywall_names:
+        report_progress(54, f"Scanning {len(paywall_names)} paywall/UI gate patterns")
+        for paywall_index, pn in enumerate(paywall_names, start=1):
             result = lookup_method(idx, pn)
             for m in result.get("methods", []):
                 paywall_methods.append({
                     "method": m.get("full_name", ""),
                     "file": m.get("file", ""),
                 })
+            _emit_progress(
+                54,
+                60,
+                paywall_index,
+                len(paywall_names),
+                f"Paywall lookup: {paywall_index}/{len(paywall_names)} patterns | {len(paywall_methods)} hits",
+            )
 
     # --- Step 5: BEHAVIORAL ANALYSIS — find gating methods by code patterns ---
     # This catches obfuscated methods like a()Z that perform subscription checks
@@ -1398,20 +2237,29 @@ def _map_feature_checks_impl(feature: str, extra_keywords: str) -> str:
                 entity_files.add(f)
 
     try:
-        for efile in list(entity_files)[:20]:
+        behavioral_files = list(entity_files)[:20]
+        report_progress(62, f"Behavioral scan across {len(behavioral_files)} candidate entity files")
+        for file_index, efile in enumerate(behavioral_files, start=1):
             try:
-                fpath = _project.apktool_dir / efile
-                if not fpath.is_file():
-                    # Try resolving differently
-                    for smali_dir in _get_all_smali_dirs():
-                        candidate = smali_dir / efile
-                        if candidate.is_file():
-                            fpath = candidate
-                            break
-                if not fpath.is_file():
+                fpath = _resolve_analysis_file(efile)
+                if fpath is None:
+                    _emit_progress(
+                        62,
+                        70,
+                        file_index,
+                        len(behavioral_files),
+                        f"Behavioral scan: {file_index}/{len(behavioral_files)} files | {len(behavioral_hits)} gate-like methods",
+                    )
                     continue
                 text = fpath.read_text(encoding="utf-8", errors="replace")
             except Exception:
+                _emit_progress(
+                    62,
+                    70,
+                    file_index,
+                    len(behavioral_files),
+                    f"Behavioral scan: {file_index}/{len(behavioral_files)} files | {len(behavioral_hits)} gate-like methods",
+                )
                 continue
 
             # Find all methods returning Z (boolean) or I (int)
@@ -1447,6 +2295,13 @@ def _map_feature_checks_impl(feature: str, extra_keywords: str) -> str:
                         "access": access,
                         "note": "Found by BEHAVIORAL analysis (code pattern), not by name",
                     })
+            _emit_progress(
+                62,
+                70,
+                file_index,
+                len(behavioral_files),
+                f"Behavioral scan: {file_index}/{len(behavioral_files)} files | {len(behavioral_hits)} gate-like methods",
+            )
     except Exception:
         pass
 
@@ -1462,25 +2317,49 @@ def _map_feature_checks_impl(feature: str, extra_keywords: str) -> str:
                 entity_classes.add(c)
 
         if idx:
-            for cls_name in list(entity_classes)[:10]:
+            structural_classes = list(entity_classes)[:10]
+            report_progress(71, f"Structural scan across {len(structural_classes)} entity classes")
+            for class_index, cls_name in enumerate(structural_classes, start=1):
                 cls_info = idx.get("classes", {}).get(cls_name, {})
                 if not cls_info:
+                    _emit_progress(
+                        71,
+                        76,
+                        class_index,
+                        len(structural_classes),
+                        f"Structural scan: {class_index}/{len(structural_classes)} classes | {len(entity_methods)} extra methods",
+                    )
                     continue
                 fpath_str = cls_info.get("file", "")
                 if not fpath_str:
+                    _emit_progress(
+                        71,
+                        76,
+                        class_index,
+                        len(structural_classes),
+                        f"Structural scan: {class_index}/{len(structural_classes)} classes | {len(entity_methods)} extra methods",
+                    )
                     continue
                 try:
-                    fpath = _project.apktool_dir / fpath_str
-                    if not fpath.is_file():
-                        for sd in _get_all_smali_dirs():
-                            c2 = sd / fpath_str
-                            if c2.is_file():
-                                fpath = c2
-                                break
-                    if not fpath.is_file():
+                    fpath = _resolve_analysis_file(fpath_str)
+                    if fpath is None:
+                        _emit_progress(
+                            71,
+                            76,
+                            class_index,
+                            len(structural_classes),
+                            f"Structural scan: {class_index}/{len(structural_classes)} classes | {len(entity_methods)} extra methods",
+                        )
                         continue
                     text = fpath.read_text(encoding="utf-8", errors="replace")
                 except Exception:
+                    _emit_progress(
+                        71,
+                        76,
+                        class_index,
+                        len(structural_classes),
+                        f"Structural scan: {class_index}/{len(structural_classes)} classes | {len(entity_methods)} extra methods",
+                    )
                     continue
 
                 # Find ALL methods returning Z or I in this entity class
@@ -1501,6 +2380,13 @@ def _map_feature_checks_impl(feature: str, extra_keywords: str) -> str:
                             "return_type": "boolean" if m.group(4) == "Z" else "int",
                             "note": "Same entity class — may also gate features",
                         })
+                _emit_progress(
+                    71,
+                    76,
+                    class_index,
+                    len(structural_classes),
+                    f"Structural scan: {class_index}/{len(structural_classes)} classes | {len(entity_methods)} extra methods",
+                )
     except Exception:
         pass
 
@@ -1511,6 +2397,7 @@ def _map_feature_checks_impl(feature: str, extra_keywords: str) -> str:
     billing_hits: list[dict] = []
     _step5_files = set(entity_files)  # Track what Step 5 already scanned
     try:
+        report_progress(77, "Tracing billing framework entry points and purchase handlers")
         # 7a: Find app classes that IMPLEMENT billing interfaces
         _BILLING_INTERFACES = [
             "PurchasesUpdatedListener", "BillingClientStateListener",
@@ -1519,7 +2406,8 @@ def _map_feature_checks_impl(feature: str, extra_keywords: str) -> str:
             "ConsumeResponseListener", "PurchaseHistoryResponseListener",
         ]
         if idx:
-            for cls_name, cls_info in idx.get("classes", {}).items():
+            idx_classes = list(idx.get("classes", {}).items())
+            for class_index, (cls_name, cls_info) in enumerate(idx_classes, start=1):
                 ifaces = cls_info.get("interfaces", [])
                 for iface in ifaces:
                     iface_short = iface.split("/")[-1].rstrip(";")
@@ -1533,6 +2421,13 @@ def _map_feature_checks_impl(feature: str, extra_keywords: str) -> str:
                         })
                         if f:
                             entity_files.add(f)
+                _emit_progress(
+                    77,
+                    80,
+                    class_index,
+                    len(idx_classes),
+                    f"Billing interface scan: {class_index}/{len(idx_classes)} classes | {len(billing_hits)} hits",
+                )
 
         # 7b: Use graph to find APP classes that call billing API methods
         _BILLING_METHODS = [
@@ -1548,9 +2443,9 @@ def _map_feature_checks_impl(feature: str, extra_keywords: str) -> str:
             "billingclient", "vending", "revenuecat", "qonversion",
             "adapty", "android/billingclient", "billing/api",
         })
-        G = _ensure_graph()
         if G:
-            for bm in _BILLING_METHODS:
+            report_progress(81, f"Tracing {len(_BILLING_METHODS)} billing API methods through the code graph")
+            for method_index, bm in enumerate(_BILLING_METHODS, start=1):
                 cr = _qc(G, bm, depth=1)
                 for chain in cr.get("call_chains", [])[:5]:
                     caller = chain.get("caller", "")
@@ -1565,6 +2460,13 @@ def _map_feature_checks_impl(feature: str, extra_keywords: str) -> str:
                     })
                     if caller_file:
                         entity_files.add(caller_file)
+                _emit_progress(
+                    81,
+                    84,
+                    method_index,
+                    len(_BILLING_METHODS),
+                    f"Billing graph trace: {method_index}/{len(_BILLING_METHODS)} APIs | {len(billing_hits)} hits",
+                )
 
         # 7c: Find classes that reference billing-related CLASSES by name
         _BILLING_CLASSES = [
@@ -1572,7 +2474,7 @@ def _map_feature_checks_impl(feature: str, extra_keywords: str) -> str:
             "BillingResult", "BillingFlowParams",
         ]
         if idx:
-            for bc in _BILLING_CLASSES:
+            for class_index, bc in enumerate(_BILLING_CLASSES, start=1):
                 result = lookup_class(idx, bc)
                 for c in result.get("classes", [])[:3]:
                     cls_name = c.get("class", "")
@@ -1588,24 +2490,40 @@ def _map_feature_checks_impl(feature: str, extra_keywords: str) -> str:
                             "references": bc,
                             "note": f"App class referencing {bc}",
                         })
+                _emit_progress(
+                    84,
+                    86,
+                    class_index,
+                    len(_BILLING_CLASSES),
+                    f"Billing class lookup: {class_index}/{len(_BILLING_CLASSES)} patterns | {len(billing_hits)} hits",
+                )
 
         # 7d: Trace FIELDS in billing-connected classes to find entity classes.
         # The purchase handler often has a field like `UserInfo mUserInfo` or
         # `SubscriptionModel mSub` — tracing field types finds the entity.
         _new_entity_files: set[str] = set()
-        for bfile in list(entity_files - _step5_files)[:15]:
+        new_billing_files = list(entity_files - _step5_files)[:15]
+        for file_index, bfile in enumerate(new_billing_files, start=1):
             try:
-                fpath = _project.apktool_dir / bfile
-                if not fpath.is_file():
-                    for sd in _get_all_smali_dirs():
-                        c2 = sd / bfile
-                        if c2.is_file():
-                            fpath = c2
-                            break
-                if not fpath.is_file():
+                fpath = _resolve_analysis_file(bfile)
+                if fpath is None:
+                    _emit_progress(
+                        86,
+                        88,
+                        file_index,
+                        len(new_billing_files),
+                        f"Billing field trace: {file_index}/{len(new_billing_files)} files | {len(_new_entity_files)} new entity files",
+                    )
                     continue
                 text = fpath.read_text(encoding="utf-8", errors="replace")
             except Exception:
+                _emit_progress(
+                    86,
+                    88,
+                    file_index,
+                    len(new_billing_files),
+                    f"Billing field trace: {file_index}/{len(new_billing_files)} files | {len(_new_entity_files)} new entity files",
+                )
                 continue
 
             # Find field types that point to app classes (potential entities)
@@ -1641,23 +2559,39 @@ def _map_feature_checks_impl(feature: str, extra_keywords: str) -> str:
                     rf = rc_info.get("file", "")
                     if rf and rf not in entity_files:
                         _new_entity_files.add(rf)
+            _emit_progress(
+                86,
+                88,
+                file_index,
+                len(new_billing_files),
+                f"Billing field trace: {file_index}/{len(new_billing_files)} files | {len(_new_entity_files)} new entity files",
+            )
 
         entity_files.update(_new_entity_files)
 
         # 7e: Behavioral scan on ALL newly discovered files (from billing tracing)
-        for bfile in list(entity_files - _step5_files)[:20]:
+        billing_behavior_files = list(entity_files - _step5_files)[:20]
+        for file_index, bfile in enumerate(billing_behavior_files, start=1):
             try:
-                fpath = _project.apktool_dir / bfile
-                if not fpath.is_file():
-                    for sd in _get_all_smali_dirs():
-                        c2 = sd / bfile
-                        if c2.is_file():
-                            fpath = c2
-                            break
-                if not fpath.is_file():
+                fpath = _resolve_analysis_file(bfile)
+                if fpath is None:
+                    _emit_progress(
+                        88,
+                        90,
+                        file_index,
+                        len(billing_behavior_files),
+                        f"Billing behavioral scan: {file_index}/{len(billing_behavior_files)} files | {len(behavioral_hits)} behavioral hits",
+                    )
                     continue
                 text = fpath.read_text(encoding="utf-8", errors="replace")
             except Exception:
+                _emit_progress(
+                    88,
+                    90,
+                    file_index,
+                    len(billing_behavior_files),
+                    f"Billing behavioral scan: {file_index}/{len(billing_behavior_files)} files | {len(behavioral_hits)} behavioral hits",
+                )
                 continue
 
             for m in _re.finditer(
@@ -1688,6 +2622,134 @@ def _map_feature_checks_impl(feature: str, extra_keywords: str) -> str:
                             "access": m.group(1).strip(),
                             "note": "Found via BILLING API tracing (billing-connected class)",
                         })
+            _emit_progress(
+                88,
+                90,
+                file_index,
+                len(billing_behavior_files),
+                f"Billing behavioral scan: {file_index}/{len(billing_behavior_files)} files | {len(behavioral_hits)} behavioral hits",
+            )
+    except Exception:
+        pass
+
+    # --- Step 8: SMALI-IR BEHAVIORAL SCAN — find gate methods by INSTRUCTION PATTERNS ---
+    # Uses the SmaliIndex (parsed IR with typed instructions) to find methods
+    # that BEHAVE like gates, regardless of their names.
+    # This is the MOST powerful step for obfuscated apps where a()Z = isPremium.
+    ir_behavioral_hits: list[dict] = []
+    try:
+        report_progress(91, "Loading SmaliIndex for instruction-level behavioral scan")
+        si = _ensure_smali_index()
+        if si:
+            # Collect class names from entity_files for targeted deep scan
+            _entity_class_names: set[str] = set()
+            for g in boolean_getters + int_getters:
+                c = g.get("class", "")
+                if c:
+                    _entity_class_names.add(c)
+            # Also add classes found through billing tracing
+            for bh in billing_hits:
+                c = bh.get("class", "")
+                if c:
+                    _entity_class_names.add(c)
+
+            # Scan entity classes (known) + classes with keyword strings (discovered)
+            _scan_classes: set[str] = set(_entity_class_names)
+
+            # Also find classes that contain feature-related strings via SmaliIndex
+            for kw in keywords[:5]:
+                for variant in [kw, kw.upper(), kw.capitalize()]:
+                    for file_path, _line in si.find_string_usages(variant):
+                        # Find which class this file belongs to
+                        for cls_name, cls_obj in si.classes.items():
+                            if cls_obj.file_path == file_path:
+                                _scan_classes.add(cls_name)
+                                break
+
+            # Now analyze each candidate class using SmaliIndex IR
+            _already_found = set()
+            for g in boolean_getters + int_getters + behavioral_hits:
+                m = g.get("method", "")
+                if m:
+                    _already_found.add(m.split("(")[0])  # Just method name
+
+            scan_classes = list(_scan_classes)[:30]
+            for class_index, cls_name in enumerate(scan_classes, start=1):
+                cls_obj = si.get_class(cls_name)
+                if cls_obj is None:
+                    _emit_progress(
+                        91,
+                        97,
+                        class_index,
+                        len(scan_classes),
+                        f"SmaliIR scan: {class_index}/{len(scan_classes)} classes | {len(ir_behavioral_hits)} IR gate hits",
+                    )
+                    continue
+
+                for method in cls_obj.methods:
+                    if method.name in ("<init>", "<clinit>"):
+                        continue
+                    if method.return_type not in ("Z", "I"):
+                        continue
+                    if method.name in _already_found:
+                        continue
+
+                    # Analyze instructions for gate BEHAVIOR
+                    has_field_read = False
+                    has_branch = False
+                    has_boolean_field = False
+                    has_date_comparison = False
+                    has_string_equality = False
+                    field_names_read: list[str] = []
+
+                    for instr in method.instructions:
+                        if instr.is_field_access and instr.opcode.startswith(("iget", "sget")):
+                            has_field_read = True
+                            if instr.opcode in ("iget-boolean", "sget-boolean"):
+                                has_boolean_field = True
+                            if instr.target_field:
+                                field_names_read.append(instr.target_field.split("->")[-1] if "->" in instr.target_field else instr.target_field)
+                        if instr.is_branch and instr.opcode.startswith("if-"):
+                            has_branch = True
+                        if instr.is_invoke:
+                            tc = instr.target_class.lower() if instr.target_class else ""
+                            tm = instr.target_method.lower() if instr.target_method else ""
+                            if any(d in tc or d in tm for d in ("calendar", "date", "time", "before", "after", "compareto")):
+                                has_date_comparison = True
+                            if tm == "equals":
+                                has_string_equality = True
+
+                    # Classify as gate if it reads fields + has conditional logic
+                    gate_reasons = []
+                    if has_boolean_field and has_branch:
+                        gate_reasons.append("BOOLEAN_FIELD_READ+BRANCH")
+                    if has_date_comparison:
+                        gate_reasons.append("DATE_COMPARISON")
+                    if has_string_equality and has_branch:
+                        gate_reasons.append("STRING_EQUALITY+BRANCH")
+                    if has_field_read and has_branch and method.return_type == "Z" and method.complexity >= 2:
+                        if not gate_reasons:
+                            gate_reasons.append("COMPLEX_CONDITIONAL_BOOLEAN")
+
+                    if gate_reasons:
+                        _already_found.add(method.name)
+                        ir_behavioral_hits.append({
+                            "method": method.signature,
+                            "class": cls_name,
+                            "file": cls_obj.file_path,
+                            "return_type": "boolean" if method.return_type == "Z" else "int",
+                            "behavior": gate_reasons,
+                            "fields_read": field_names_read[:5],
+                            "complexity": method.complexity,
+                            "note": "Found by SmaliIR INSTRUCTION-LEVEL analysis (survives obfuscation)",
+                        })
+                _emit_progress(
+                    91,
+                    97,
+                    class_index,
+                    len(scan_classes),
+                    f"SmaliIR scan: {class_index}/{len(scan_classes)} classes | {len(ir_behavioral_hits)} IR gate hits",
+                )
     except Exception:
         pass
 
@@ -1711,10 +2773,13 @@ def _map_feature_checks_impl(feature: str, extra_keywords: str) -> str:
     behavioral_hits = _dedup(behavioral_hits)[:15]
     entity_methods = _dedup(entity_methods)[:15]
     billing_hits = _dedup(billing_hits)[:15]
+    ir_behavioral_hits = _dedup(ir_behavioral_hits)[:20]
 
     total = (len(boolean_getters) + len(int_getters) + len(shared_prefs_hits)
              + len(paywall_methods) + len(behavioral_hits) + len(entity_methods)
-             + len(billing_hits))
+             + len(billing_hits) + len(ir_behavioral_hits))
+
+    report_progress(100, f"map_feature_checks complete: {total} checkpoints across {len(keywords)} keywords")
 
     return json.dumps({
         "success": True,
@@ -1723,6 +2788,7 @@ def _map_feature_checks_impl(feature: str, extra_keywords: str) -> str:
         "boolean_getters": boolean_getters,
         "int_getters": int_getters,
         "behavioral_checks": behavioral_hits,
+        "ir_behavioral_gates": ir_behavioral_hits,
         "entity_class_methods": entity_methods,
         "billing_purchase_system": billing_hits,
         "string_refs": string_refs,
@@ -1736,13 +2802,17 @@ def _map_feature_checks_impl(feature: str, extra_keywords: str) -> str:
                f"handler classes through billing API tracing — these are the ENTRY POINTS to the "
                f"premium system. Trace their fields and callees to find the entity class. "
                if billing_hits else "")
+            + (f"SmaliIR GATES ({len(ir_behavioral_hits)}): Methods found by INSTRUCTION-LEVEL "
+               f"behavioral analysis — these are gate methods detected by code structure (field read + "
+               f"branch), NOT by name. Works on fully obfuscated code. "
+               if ir_behavioral_hits else "")
             + (f"BEHAVIORAL checks ({len(behavioral_hits)}): Methods found by analyzing "
                f"code BEHAVIOR — these are often the REAL gating logic in obfuscated apps. "
                if behavioral_hits else "")
             + (f"Entity class methods ({len(entity_methods)}): OTHER boolean/int methods "
                f"in the same subscription entity class — check each one. "
                if entity_methods else "")
-            + f"NEXT STEPS: 1) For each billing/behavioral hit, run "
+            + f"NEXT STEPS: 1) For each billing/behavioral/IR-gate hit, run "
               f"analyze_subscription_model(file) to deep-analyze the class. "
               f"2) Read jadx source for the same class. "
               f"3) Patch ALL gate methods. "
@@ -1988,6 +3058,56 @@ def analyze_subscription_model(smali_file: str) -> str:
                 all_methods.append(method_info)
                 method_start = -1
 
+        # --- SmaliIndex hierarchy scan ---
+        # Use SmaliIndex to find subclasses and parent class that may override
+        # or inherit gate methods. Catches polymorphic gate bypass failures.
+        hierarchy_gates: list[dict] = []
+        try:
+            si = _ensure_smali_index()
+            if si and class_name:
+                # Check parent class for gate methods
+                parent_cls = si.get_class(super_class) if super_class else None
+                # Check child classes that override gate methods
+                child_names = si.get_subclasses(class_name)
+
+                _already_gate_names = {g["name"] for g in gate_methods}
+
+                related_classes: list[tuple[str, str]] = []  # (class_name, relation)
+                if parent_cls:
+                    related_classes.append((super_class, "parent"))
+                for cn in child_names[:10]:
+                    related_classes.append((cn, "child"))
+
+                for rel_cls_name, relation in related_classes:
+                    rel_cls = si.get_class(rel_cls_name)
+                    if rel_cls is None:
+                        continue
+                    for method in rel_cls.methods:
+                        if method.name in ("<init>", "<clinit>"):
+                            continue
+                        if method.return_type not in ("Z", "I"):
+                            continue
+                        # Check if this method is behaviorally a gate
+                        has_field_read = any(
+                            i.is_field_access and i.opcode.startswith(("iget", "sget"))
+                            for i in method.instructions
+                        )
+                        has_branch = any(
+                            i.is_branch and i.opcode.startswith("if-")
+                            for i in method.instructions
+                        )
+                        if has_field_read and has_branch:
+                            hierarchy_gates.append({
+                                "method": method.signature,
+                                "class": rel_cls_name,
+                                "file": rel_cls.file_path,
+                                "relation": relation,
+                                "return_type": _smali_type_name(method.return_type),
+                                "note": f"{relation.upper()} class gate — may override or inherit subscription logic",
+                            })
+        except Exception:
+            pass
+
         return json.dumps({
             "success": True,
             "class_name": class_name,
@@ -1998,15 +3118,21 @@ def analyze_subscription_model(smali_file: str) -> str:
             "total_methods": len(all_methods),
             "gate_methods_count": len(gate_methods),
             "gate_methods": gate_methods,
+            "hierarchy_gates": hierarchy_gates,
             "all_methods": [m for m in all_methods if m not in gate_methods][:15],
             "field_dependencies": field_deps,
             "instruction": (
-                f"Found {len(gate_methods)} GATE METHODS in {class_name} — "
-                f"these are the methods that control premium/subscription access. "
+                f"Found {len(gate_methods)} GATE METHODS in {class_name}"
+                + (f" + {len(hierarchy_gates)} in parent/child classes" if hierarchy_gates else "")
+                + " — these are the methods that control premium/subscription access. "
                 f"For each gate method: 1) Read the jadx Java source to understand the logic, "
                 f"2) Determine what return value means 'unlocked', "
                 f"3) Patch with apply_smali_patch. "
-                f"ALSO check the fields list — fields like 'role', 'dueTime', 'type', "
+                + (f"⚠️ HIERARCHY WARNING: {len(hierarchy_gates)} gate methods found in "
+                   f"{'parent' if any(h['relation'] == 'parent' for h in hierarchy_gates) else 'child'} "
+                   f"classes — these MUST also be patched or they will override your patches. "
+                   if hierarchy_gates else "")
+                + f"ALSO check the fields list — fields like 'role', 'dueTime', 'type', "
                 f"'expired' store subscription state. Trace who WRITES to these fields."
             ),
         }, ensure_ascii=False, indent=2)[:15000]
@@ -2312,6 +3438,49 @@ def generate_constructor_override(
         fpath = str(_resolve_file(smali_file))
         overrides = json.loads(field_overrides_json)
         result = override_constructor_fields(fpath, class_descriptor, overrides)
+
+        # --- SmaliIndex hierarchy scan: also patch CHILD class constructors ---
+        # Child classes that extend this entity class inherit its fields,
+        # so their constructors also need field overrides.
+        hierarchy_patches: list[dict] = []
+        try:
+            si = _ensure_smali_index()
+            if si:
+                child_classes = si.get_subclasses(class_descriptor)
+                for child_name in child_classes[:10]:
+                    child_cls = si.get_class(child_name)
+                    if child_cls is None or not child_cls.abs_path:
+                        continue
+                    # Check if this child class has constructors
+                    has_init = any(m.name == "<init>" for m in child_cls.methods)
+                    if has_init:
+                        try:
+                            child_result = override_constructor_fields(
+                                child_cls.abs_path, child_name, overrides
+                            )
+                            hierarchy_patches.append({
+                                "class": child_name,
+                                "file": child_cls.file_path,
+                                "success": child_result.get("success", False),
+                                "constructors_patched": child_result.get("constructors_patched", 0),
+                            })
+                        except Exception as e:
+                            hierarchy_patches.append({
+                                "class": child_name,
+                                "file": child_cls.file_path,
+                                "success": False,
+                                "error": str(e)[:100],
+                            })
+        except Exception:
+            pass
+
+        if hierarchy_patches:
+            result["hierarchy_patches"] = hierarchy_patches
+            result["note"] = (
+                f"Also patched {sum(1 for h in hierarchy_patches if h.get('success'))} "
+                f"child class constructors (inheriting fields from {class_descriptor})"
+            )
+
         return json.dumps(result, ensure_ascii=False, indent=2)
 
     return _safe_call(_run, "generate_constructor_override")
@@ -2390,8 +3559,9 @@ def batch_patch_methods(patches_json: str) -> str:
     3. Creates backups and diffs for each file
     4. Returns a summary of successes and failures
 
-    This is the PREFERRED tool for premium bypass — after you've analyzed the
-    entity class and know which methods to patch and what values to use.
+    Use this only for simple constant-return body rewrites AFTER you have
+    verified the exact target methods. For risky or unclear methods, prefer
+    preview_smali_patch + apply_smali_patch one-by-one.
 
     Args:
         patches_json: JSON string with an array of patch specifications:
@@ -2416,6 +3586,9 @@ def batch_patch_methods(patches_json: str) -> str:
     """
     import re as _re
     import shutil
+    from tempfile import NamedTemporaryFile
+
+    from apk_agent.tools.deep_analysis import validate_smali_syntax as _validate_smali_syntax
 
     def _run():
         patches = json.loads(patches_json)
@@ -2431,6 +3604,120 @@ def batch_patch_methods(patches_json: str) -> str:
         results = []
         total_ok = 0
         total_fail = 0
+
+        def _extract_method_name(query: str) -> str:
+            query = str(query or "").strip()
+            if not query:
+                return ""
+            match = _re.match(r'([\w<>$-]+)\(', query)
+            if match:
+                return match.group(1)
+            return query.split()[-1] if query.split() else ""
+
+        def _extract_return_type(query: str) -> str:
+            query = str(query or "").strip()
+            if ')' not in query:
+                return ""
+            return query.rsplit(')', 1)[-1].strip()
+
+        def _count_param_slots(method_header: str) -> int:
+            match = _re.search(r'\((.*?)\)', method_header)
+            if not match:
+                return 0
+            params = match.group(1)
+            count = 0
+            idx = 0
+            while idx < len(params):
+                token = params[idx]
+                if token in 'ZBCSIF':
+                    count += 1
+                    idx += 1
+                elif token in 'JD':
+                    count += 2
+                    idx += 1
+                elif token == 'L':
+                    count += 1
+                    idx = params.index(';', idx) + 1
+                elif token == '[':
+                    idx += 1
+                else:
+                    idx += 1
+            if 'static' not in method_header.lower().split('(')[0]:
+                count += 1
+            return count
+
+        def _extract_param_descriptors(method_header: str) -> list[str]:
+            match = _re.search(r'\((.*?)\)', method_header)
+            if not match:
+                return []
+            params = match.group(1)
+            descriptors: list[str] = []
+            idx = 0
+            while idx < len(params):
+                token = params[idx]
+                start = idx
+                if token == '[':
+                    while idx < len(params) and params[idx] == '[':
+                        idx += 1
+                    if idx < len(params) and params[idx] == 'L':
+                        end = params.index(';', idx)
+                        idx = end + 1
+                    else:
+                        idx += 1
+                    descriptors.append(params[start:idx])
+                elif token == 'L':
+                    end = params.index(';', idx)
+                    idx = end + 1
+                    descriptors.append(params[start:idx])
+                else:
+                    idx += 1
+                    descriptors.append(token)
+            return descriptors
+
+        def _find_param_register(method_header: str, descriptor: str) -> str:
+            params = _extract_param_descriptors(method_header)
+            slot = 0 if 'static' in method_header.lower().split('(')[0] else 1
+            for param in params:
+                if param == descriptor:
+                    return f"p{slot}"
+                slot += 2 if param in {'J', 'D'} else 1
+            return ""
+
+        def _actual_return_type(method_header: str) -> str:
+            match = _re.search(r'\)(\S+)', method_header)
+            if not match:
+                return ""
+            return match.group(1).strip()
+
+        def _promise_bridge_compatible(method_header: str, expected_return: str) -> bool:
+            if not expected_return or _actual_return_type(method_header) != 'V':
+                return False
+            if not _find_param_register(method_header, 'Lcom/facebook/react/bridge/Promise;'):
+                return False
+            return expected_return in {'Z', 'I', 'J'}
+
+        def _ensure_method_registers(lines: list[str], locals_line: int, method_header: str, needed_locals: int) -> None:
+            locals_match = _re.match(r'(\s*)\.locals\s+(\d+)', lines[locals_line])
+            if locals_match:
+                current = int(locals_match.group(2))
+                if current < needed_locals:
+                    lines[locals_line] = f"{locals_match.group(1)}.locals {needed_locals}"
+                return
+
+            registers_match = _re.match(r'(\s*)\.registers\s+(\d+)', lines[locals_line])
+            if registers_match:
+                current = int(registers_match.group(2))
+                param_slots = _count_param_slots(method_header)
+                required = max(current, param_slots + needed_locals)
+                if required != current:
+                    lines[locals_line] = f"{registers_match.group(1)}.registers {required}"
+
+        def _strip_bodyless_flags(method_header: str) -> str:
+            parts = method_header.strip().split()
+            if not parts or parts[0] != '.method':
+                return method_header.strip()
+            filtered = [parts[0]] + [part for part in parts[1:] if part not in {'native', 'abstract'}]
+            return ' '.join(filtered)
 
         def _match_method(header: str, query: str) -> bool:
             """Match a method header against a query string.
@@ -2449,6 +3736,137 @@ def batch_patch_methods(patches_json: str) -> str:
                     return False
             return name == query
 
+        def _find_method_index(method_ranges: list[tuple[int, int, str]], patched_indices: set[int], query: str) -> tuple[int, str]:
+            for midx, (_m_start, _m_end, m_header) in enumerate(method_ranges):
+                if midx in patched_indices:
+                    continue
+                if _match_method(m_header, query):
+                    return midx, "exact"
+
+            method_name = _extract_method_name(query)
+            if not method_name:
+                return -1, "not_found"
+
+            expected_return = _extract_return_type(query)
+            fuzzy_candidates: list[int] = []
+            for midx, (_m_start, _m_end, m_header) in enumerate(method_ranges):
+                if midx in patched_indices:
+                    continue
+                match = _re.search(r'(\S+)\((.*?)\)(\S+)', m_header)
+                if not match:
+                    continue
+                if match.group(1) != method_name:
+                    continue
+                if expected_return and match.group(3).strip() != expected_return:
+                    continue
+                fuzzy_candidates.append(midx)
+
+            if len(fuzzy_candidates) == 1:
+                return fuzzy_candidates[0], "unique_name_fallback"
+            if len(fuzzy_candidates) > 1:
+                return -1, "ambiguous_name_fallback"
+
+            promise_bridge_candidates: list[int] = []
+            for midx, (_m_start, _m_end, m_header) in enumerate(method_ranges):
+                if midx in patched_indices:
+                    continue
+                match = _re.search(r'(\S+)\((.*?)\)(\S+)', m_header)
+                if not match:
+                    continue
+                if match.group(1) != method_name:
+                    continue
+                if _promise_bridge_compatible(m_header, expected_return):
+                    promise_bridge_candidates.append(midx)
+
+            if len(promise_bridge_candidates) == 1:
+                return promise_bridge_candidates[0], "promise_bridge_fallback"
+            if len(promise_bridge_candidates) > 1:
+                return -1, "ambiguous_name_fallback"
+            return -1, "not_found"
+
+        def _build_patch_instructions(requested_return_type: str, value, method_header: str) -> tuple[str, int, str]:
+            actual_return = _actual_return_type(method_header)
+            promise_reg = _find_param_register(method_header, 'Lcom/facebook/react/bridge/Promise;')
+
+            if actual_return == 'V' and promise_reg and requested_return_type in {'boolean', 'int', 'long', 'void'}:
+                if requested_return_type == 'void':
+                    return (
+                        f"    const/4 v0, 0x0\n\n"
+                        f"    invoke-interface {{{promise_reg}, v0}}, Lcom/facebook/react/bridge/Promise;->resolve(Ljava/lang/Object;)V\n\n"
+                        f"    return-void",
+                        1,
+                        'promise_resolve_rewrite',
+                    )
+                if requested_return_type == 'boolean':
+                    v = '0x1' if value else '0x0'
+                    return (
+                        f"    const/4 v0, {v}\n\n"
+                        f"    invoke-static {{v0}}, Ljava/lang/Boolean;->valueOf(Z)Ljava/lang/Boolean;\n\n"
+                        f"    move-result-object v0\n\n"
+                        f"    invoke-interface {{{promise_reg}, v0}}, Lcom/facebook/react/bridge/Promise;->resolve(Ljava/lang/Object;)V\n\n"
+                        f"    return-void",
+                        1,
+                        'promise_resolve_rewrite',
+                    )
+                if requested_return_type == 'int':
+                    iv = int(value)
+                    if -8 <= iv <= 7:
+                        load = f"    const/4 v0, {hex(iv)}"
+                    elif -32768 <= iv <= 32767:
+                        load = f"    const/16 v0, {hex(iv)}"
+                    else:
+                        load = f"    const v0, {hex(iv)}"
+                    return (
+                        f"{load}\n\n"
+                        f"    invoke-static {{v0}}, Ljava/lang/Integer;->valueOf(I)Ljava/lang/Integer;\n\n"
+                        f"    move-result-object v0\n\n"
+                        f"    invoke-interface {{{promise_reg}, v0}}, Lcom/facebook/react/bridge/Promise;->resolve(Ljava/lang/Object;)V\n\n"
+                        f"    return-void",
+                        1,
+                        'promise_resolve_rewrite',
+                    )
+                return (
+                    f"    const-wide v0, {hex(int(value))}\n\n"
+                    f"    invoke-static {{v0, v1}}, Ljava/lang/Long;->valueOf(J)Ljava/lang/Long;\n\n"
+                    f"    move-result-object v0\n\n"
+                    f"    invoke-interface {{{promise_reg}, v0}}, Lcom/facebook/react/bridge/Promise;->resolve(Ljava/lang/Object;)V\n\n"
+                    f"    return-void",
+                    2,
+                    'promise_resolve_rewrite',
+                )
+
+            if requested_return_type == "void":
+                return "    return-void", 0, "body_rewrite"
+            if requested_return_type == "boolean":
+                v = "0x1" if value else "0x0"
+                return f"    const/4 v0, {v}\n\n    return v0", 1, "body_rewrite"
+            if requested_return_type == "int":
+                iv = int(value)
+                if -8 <= iv <= 7:
+                    inject = f"    const/4 v0, {hex(iv)}\n\n    return v0"
+                elif -32768 <= iv <= 32767:
+                    inject = f"    const/16 v0, {hex(iv)}\n\n    return v0"
+                else:
+                    inject = f"    const v0, {hex(iv)}\n\n    return v0"
+                return inject, 1, "body_rewrite"
+            if requested_return_type == "long":
+                return f"    const-wide v0, {hex(int(value))}\n\n    return-wide v0", 2, "body_rewrite"
+            return "    const/4 v0, 0x0\n\n    return v0", 1, "body_rewrite"
+
+        def _validate_generated_smali(candidate_lines: list[str]) -> dict:
+            temp_path: Path | None = None
+            try:
+                with NamedTemporaryFile("w", encoding="utf-8", suffix=".smali", delete=False) as handle:
+                    handle.write("\n".join(candidate_lines) + "\n")
+                    temp_path = Path(handle.name)
+                return _validate_smali_syntax(temp_path)
+            finally:
+                if temp_path is not None:
+                    try:
+                        temp_path.unlink()
+                    except OSError:
+                        pass
+
         for file_rel, file_patches in by_file.items():
             fpath = _resolve_file(file_rel)
             if not fpath.is_file():
@@ -2458,13 +3876,12 @@ def batch_patch_methods(patches_json: str) -> str:
                     total_fail += 1
                 continue
 
-            # Backup — use relative path hash to avoid filename collisions
-            backup = _project.patch_backup_dir / (file_rel.replace("/", "_").replace("\\", "_"))
-            _project.patch_backup_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(fpath, backup)
-
             text = fpath.read_text(encoding="utf-8", errors="replace")
             lines = text.splitlines()
+            original_lines = list(lines)
+            file_results: list[dict | None] = [None] * len(file_patches)
+            file_journal_entries: list[dict] = []
+            file_failures = 0
 
             # Pre-index ALL methods in the file to avoid index-shift problems.
             # We collect (start, end, header) for every method.
@@ -2483,97 +3900,142 @@ def batch_patch_methods(patches_json: str) -> str:
 
             # Track already-patched method indices to avoid double-patching
             patched_indices: set[int] = set()
-            # Track cumulative line offset from previous patches in this file
-            line_offset = 0
+            planned_patches: list[dict] = []
 
-            for p in file_patches:
+            for request_index, p in enumerate(file_patches):
                 method_q = p.get("method", "")
                 ret_type = p.get("return_type", "boolean")
                 value = p.get("value")
                 desc = p.get("description", "")
 
-                # Find the FIRST unpatched method matching the query
-                found_idx = -1
-                for midx, (m_start_orig, m_end_orig, m_header) in enumerate(method_ranges):
-                    if midx in patched_indices:
-                        continue
-                    if _match_method(m_header, method_q):
-                        found_idx = midx
-                        break
+                found_idx, resolution = _find_method_index(method_ranges, patched_indices, method_q)
 
                 if found_idx < 0:
-                    results.append({"method": method_q, "file": file_rel,
-                                    "success": False, "error": f"Method not found: {method_q}"})
-                    total_fail += 1
+                    error = f"Method not found: {method_q}"
+                    if resolution == "ambiguous_name_fallback":
+                        error = f"Method match was ambiguous: {method_q}"
+                    file_results[request_index] = {"method": method_q, "file": file_rel,
+                                                   "success": False, "error": error}
+                    file_failures += 1
                     continue
 
                 patched_indices.add(found_idx)
-                m_start_orig, m_end_orig, _ = method_ranges[found_idx]
+                m_start_orig, m_end_orig, original_header = method_ranges[found_idx]
 
-                # Adjust for cumulative line offset from previous patches
-                m_start = m_start_orig + line_offset
-                m_end = m_end_orig + line_offset
+                inject, needed_locals, rewrite_mode = _build_patch_instructions(ret_type, value, original_header)
+                file_results[request_index] = {"method": method_q, "file": file_rel,
+                                               "success": True, "description": desc,
+                                               "resolution": resolution, "rewrite_mode": rewrite_mode}
+                planned_patches.append({
+                    "request_index": request_index,
+                    "method_q": method_q,
+                    "ret_type": ret_type,
+                    "value": value,
+                    "description": desc,
+                    "resolution": resolution,
+                    "rewrite_mode": rewrite_mode,
+                    "m_start_orig": m_start_orig,
+                    "m_end_orig": m_end_orig,
+                    "original_header": original_header,
+                    "inject": inject,
+                    "needed_locals": needed_locals,
+                })
 
-                # Build replacement instructions
-                if ret_type == "void":
-                    inject = "    return-void"
-                elif ret_type == "boolean":
-                    v = "0x1" if value else "0x0"
-                    inject = f"    const/4 v0, {v}\n\n    return v0"
-                elif ret_type == "int":
-                    iv = int(value)
-                    if -8 <= iv <= 7:
-                        inject = f"    const/4 v0, {hex(iv)}\n\n    return v0"
-                    elif -32768 <= iv <= 32767:
-                        inject = f"    const/16 v0, {hex(iv)}\n\n    return v0"
-                    else:
-                        inject = f"    const v0, {hex(iv)}\n\n    return v0"
-                elif ret_type == "long":
-                    inject = f"    const-wide v0, {hex(int(value))}\n\n    return-wide v0"
-                else:
-                    inject = "    const/4 v0, 0x0\n\n    return v0"
+            normalized_file_results = [
+                entry if entry is not None else {
+                    "method": file_patches[idx].get("method", ""),
+                    "file": file_rel,
+                    "success": False,
+                    "error": "Internal batch patch planning failure",
+                }
+                for idx, entry in enumerate(file_results)
+            ]
 
-                # Find .locals or .registers line
+            if file_failures:
+                abort_error = (
+                    f"Aborted file-level batch patch for {file_rel}: "
+                    f"{file_failures} requested method(s) failed, so no changes were written."
+                )
+                for entry in normalized_file_results:
+                    committed = entry.get("success", False) and "error" not in entry
+                    entry["success"] = False
+                    if committed:
+                        entry["error"] = abort_error
+                        entry["aborted"] = True
+                results.extend(normalized_file_results)
+                total_fail += len(normalized_file_results)
+                lines = original_lines
+                continue
+
+            for planned in sorted(planned_patches, key=lambda item: item["m_start_orig"], reverse=True):
+                m_start = planned["m_start_orig"]
+                m_end = planned["m_end_orig"]
+
                 locals_line = -1
                 for i in range(m_start + 1, min(m_start + 15, m_end)):
                     if _re.match(r'\s*\.(locals|registers)\s+\d+', lines[i]):
                         locals_line = i
                         break
 
+                final_rewrite_mode = planned["rewrite_mode"]
                 if locals_line < 0:
-                    results.append({"method": method_q, "file": file_rel,
-                                    "success": False, "error": "No .locals/.registers found"})
-                    total_fail += 1
-                    continue
+                    final_rewrite_mode = "bodyless_method_rewrite"
+                    patched_header = _strip_bodyless_flags(lines[m_start])
+                    new_body = [patched_header, f"    .locals {planned['needed_locals']}"]
+                else:
+                    _ensure_method_registers(lines, locals_line, planned["original_header"], planned["needed_locals"])
+                    new_body = [lines[i] for i in range(m_start, locals_line + 1)]
 
-                # Replace everything between locals_line+1 and m_end with our injection
-                old_len = m_end - m_start + 1
-                new_body = [lines[i] for i in range(m_start, locals_line + 1)]
                 new_body.append("")
-                new_body.append(f"    # APK-AGI batch patch: {desc}")
-                new_body.append(inject)
+                new_body.append(f"    # APK-AGI batch patch: {planned['description']}")
+                new_body.append(planned["inject"])
                 new_body.append("")
                 new_body.append(".end method")
-                new_len = len(new_body)
 
-                # Replace in lines and track cumulative offset
                 lines[m_start:m_end + 1] = new_body
-                line_offset += (new_len - old_len)
+                normalized_file_results[planned["request_index"]]["rewrite_mode"] = final_rewrite_mode
 
-                results.append({"method": method_q, "file": file_rel,
-                                "success": True, "description": desc})
-                total_ok += 1
+            validation = _validate_generated_smali(lines)
+            if not validation.get("valid", False):
+                validation_errors = "; ".join(
+                    f"line {err.get('line', 0)}: {err.get('message', 'unknown error')}"
+                    for err in validation.get("errors", [])[:3]
+                ) or "unknown smali validation error"
+                abort_error = (
+                    f"Generated smali failed validation for {file_rel}; no changes were written: "
+                    f"{validation_errors}"
+                )
+                for entry in normalized_file_results:
+                    entry["success"] = False
+                    entry["error"] = abort_error
+                    entry["aborted"] = True
+                results.extend(normalized_file_results)
+                total_fail += len(normalized_file_results)
+                lines = original_lines
+                continue
 
-                # Record to patch journal
-                _patch_journal.append({
+            for planned in planned_patches:
+                file_journal_entries.append({
                     "success": True, "target_file": file_rel,
-                    "description": desc, "steps_applied": 1, "steps_total": 1,
-                    "diff_text": f"Forced {method_q} -> {ret_type}({value})",
+                    "description": planned["description"], "steps_applied": 1, "steps_total": 1,
+                    "diff_text": f"Forced {planned['method_q']} -> {planned['ret_type']}({planned['value']})",
                     "errors": [], "tool": "batch_patch_methods",
                 })
 
-            # Write once per file
+            # Backup — preserve the original file using the canonical relative path
+            # so restore_smali_backup can locate it later.
+            # Only create it once we know the entire file batch will commit.
+            backup = _project.patch_backup_dir / file_rel.replace("\\", "/")
+            _project.patch_backup_dir.mkdir(parents=True, exist_ok=True)
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            if not backup.exists():
+                shutil.copy2(fpath, backup)
+
+            # Write once per file after every requested method in the file succeeded.
             fpath.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            results.extend(normalized_file_results)
+            total_ok += len(normalized_file_results)
+            _patch_journal.extend(file_journal_entries)
 
         return json.dumps({
             "success": total_fail == 0,
@@ -3204,6 +4666,85 @@ def cross_reference_map(target: str) -> str:
         field_writes: list[dict] = []
         string_constants: list[str] = []
         resource_refs: list[dict] = []
+        hierarchy_info: dict = {}
+
+        # --- FAST PATH: Use SmaliIndex if available (instant lookups) ---
+        si = _ensure_smali_index()
+        if si and is_class:
+            cls_obj = si.get_class(target)
+            if cls_obj:
+                # Outgoing calls + strings from the class's own methods
+                for method in cls_obj.methods:
+                    for api in method.api_calls:
+                        outgoing_calls.append({"instruction": api[:120], "from_method": method.signature[:60]})
+                    for s in method.string_constants:
+                        string_constants.append(s)
+
+                # Incoming calls via api_callers index (INSTANT — no file scan)
+                for method in cls_obj.methods:
+                    full_sig_prefix = f"{target}->{method.name}"
+                    callers = si.find_api_callers(full_sig_prefix)
+                    for caller_sig in callers[:20]:
+                        caller_method = si.get_method(caller_sig)
+                        incoming_calls.append({
+                            "caller": caller_sig[:120],
+                            "file": caller_method.full_signature.split("->")[0] if caller_method else "",
+                            "calls": method.signature[:60],
+                        })
+
+                # Field reads/writes via instruction scanning across ALL methods
+                target_escaped = target.replace("$", "\\$")
+                for method_sig, method_obj in si.methods.items():
+                    if target in method_sig:
+                        continue  # Skip self
+                    for instr in method_obj.instructions:
+                        if instr.is_field_access and target[1:-1] in (instr.target_field or ""):
+                            entry = {
+                                "method": method_sig[:80],
+                                "instruction": instr.raw[:120],
+                                "line": instr.line,
+                            }
+                            if instr.opcode.startswith(("iget", "sget")):
+                                field_reads.append(entry)
+                            elif instr.opcode.startswith(("iput", "sput")):
+                                field_writes.append(entry)
+
+                # Hierarchy info
+                subclasses = si.get_subclasses(target)
+                implementors = []
+                for iface in cls_obj.interfaces:
+                    implementors.extend(si.get_implementors(iface))
+                if subclasses or cls_obj.super_class or implementors:
+                    hierarchy_info = {
+                        "super_class": cls_obj.super_class,
+                        "subclasses": subclasses[:10],
+                        "interface_implementors": implementors[:10],
+                    }
+
+                string_constants = list(set(string_constants))
+
+                return json.dumps({
+                    "success": True,
+                    "target": target,
+                    "target_file_found": True,
+                    "source": "smali_index",
+                    "hierarchy": hierarchy_info,
+                    "summary": {
+                        "incoming_calls": len(incoming_calls),
+                        "outgoing_calls": len(outgoing_calls),
+                        "field_reads": len(field_reads),
+                        "field_writes": len(field_writes),
+                        "string_constants": len(string_constants),
+                        "resource_refs": 0,
+                    },
+                    "incoming_calls": incoming_calls[:50],
+                    "outgoing_calls": outgoing_calls[:50],
+                    "field_reads": field_reads[:30],
+                    "field_writes": field_writes[:30],
+                    "string_constants": string_constants[:30],
+                }, ensure_ascii=False, indent=2)[:25000]
+
+        # --- FALLBACK: File-scan path (for method targets or when SmaliIndex unavailable) ---
 
         # Patterns
         if is_class:
@@ -3974,6 +5515,175 @@ def verify_bypass_completeness() -> str:
 # Patch tools
 # ---------------------------------------------------------------------------
 
+_BINARY_PATCH_SUFFIXES = {
+    ".apk", ".apks", ".dex", ".so", ".arsc", ".bin",
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico",
+    ".ttf", ".otf", ".woff", ".woff2", ".mp3", ".ogg",
+    ".wav", ".mp4", ".pdf",
+}
+
+
+def _looks_binary_patch_target(target_file: str) -> bool:
+    return Path(str(target_file or "")).suffix.lower() in _BINARY_PATCH_SUFFIXES
+
+
+@tool
+def apply_text_patch(patch_plan_json: str) -> str:
+    """Apply a structured patch to any TEXT file inside the apktool project.
+
+    Use this for AndroidManifest.xml, resource XML, network_security_config.xml,
+    apktool.yml, JSON/properties/text assets, and other non-binary files.
+
+    IMPORTANT:
+    - This is for TEXT files only. For binary files such as .so or .dex, use patch_binary_hex.
+    - For smali bytecode logic changes, prefer apply_smali_patch.
+
+    Args:
+        patch_plan_json: Same JSON structure used by apply_smali_patch:
+            {
+                "target_file": "AndroidManifest.xml",
+                "description": "Enable exported activity",
+                "steps": [
+                    {
+                        "operation": "replace_line|replace_block|replace_all|insert_before|insert_after|delete_block|delete_line",
+                        "match_pattern": "exact text or regex to find",
+                        "replacement": "replacement text (for replace ops)",
+                        "content": "text to insert (for insert ops)",
+                        "is_regex": false,
+                        "description": "What this step does"
+                    }
+                ]
+            }
+
+    Returns: JSON with keys: success, target_file, steps_applied, steps_total,
+    diff_text, errors, backup_path.
+    """
+    from apk_agent.patch_engine import PatchEngine, PatchPlan
+
+    if not patch_plan_json or not patch_plan_json.strip():
+        return json.dumps({
+            "success": False,
+            "error": "patch_plan_json is empty. You must provide the full JSON patch plan.",
+            "recovery_hint": "Build the JSON with target_file, description, and steps[] then call again.",
+        })
+
+    try:
+        plan_data = json.loads(patch_plan_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"success": False, "error": f"Invalid JSON: {e}"})
+
+    if not plan_data.get("steps"):
+        return json.dumps({
+            "success": False,
+            "error": "Patch plan has no steps. Add at least one step with operation and match_pattern.",
+        })
+
+    if not (plan_data.get("target_file") or plan_data.get("file") or plan_data.get("smali_file")):
+        return json.dumps({
+            "success": False,
+            "error": "Missing 'target_file' in patch plan JSON.",
+            "recovery_hint": 'Add "target_file": "AndroidManifest.xml" (or another apktool text file) to your JSON.',
+        })
+
+    try:
+        plan = PatchPlan.from_dict(plan_data)
+    except (ValueError, KeyError) as e:
+        return json.dumps({"success": False, "error": str(e)})
+
+    if _looks_binary_patch_target(plan.target_file):
+        return json.dumps({
+            "success": False,
+            "error": f"Binary target not allowed with apply_text_patch: {plan.target_file}",
+            "recovery_hint": "Use patch_binary_hex for .so/.dex and other binary files.",
+        })
+
+    engine = PatchEngine(
+        apktool_dir=_project.apktool_dir,
+        backup_dir=_project.patch_backup_dir,
+        diffs_dir=_project.patch_diffs_dir,
+    )
+    result = engine.apply_plan(plan)
+
+    out = {
+        "success": result.success,
+        "target_file": result.target_file,
+        "steps_applied": result.steps_applied,
+        "steps_total": result.steps_total,
+        "diff_text": result.diff_text[:5000],
+        "errors": result.errors,
+        "backup_path": result.backup_path,
+    }
+
+    _patch_journal.append({
+        "success": result.success,
+        "target_file": result.target_file,
+        "description": plan_data.get("description", ""),
+        "steps_applied": result.steps_applied,
+        "steps_total": result.steps_total,
+        "diff_text": result.diff_text[:3000],
+        "errors": result.errors,
+        "tool": "apply_text_patch",
+    })
+
+    return json.dumps(out, ensure_ascii=False, indent=2)
+
+
+@tool
+def preview_text_patch(patch_plan_json: str) -> str:
+    """Preview a structured TEXT patch without modifying files.
+
+    Use this before apply_text_patch when editing AndroidManifest.xml,
+    resource XML, apktool.yml, JSON, or other text files in the apktool tree.
+
+    Args:
+        patch_plan_json: Same JSON structure as apply_text_patch.
+
+    Returns: Unified diff text, or JSON with success=false on validation errors.
+    """
+    from apk_agent.patch_engine import PatchEngine, PatchPlan
+
+    if not patch_plan_json or not patch_plan_json.strip():
+        return json.dumps({
+            "success": False,
+            "error": "patch_plan_json is empty. You must provide the full JSON patch plan.",
+            "recovery_hint": "Build the JSON with target_file, description, and steps[] then call again.",
+        })
+
+    try:
+        plan_data = json.loads(patch_plan_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({
+            "success": False,
+            "error": f"Invalid JSON in patch_plan_json: {e}",
+            "recovery_hint": "Check your JSON syntax — ensure all strings are properly quoted and brackets are balanced.",
+        })
+
+    if not (plan_data.get("target_file") or plan_data.get("file") or plan_data.get("smali_file")):
+        return json.dumps({
+            "success": False,
+            "error": "Missing 'target_file' in patch plan JSON.",
+            "recovery_hint": 'Add "target_file": "AndroidManifest.xml" (or another apktool text file) to your JSON.',
+        })
+
+    try:
+        plan = PatchPlan.from_dict(plan_data)
+    except (ValueError, KeyError) as e:
+        return json.dumps({"success": False, "error": str(e)})
+
+    if _looks_binary_patch_target(plan.target_file):
+        return json.dumps({
+            "success": False,
+            "error": f"Binary target not allowed with preview_text_patch: {plan.target_file}",
+            "recovery_hint": "Use patch_binary_hex for .so/.dex and other binary files.",
+        })
+
+    engine = PatchEngine(
+        apktool_dir=_project.apktool_dir,
+        backup_dir=_project.patch_backup_dir,
+        diffs_dir=_project.patch_diffs_dir,
+    )
+    return engine.preview_plan(plan)[:8000]
+
 
 @tool
 def apply_smali_patch(patch_plan_json: str) -> str:
@@ -3994,7 +5704,7 @@ def apply_smali_patch(patch_plan_json: str) -> str:
                 "description": "Disable SSL pinning check",
                 "steps": [
                     {
-                        "operation": "replace_line|replace_block|insert_before|insert_after|delete_block|delete_line",
+                        "operation": "replace_line|replace_block|replace_all|insert_before|insert_after|delete_block|delete_line",
                         "match_pattern": "exact text or regex to find",
                         "replacement": "replacement text (for replace ops)",
                         "content": "text to insert (for insert ops)",
@@ -4248,6 +5958,154 @@ def restore_smali_backup(smali_file: str) -> str:
         return json.dumps(result, ensure_ascii=False, indent=2)
 
     return _safe_call(_run, "restore_smali_backup")
+
+
+@tool
+def patch_binary_hex(
+    file_path: str,
+    search_hex: str,
+    replace_hex: str,
+    occurrence: int = 1,
+    replace_all: bool = False,
+) -> str:
+    """Patch a binary file by exact hex replacement.
+
+    This enables controlled patching of binary assets such as `.so` libraries,
+    raw `.dex` files (when available), and other non-text blobs.
+
+    Safety rules:
+    - `search_hex` and `replace_hex` must be the same byte length.
+    - The tool performs exact byte matching only; it does NOT disassemble binaries.
+    - A backup is created before the first successful write.
+
+    Args:
+        file_path: Absolute path or path relative to the apktool project/workspace.
+        search_hex: Hex byte pattern to search for. Spaces, `0x`, and `\\x` are ignored.
+        replace_hex: Replacement hex pattern. Must be the same length as search_hex.
+        occurrence: 1-based occurrence number to patch when replace_all=false.
+        replace_all: If true, patch every occurrence in the file.
+
+    Returns: JSON with keys: success, path, matches_found, patched_occurrences,
+    offsets, backup_path.
+    """
+
+    def _normalize_hex(value: str) -> bytes:
+        cleaned = str(value or "")
+        cleaned = cleaned.replace("\\x", "").replace("0x", "")
+        cleaned = "".join(cleaned.split())
+        if not cleaned:
+            raise ValueError("hex pattern is empty")
+        if len(cleaned) % 2 != 0:
+            raise ValueError("hex pattern has an odd number of characters")
+        return bytes.fromhex(cleaned)
+
+    def _nth_offset(data: bytes, needle: bytes, n: int) -> int:
+        start = 0
+        for _ in range(n):
+            idx = data.find(needle, start)
+            if idx < 0:
+                return -1
+            start = idx + len(needle)
+        return idx
+
+    def _run():
+        p = Path(file_path)
+        if not p.is_absolute():
+            resolved = _resolve_file(file_path)
+            if resolved.exists():
+                p = resolved
+            else:
+                p = Path(_project.workspace_path) / file_path
+
+        if not p.is_file():
+            return json.dumps({"success": False, "error": f"File not found: {p}"})
+
+        try:
+            search = _normalize_hex(search_hex)
+            replace = _normalize_hex(replace_hex)
+        except ValueError as e:
+            return json.dumps({"success": False, "error": str(e)})
+
+        if len(search) != len(replace):
+            return json.dumps({
+                "success": False,
+                "error": "search_hex and replace_hex must have the same byte length.",
+                "search_len": len(search),
+                "replace_len": len(replace),
+            })
+
+        if occurrence < 1:
+            return json.dumps({"success": False, "error": "occurrence must be >= 1"})
+
+        original = p.read_bytes()
+        matches_found = original.count(search)
+        if matches_found == 0:
+            return json.dumps({
+                "success": False,
+                "error": "search_hex pattern was not found in the target file.",
+                "path": str(p),
+            })
+
+        offsets: list[str] = []
+        if replace_all:
+            idx = 0
+            while True:
+                idx = original.find(search, idx)
+                if idx < 0:
+                    break
+                offsets.append(f"0x{idx:x}")
+                idx += len(search)
+            patched = original.replace(search, replace)
+        else:
+            idx = _nth_offset(original, search, occurrence)
+            if idx < 0:
+                return json.dumps({
+                    "success": False,
+                    "error": f"Occurrence {occurrence} not found. Total matches: {matches_found}",
+                    "path": str(p),
+                })
+            offsets.append(f"0x{idx:x}")
+            patched = original[:idx] + replace + original[idx + len(search):]
+
+        backup_key = None
+        try:
+            backup_key = str(p.relative_to(_project.apktool_dir)).replace("\\", "/")
+        except ValueError:
+            try:
+                backup_key = str(p.relative_to(_project.workspace_path)).replace("\\", "/")
+            except ValueError:
+                backup_key = p.name
+        backup_name = backup_key.replace("/", "_").replace("\\", "_") + ".bak"
+        backup_path = _project.patch_backup_dir / backup_name
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+        if not backup_path.exists():
+            backup_path.write_bytes(original)
+
+        if p.exists():
+            p.chmod(p.stat().st_mode | 0o200)
+        p.write_bytes(patched)
+
+        _patch_journal.append({
+            "success": True,
+            "target_file": str(p),
+            "description": f"Binary hex patch ({len(offsets)} occurrence(s))",
+            "steps_applied": len(offsets),
+            "steps_total": len(offsets),
+            "diff_text": f"search={search.hex()} replace={replace.hex()} offsets={', '.join(offsets[:10])}",
+            "errors": [],
+            "tool": "patch_binary_hex",
+        })
+
+        return json.dumps({
+            "success": True,
+            "path": str(p),
+            "matches_found": matches_found,
+            "patched_occurrences": len(offsets),
+            "offsets": offsets[:50],
+            "backup_path": str(backup_path),
+        }, ensure_ascii=False, indent=2)
+
+    return _safe_call(_run, "patch_binary_hex")
 
 
 # ---------------------------------------------------------------------------
@@ -4781,6 +6639,104 @@ def analyze_network_config() -> str:
 
 
 # ---------------------------------------------------------------------------
+# NEW: Resource-aware Android resource tools
+# ---------------------------------------------------------------------------
+
+
+@tool
+def search_binary_strings(
+    file_path: str,
+    query: str = "",
+    categories: str = "",
+    min_length: int = 4,
+    max_results: int = 100,
+) -> str:
+    """Search embedded printable strings in a binary file or directory such as `lib/`, `assets/`, `.so`, or `.dex`.
+
+    This is a semantic search layer over binary string tables/constants, returning
+    exact offsets to plan safe native/DEX patches. If you pass a directory, the
+    tool scans matching files recursively and returns the file path for each hit.
+
+    Args:
+        file_path: Target binary file OR directory. Can be absolute or relative to apktool/workspace.
+        query: Optional regex or plain-text query to filter returned strings.
+        categories: Optional comma-separated categories such as `url,api_key,jni_native,class_descriptor`.
+        min_length: Minimum printable string length to extract.
+        max_results: Maximum returned matches.
+
+    Returns: JSON with matched strings, offsets, categories, and patching rules.
+    """
+    from apk_agent.tools.binary_patch import search_binary_strings as _search
+
+    def _run():
+        p = _resolve_project_path(file_path)
+        category_list = [c.strip() for c in categories.split(",") if c.strip()]
+        result = _search(
+            p,
+            query=query,
+            categories=category_list,
+            min_length=min_length,
+            max_results=max_results,
+        )
+        return json.dumps(result, ensure_ascii=False, indent=2)[:20000]
+    return _safe_call(_run, "search_binary_strings", _cache_hint=f"{file_path}:{query}:{categories}:{min_length}:{max_results}")
+
+
+@tool
+def patch_binary_strings(file_path: str, replacements_json: str) -> str:
+    """Patch embedded strings in `.so`, `.dex`, and similar binary files.
+
+    This is safer and more semantic than blind hex patching because it matches
+    string constants by value and enforces file-type-specific length rules.
+
+    Safety rules:
+    - `.dex` / `.cdex`: replacement must have identical UTF-8 byte length.
+    - Other binaries: replacement may be shorter and will be NUL-padded.
+    - Longer replacements are rejected.
+
+    Args:
+        file_path: Target binary file. Can be absolute or relative.
+        replacements_json: JSON array like:
+            [
+              {"old_string": "https://api.old.com", "new_string": "https://api.new.io", "occurrence": 1},
+              {"old_string": "frida", "new_string": "frixa", "replace_all": true}
+            ]
+
+    Returns: JSON with patched offsets, backup path, and per-replacement results.
+    """
+    from apk_agent.tools.binary_patch import patch_binary_strings as _patch
+
+    def _run():
+        try:
+            replacements = json.loads(replacements_json)
+        except json.JSONDecodeError as e:
+            return json.dumps({"success": False, "error": f"Invalid JSON: {e}"})
+        if not isinstance(replacements, list) or not replacements:
+            return json.dumps({"success": False, "error": "replacements_json must be a non-empty JSON array."})
+
+        p = _resolve_project_path(file_path)
+
+        backup_name = str(p.name) + ".binpatch.bak"
+        backup_path = _project.patch_backup_dir / backup_name
+        result = _patch(p, replacements, backup_path=backup_path)
+
+        if result.get("success"):
+            _patch_journal.append({
+                "success": True,
+                "target_file": str(p),
+                "description": f"Semantic binary string patch — {result.get('patched_operations', 0)} replacements",
+                "steps_applied": result.get("patched_operations", 0),
+                "steps_total": result.get("patched_operations", 0),
+                "diff_text": json.dumps(result.get("replacements", [])[:5], ensure_ascii=False),
+                "errors": [],
+                "tool": "patch_binary_strings",
+            })
+
+        return json.dumps(result, ensure_ascii=False, indent=2)[:20000]
+    return _safe_call(_run, "patch_binary_strings")
+
+
+# ---------------------------------------------------------------------------
 # NEW: Native library analyzer
 # ---------------------------------------------------------------------------
 
@@ -5095,6 +7051,108 @@ def reconstruct_strings(smali_file: str) -> str:
     return _safe_call(_run, "reconstruct_strings")
 
 
+@tool
+def find_entry_points() -> str:
+    """Discover the full Android entry surface across all DEX files.
+
+    Finds the Application class, launcher activities, services, receivers, and
+    other execution entry points in order to recover how the app starts.
+    """
+    from apk_agent.tools.deep_analysis import find_entry_points as _find
+
+    def _run():
+        manifest_path = _project.apktool_dir / "AndroidManifest.xml"
+        result = _find(manifest_path, _get_all_smali_dirs())
+        return json.dumps(result, ensure_ascii=False, indent=2)[:20000]
+
+    return _safe_call(_run, "find_entry_points")
+
+
+@tool
+def map_hierarchy(target_class: str = "") -> str:
+    """Map class inheritance and interface implementation relationships.
+
+    Useful for obfuscated apps where framework interfaces survive renaming and
+    help locate the real app-owned implementations.
+    """
+    from apk_agent.tools.deep_analysis import map_class_hierarchy as _map
+
+    def _run():
+        result = _map(_get_all_smali_dirs(), target_class=target_class.strip())
+        return json.dumps(result, ensure_ascii=False, indent=2)[:20000]
+
+    return _safe_call(_run, "map_hierarchy", _cache_hint=target_class)
+
+
+@tool
+def validate_patch(file_path: str) -> str:
+    """Validate smali syntax for a patched file before build.
+
+    Use after any smali edit to catch invalid opcodes, broken directives, or
+    malformed method bodies before running apktool_build.
+    """
+    from apk_agent.tools.deep_analysis import validate_smali_syntax as _validate
+
+    def _run():
+        target = _resolve_file(file_path)
+        result = _validate(target)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
+
+    return _safe_call(_run, "validate_patch", _cache_hint=file_path)
+
+
+@tool
+def diff_patched_file(original_file: str, patched_file: str) -> str:
+    """Show the exact diff between an original file and its patched version."""
+    from apk_agent.tools.deep_analysis import diff_smali_files as _diff
+
+    def _run():
+        original = _resolve_file(original_file)
+        patched = _resolve_file(patched_file)
+        result = _diff(original, patched)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:20000]
+
+    return _safe_call(_run, "diff_patched_file", _cache_hint=f"{original_file}:{patched_file}")
+
+
+@tool
+def analyze_shared_prefs() -> str:
+    """Analyze SharedPreferences usage and likely boolean bypass flags."""
+    from apk_agent.tools.deep_analysis import analyze_shared_prefs as _analyze
+
+    def _run():
+        search_dirs = [_project.jadx_dir, *_get_all_smali_dirs()]
+        result = _analyze(search_dirs)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:20000]
+
+    return _safe_call(_run, "analyze_shared_prefs")
+
+
+@tool
+def extract_native_strings(so_file: str, min_length: int = 6) -> str:
+    """Extract and classify readable strings from a native `.so` library."""
+    from apk_agent.tools.deep_analysis import extract_strings_from_binary as _extract
+
+    def _run():
+        target = _resolve_file(so_file)
+        result = _extract(target, min_length=min_length)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:20000]
+
+    return _safe_call(_run, "extract_native_strings", _cache_hint=f"{so_file}:{min_length}")
+
+
+@tool
+def scan_assets_secrets() -> str:
+    """Scan assets and raw/xml resources for embedded secrets and keys."""
+    from apk_agent.tools.deep_analysis import scan_assets_for_secrets as _scan
+
+    def _run():
+        result = _scan(_project.apktool_dir)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:20000]
+
+    return _safe_call(_run, "scan_assets_secrets")
+
+
 # ---------------------------------------------------------------------------
 # Refined / intelligent search tools
 # ---------------------------------------------------------------------------
@@ -5195,7 +7253,10 @@ def smart_search(
     from apk_agent.tools.advanced_search import smart_search as _smart
 
     if directory:
-        base_dirs = [str(_resolve_dir(directory, default="jadx"))]
+        resolved_dir = _resolve_project_path(directory)
+        if resolved_dir.is_file():
+            resolved_dir = resolved_dir.parent
+        base_dirs = [str(resolved_dir)]
     elif search_type == "code":
         # Search BOTH jadx Java sources AND all smali directories
         base_dirs = [str(_project.jadx_dir)]
@@ -5219,90 +7280,199 @@ def smart_search(
 # Code Graph tools (NetworkX-powered)
 # ---------------------------------------------------------------------------
 
-# Module-level graph + index holders (loaded once per session)
-_code_graph = None
-_code_index = None
-_smali_index = None  # SmaliIndex IR (from smali_ir module)
+# Module-level mode flags kept for backwards compatibility.
 _auto_mode = False   # Set by CLI when /auto is active
+_human_mode = False  # Set by CLI/TG when /human is active (step-by-step)
 
 
 def _ensure_graph():
     """Load or build the code graph. Returns the graph."""
-    global _code_graph
-    if _code_graph is not None:
-        return _code_graph
+    cached_graph = get_runtime_slot("code_graph")
+    if cached_graph is not None:
+        return cached_graph
 
     from apk_agent.tools.code_graph import load_graph, build_code_graph, save_graph
+    from apk_agent.progress import report_progress
 
-    graph_path = Path(_project.outputs_dir) / "call_graph.pickle"
+    graph_path = _project_outputs_dir() / "call_graph.pickle"
+    report_progress(6, "Loading cached code graph")
     G = load_graph(graph_path)
     if G is not None:
-        _code_graph = G
+        set_runtime_slot("code_graph", G)
+        report_progress(18, f"Code graph loaded: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
         return G
 
-    # Need to build it
     smali_dirs = _get_all_smali_dirs()
     if not smali_dirs:
         return None
 
-    from apk_agent.progress import report_progress
+    report_progress(8, "Cached graph missing; building code graph")
     G = build_code_graph(smali_dirs, progress_callback=report_progress)
     save_graph(G, graph_path)
-    _code_graph = G
+    set_runtime_slot("code_graph", G)
+    report_progress(18, f"Code graph built: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
     return G
 
 
 def _ensure_index():
     """Load or build the code index. Returns the index dict."""
-    global _code_index
-    if _code_index is not None:
-        return _code_index
+    cached_index = get_runtime_slot("code_index")
+    if cached_index is not None:
+        return cached_index
 
     from apk_agent.tools.index_cache import load_index, build_code_index, save_index
+    from apk_agent.progress import report_progress
 
-    index_path = Path(_project.outputs_dir) / "code_index.json"
+    index_path = _project_outputs_dir() / "code_index.json"
+    report_progress(6, "Loading cached code index")
     idx = load_index(index_path)
     if idx is not None:
-        _code_index = idx
+        set_runtime_slot("code_index", idx)
+        stats = idx.get("stats", {}) if isinstance(idx, dict) else {}
+        report_progress(
+            18,
+            f"Code index loaded: {stats.get('total_classes', 0)} classes, {stats.get('total_methods', 0)} methods",
+        )
         return idx
 
-    # Need to build it
     smali_dirs = _get_all_smali_dirs()
     if not smali_dirs:
         return None
 
-    from apk_agent.progress import report_progress
-    idx = build_code_index(smali_dirs, jadx_dir=_project.jadx_dir,
+    report_progress(8, "Cached index missing; building code index")
+    idx = build_code_index(smali_dirs, jadx_dir=_project_jadx_dir(),
                            progress_callback=report_progress)
     save_index(idx, index_path)
-    _code_index = idx
+    set_runtime_slot("code_index", idx)
+    stats = idx.get("stats", {}) if isinstance(idx, dict) else {}
+    report_progress(
+        18,
+        f"Code index built: {stats.get('total_classes', 0)} classes, {stats.get('total_methods', 0)} methods",
+    )
     return idx
 
 
 def _ensure_smali_index():
     """Load or build the SmaliIndex IR. Returns the SmaliIndex."""
-    global _smali_index
-    if _smali_index is not None:
-        return _smali_index
+    cached_smali_index = get_runtime_slot("smali_index")
+    if cached_smali_index is not None:
+        return cached_smali_index
 
     from apk_agent.tools.smali_ir import load_index as load_smali_index, build_index as build_smali_idx, save_index as save_smali_index
+    from apk_agent.progress import report_progress
 
-    index_path = Path(_project.outputs_dir) / "smali_index.pickle"
+    index_path = _project_outputs_dir() / "smali_index.pickle"
+    report_progress(6, "Loading cached SmaliIndex")
     idx = load_smali_index(index_path)
     if idx is not None:
-        _smali_index = idx
+        clear_runtime_slots(
+            "semantic_architecture_cache",
+            "hidden_state_model_cache",
+            "guard_surface_profile_cache",
+            "architecture_context_cache",
+        )
+        set_runtime_slot("smali_index", idx)
+        report_progress(18, f"SmaliIndex loaded: {len(idx.classes)} classes, {len(idx.methods)} methods")
         return idx
 
-    # Need to build it
     smali_dirs = _get_all_smali_dirs()
     if not smali_dirs:
         return None
 
-    from apk_agent.progress import report_progress
+    report_progress(8, "Cached SmaliIndex missing; building SmaliIndex")
     idx = build_smali_idx(smali_dirs, progress_callback=report_progress)
+    clear_runtime_slots(
+        "semantic_architecture_cache",
+        "hidden_state_model_cache",
+        "guard_surface_profile_cache",
+        "architecture_context_cache",
+    )
+    set_runtime_slot("smali_index", idx)
     save_smali_index(idx, index_path)
-    _smali_index = idx
+    report_progress(18, f"SmaliIndex built: {len(idx.classes)} classes, {len(idx.methods)} methods")
     return idx
+
+
+def _app_knowledge_pack_path() -> Path:
+    return _project_outputs_dir() / "app_knowledge_pack.json"
+
+
+def _ensure_app_knowledge_pack(*, auto_build: bool = True, focus_hint: str = ""):
+    """Load or build the persisted application knowledge pack."""
+    cached_pack = get_runtime_slot("app_knowledge_pack")
+    if cached_pack is not None:
+        return cached_pack
+
+    from apk_agent.tools.app_knowledge import (
+        build_app_knowledge_pack as _build_app_knowledge_pack,
+        load_app_knowledge_pack,
+        save_app_knowledge_pack,
+    )
+
+    pack_path = _app_knowledge_pack_path()
+    pack = load_app_knowledge_pack(pack_path)
+    if pack is not None:
+        set_runtime_slot("app_knowledge_pack", pack)
+        return pack
+
+    if not auto_build:
+        return None
+
+    idx = _ensure_smali_index()
+    if idx is None:
+        return None
+
+    pack = _build_app_knowledge_pack(
+        idx,
+        focus_hint=focus_hint,
+        package_name=str(getattr(_project, "package_name", "") or ""),
+        app_label=str(getattr(_project, "apk_name", "") or ""),
+    )
+    save_app_knowledge_pack(pack, pack_path)
+    set_runtime_slot("app_knowledge_pack", pack)
+    return pack
+
+
+def _behavior_graph_path() -> Path:
+    return _project_outputs_dir() / "behavior_graph.json"
+
+
+def _ensure_behavior_graph_pack(*, auto_build: bool = True, focus_hint: str = ""):
+    """Load or build the persisted unified behavior graph pack."""
+    cached_pack = get_runtime_slot("behavior_graph_pack")
+    if cached_pack is not None:
+        return cached_pack
+
+    from apk_agent.tools.behavior_engine import (
+        build_behavior_graph as _build_behavior_graph,
+        load_behavior_graph,
+        save_behavior_graph,
+    )
+
+    pack_path = _behavior_graph_path()
+    pack = load_behavior_graph(pack_path)
+    if pack is not None:
+        set_runtime_slot("behavior_graph_pack", pack)
+        return pack
+
+    if not auto_build:
+        return None
+
+    idx = _ensure_smali_index()
+    if idx is None:
+        return None
+
+    graph = _ensure_graph()
+    pack = _build_behavior_graph(
+        idx,
+        graph=graph,
+        focus_hint=focus_hint,
+        package_name=str(getattr(_project, "package_name", "") or ""),
+        app_label=str(getattr(_project, "apk_name", "") or ""),
+    )
+    save_behavior_graph(pack, pack_path)
+    set_runtime_slot("behavior_graph_pack", pack)
+    return pack
 
 
 @tool
@@ -5315,14 +7485,18 @@ def build_graph_and_index() -> str:
     - Call graph (NetworkX): class→method→calls relationships for instant tracing
     - Code index (JSON): class/method/string lookup for instant search
 
+    NOTE: This does NOT build SmaliIndex. For behavioral analysis tools
+    (discover_entity_classes, detect_gate_chain, smart_entity_patch, etc.)
+    run build_smali_index separately.
+
     When to use: Run once after apktool_decompile. Enables all graph_* and index_*
     tools. Re-run only if you decompile a different APK.
 
     Returns: JSON with keys: success, graph ({nodes, edges, components}),
     index ({classes, methods, strings, packages}).
     """
-    global _code_graph, _code_index
-    from apk_agent.tools.code_graph import build_code_graph, save_graph, get_graph_stats
+    from concurrent.futures import ThreadPoolExecutor
+    from apk_agent.tools.code_graph import build_code_graph, save_graph
     from apk_agent.tools.index_cache import build_code_index, save_index
     from apk_agent.progress import report_progress
 
@@ -5331,25 +7505,39 @@ def build_graph_and_index() -> str:
         return json.dumps({"success": False, "error": "No smali directories found. Run apktool_decompile first."})
 
     def _run():
-        global _code_graph, _code_index
+        outputs_dir = _project_outputs_dir()
+        jadx_dir = _project_jadx_dir()
 
-        # Build graph
-        G = build_code_graph(smali_dirs, progress_callback=report_progress)
-        graph_path = Path(_project.outputs_dir) / "call_graph.pickle"
-        g_stats = save_graph(G, graph_path)
-        _code_graph = G
+        def _build_graph():
+            G = build_code_graph(smali_dirs, progress_callback=report_progress)
+            graph_path = outputs_dir / "call_graph.pickle"
+            g_stats = save_graph(G, graph_path)
+            return G, g_stats
 
-        # Build index
-        idx = build_code_index(smali_dirs, jadx_dir=_project.jadx_dir,
-                               progress_callback=report_progress)
-        index_path = Path(_project.outputs_dir) / "code_index.json"
-        i_stats = save_index(idx, index_path)
-        _code_index = idx
+        def _build_index():
+            idx = build_code_index(
+                smali_dirs,
+                jadx_dir=jadx_dir,
+                progress_callback=report_progress,
+            )
+            index_path = outputs_dir / "code_index.json"
+            i_stats = save_index(idx, index_path)
+            return idx, i_stats
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            graph_future = pool.submit(_build_graph)
+            index_future = pool.submit(_build_index)
+            G, g_stats = graph_future.result()
+            idx, i_stats = index_future.result()
+
+        set_runtime_slot("code_graph", G)
+        set_runtime_slot("code_index", idx)
 
         return json.dumps({
             "success": True,
             "graph": g_stats,
             "index": i_stats,
+            "hint": "For SmaliIndex-powered tools (discover_entity_classes, detect_gate_chain, smart_entity_patch), run build_smali_index separately.",
         }, indent=2)
     return _safe_call(_run, "build_graph_and_index")
 
@@ -5471,13 +7659,27 @@ def graph_security_scan() -> str:
     Returns: JSON with keys: success, total_security_methods, categories
     (dict of category→array of {method, class, file, caller_count, callers}).
     """
+    from apk_agent.progress import report_progress
     from apk_agent.tools.code_graph import find_security_methods
 
     def _run():
+        report_progress(2, "Loading or building code graph")
         G = _ensure_graph()
         if G is None:
             return json.dumps({"success": False, "error": "No code graph. Run build_graph_and_index first."})
-        result = find_security_methods(G)
+
+        report_progress(10, f"Code graph ready: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+
+        def _scan_progress(pct: float, detail: str) -> None:
+            mapped_pct = 10 + max(0.0, min(100.0, pct)) * 0.88
+            report_progress(mapped_pct, detail)
+
+        result = find_security_methods(G, progress_callback=_scan_progress)
+        total_hits = int(result.get("total_hits", 0) or 0)
+        report_progress(
+            100,
+            f"graph_security_scan complete: {total_hits} hits in {result.get('categories_found', 0)} categories",
+        )
         return json.dumps(result, ensure_ascii=False, indent=2)[:20000]
     return _safe_call(_run, "graph_security_scan")
 
@@ -5524,12 +7726,16 @@ def index_lookup_class(query: str) -> str:
     (array of {class_name, package, file_path, methods (list)}).
     """
     from apk_agent.tools.index_cache import lookup_class
+    from apk_agent.progress import report_progress
 
     def _run():
+        report_progress(2, f"Preparing class index lookup for '{query}'")
         idx = _ensure_index()
         if idx is None:
             return json.dumps({"success": False, "error": "No code index. Run build_graph_and_index first."})
+        report_progress(80, f"Searching class index for '{query}'")
         result = lookup_class(idx, query)
+        report_progress(100, f"index_lookup_class complete: {result.get('total_matches', 0)} matches")
         return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
     return _safe_call(_run, "index_lookup_class", _cache_hint=query)
 
@@ -5549,12 +7755,16 @@ def index_lookup_method(method_name: str) -> str:
     (array of {class_name, file_path, method_signature}).
     """
     from apk_agent.tools.index_cache import lookup_method
+    from apk_agent.progress import report_progress
 
     def _run():
+        report_progress(2, f"Preparing method index lookup for '{method_name}'")
         idx = _ensure_index()
         if idx is None:
             return json.dumps({"success": False, "error": "No code index. Run build_graph_and_index first."})
+        report_progress(80, f"Searching method index for '{method_name}'")
         result = lookup_method(idx, method_name)
+        report_progress(100, f"index_lookup_method complete: {result.get('total_matches', 0)} matches")
         return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
     return _safe_call(_run, "index_lookup_method", _cache_hint=method_name)
 
@@ -5582,12 +7792,16 @@ def index_lookup_string(query: str) -> str:
         If nothing found, includes a hint for alternative search tools.
     """
     from apk_agent.tools.index_cache import lookup_string
+    from apk_agent.progress import report_progress
 
     def _run():
+        report_progress(2, f"Preparing unified index lookup for '{query}'")
         idx = _ensure_index()
         if idx is None:
             return json.dumps({"success": False, "error": "No code index. Run build_graph_and_index first."})
+        report_progress(80, f"Searching unified index for '{query}'")
         result = lookup_string(idx, query)
+        report_progress(100, f"index_lookup_string complete: {result.get('total_matches', 0)} matches")
         return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
     return _safe_call(_run, "index_lookup_string", _cache_hint=query)
 
@@ -5812,6 +8026,40 @@ def patch_manifest_security() -> str:
 
 
 @tool
+def rename_package_identity(new_package: str, old_package: str = "") -> str:
+    """Rename the install-time Android package identity for side-by-side clones.
+
+    Unlike a manifest-only package edit, this also rewrites app-owned provider
+    authorities, custom permissions, task affinity, process names, and other
+    manifest identifiers that keep conflicting with the original installed app.
+
+    It also normalizes relative component class references to absolute names
+    under the original code package so the APK still launches after the new
+    install identity is applied.
+    """
+    from apk_agent.tools.package_renamer import rename_package_identity as _rename
+
+    def _run():
+        result = _rename(
+            apktool_dir=_project.apktool_dir,
+            new_package=new_package.strip(),
+            old_package=(old_package.strip() or None),
+        )
+        changes = result.get("changes_applied") or []
+        _patch_journal.append({
+            "success": result.get("success", False),
+            "target_file": "AndroidManifest.xml",
+            "description": f"Package identity rename: {result.get('old_package', '')} -> {result.get('new_package', '')}",
+            "steps_applied": len(changes),
+            "steps_total": len(changes),
+            "errors": [] if result.get("success", False) else [result.get("error", "rename_package_identity failed")],
+            "tool": "rename_package_identity",
+        })
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    return _safe_call(_run, "rename_package_identity")
+
+
+@tool
 def remove_ads() -> str:
     """Remove ad networks from the APK by patching smali code.
     Neutralizes 40+ ad networks: AdMob, Facebook, Unity, IronSource, AppLovin,
@@ -5877,6 +8125,1635 @@ def list_bypass_categories() -> str:
 
 
 # ---------------------------------------------------------------------------
+# SmaliIndex-powered analysis tools (Tier 1 & 2)
+# ---------------------------------------------------------------------------
+
+
+@tool
+def discover_entity_classes(keywords_json: str = '["premium","subscription","license","vip","pro","trial","purchase","billing","paid","plan"]') -> str:
+    """Discover ALL entity/model classes related to premium/subscription/licensing.
+
+    Uses SmaliIndex string_index, class/method/field behavior, hidden-state
+    recovery, and semantic architecture roles to find likely premium/source-of-
+    truth classes. This is the BEST starting point — call this BEFORE
+    map_feature_checks or cross_reference_map.
+
+    Much more thorough than text search because it:
+    1. Searches string constants inside bytecode (not just class/method names)
+    2. Walks class hierarchy to find child classes of known entities
+    3. Categorizes each class by role (entity, manager, UI, network, etc.)
+    4. Returns classes ranked by relevance (most gate methods first)
+
+    Args:
+        keywords_json: JSON array of search keywords. Default covers premium/subscription.
+
+    Returns: JSON with ranked entity_classes, each with class name, file, fields,
+    gate_method_count, category, and relevance_score.
+    """
+    def _run():
+        from apk_agent.progress import report_progress
+        from apk_agent.tools.advanced_search import _is_third_party_path
+        from apk_agent.tools.app_knowledge import query_app_knowledge as _query_app_knowledge
+        from apk_agent.tools.behavior_engine import query_behavior_graph as _query_behavior_graph
+        from apk_agent.tools.semantic_cache import (
+            get_cached_hidden_state_model as _recover_hidden_state_model,
+            get_cached_semantic_architecture as _map_semantic_architecture,
+        )
+
+        report_progress(2, "Loading SmaliIndex for entity discovery")
+        si = _ensure_smali_index()
+        if not si:
+            return json.dumps({"success": False, "error": "SmaliIndex not available. Run build_graph_and_index first."})
+
+        report_progress(
+            8,
+            f"SmaliIndex ready: {len(si.classes)} classes, {len(si.string_index)} string literals",
+        )
+
+        try:
+            raw_keywords = json.loads(keywords_json)
+        except json.JSONDecodeError as exc:
+            return json.dumps({"success": False, "error": f"Invalid keywords_json: {exc}"})
+
+        focus_terms = [str(keyword).strip().lower() for keyword in raw_keywords if str(keyword).strip()]
+        if not focus_terms:
+            return json.dumps({"success": False, "error": "No keywords provided."})
+        query_blob = " ".join(focus_terms)
+
+        def _emit_progress(start_pct: float, end_pct: float, current: int, total: int, detail: str) -> None:
+            if total <= 0:
+                report_progress(end_pct, detail)
+                return
+            interval = max(1, total // 20)
+            if current == total or current % interval == 0:
+                pct = start_pct + (current / total) * (end_pct - start_pct)
+                report_progress(pct, detail)
+
+        candidate_classes: dict[str, dict] = {}
+        file_to_classes: dict[str, list[str]] = {}
+
+        def _normalize_path(path_value: str) -> str:
+            return path_value.replace("\\", "/").strip()
+
+        def _append_unique(items: list, value, limit: int = 8) -> None:
+            if not value:
+                return
+            if value not in items and len(items) < limit:
+                items.append(value)
+
+        def _append_hidden_state_field(entry: dict, field_candidate: dict) -> None:
+            field_name = field_candidate.get("field", "") or field_candidate.get("name", "")
+            if not field_name:
+                return
+            payload = {
+                "field": field_name,
+                "type": field_candidate.get("type", ""),
+                "semantic_guess": field_candidate.get("semantic_guess", "state_value"),
+                "likely_unlocked_value": field_candidate.get("likely_unlocked_value"),
+                "suggested_unlocked_value": field_candidate.get("suggested_unlocked_value"),
+                "value_origin": field_candidate.get("value_origin", "semantic_guess"),
+                "safe_for_auto_override": field_candidate.get("safe_for_auto_override", False),
+                "exact_value_candidates": field_candidate.get("exact_value_candidates", [])[:3],
+                "confidence": field_candidate.get("confidence", 0),
+            }
+            if len(entry["hidden_state_fields"]) < 8 and payload not in entry["hidden_state_fields"]:
+                entry["hidden_state_fields"].append(payload)
+
+        def _class_blob(cls_obj) -> str:
+            parts: list[str] = [
+                cls_obj.name,
+                cls_obj.super_class,
+                cls_obj.source_file,
+                cls_obj.file_path,
+                " ".join(cls_obj.interfaces),
+            ]
+            for field in cls_obj.fields[:24]:
+                parts.append(field.name)
+                parts.append(field.type)
+            for method in cls_obj.methods[:80]:
+                parts.append(method.name)
+                parts.append(method.signature)
+                if method.api_calls:
+                    parts.append(" ".join(method.api_calls[:24]))
+                if method.string_constants:
+                    parts.append(" ".join(method.string_constants[:12]))
+            return " ".join(part for part in parts if part).lower()
+
+        def _ensure_candidate(cls_name: str) -> dict | None:
+            cls_obj = si.get_class(cls_name)
+            if cls_obj is None or _is_third_party_path(cls_obj.file_path):
+                return None
+            entry = candidate_classes.setdefault(cls_name, {
+                "keywords": set(),
+                "string_hits": 0,
+                "string_examples": [],
+                "gate_methods": 0,
+                "gate_method_names": [],
+                "architecture_roles": set(),
+                "architecture_evidence": [],
+                "semantic_guesses": set(),
+                "hidden_state_fields": [],
+                "reader_tags": set(),
+                "writer_tags": set(),
+                "notes": [],
+                "ranking_boost": 0.0,
+            })
+            entry.setdefault("file", cls_obj.file_path)
+            entry.setdefault("super_class", cls_obj.super_class)
+            entry.setdefault("fields", [{"name": field.name, "type": field.type} for field in cls_obj.fields[:20]])
+            entry.setdefault("total_methods", len(cls_obj.methods))
+            return entry
+
+        for cls_name, cls_obj in si.classes.items():
+            if _is_third_party_path(cls_obj.file_path):
+                continue
+            file_to_classes.setdefault(_normalize_path(cls_obj.file_path), []).append(cls_name)
+
+        pack_seeded_classes: set[str] = set()
+
+        try:
+            behavior_pack = _ensure_behavior_graph_pack(auto_build=False, focus_hint=query_blob)
+        except RuntimeError:
+            behavior_pack = None
+        if behavior_pack:
+            symbol_hints_by_class = {
+                item.get("class", ""): item
+                for item in behavior_pack.get("behavior", {}).get("symbol_hints", [])
+                if item.get("class")
+            }
+            controls_by_class: dict[str, list[dict]] = {}
+            for control in behavior_pack.get("behavior", {}).get("feature_controls", []):
+                cls_name = control.get("class", "")
+                if cls_name:
+                    controls_by_class.setdefault(cls_name, []).append(control)
+
+            behavior_hits = _query_behavior_graph(
+                behavior_pack,
+                query_blob,
+                feature=query_blob,
+                max_results=24,
+            )
+            for match in behavior_hits.get("matches", []):
+                cls_name = match.get("class", "")
+                entry = _ensure_candidate(cls_name)
+                if entry is None:
+                    continue
+                pack_seeded_classes.add(cls_name)
+                hint = symbol_hints_by_class.get(cls_name, {})
+                entry["architecture_roles"].update(hint.get("roles", []))
+                entry["semantic_guesses"].update(hint.get("semantic_guesses", []))
+                entry["ranking_boost"] += float(match.get("match_score", 0) or 0) + float(hint.get("score", 0) or 0)
+                for reason in (match.get("evidence", []) or [])[:4]:
+                    _append_unique(entry["architecture_evidence"], reason)
+                if hint.get("suggested_name"):
+                    _append_unique(entry["notes"], f"Behavior hint: {hint.get('suggested_name')}")
+                gate_methods = [
+                    control.get("method", "")
+                    for control in controls_by_class.get(cls_name, [])
+                    if control.get("method")
+                ]
+                if gate_methods:
+                    entry["gate_methods"] = max(entry.get("gate_methods", 0), len(gate_methods))
+                    entry["gate_method_names"] = gate_methods[:10]
+            if pack_seeded_classes:
+                report_progress(9, f"Loaded persisted behavior graph seeds: {len(pack_seeded_classes)} classes")
+
+        try:
+            app_pack = _ensure_app_knowledge_pack(auto_build=False, focus_hint=query_blob)
+        except RuntimeError:
+            app_pack = None
+        if app_pack:
+            entities_by_class = {
+                item.get("class", ""): item
+                for item in app_pack.get("knowledge", {}).get("entities", [])
+                if item.get("class")
+            }
+            state_fields_by_class: dict[str, list[dict]] = {}
+            for field in app_pack.get("knowledge", {}).get("state_fields", []):
+                cls_name = field.get("class", "")
+                if cls_name:
+                    state_fields_by_class.setdefault(cls_name, []).append(field)
+
+            app_hits = _query_app_knowledge(
+                app_pack,
+                query_blob,
+                feature=query_blob,
+                max_results=24,
+            )
+            seeded_before = len(pack_seeded_classes)
+            for match in app_hits.get("matches", []):
+                cls_name = match.get("class", "")
+                entry = _ensure_candidate(cls_name)
+                if entry is None:
+                    continue
+                pack_seeded_classes.add(cls_name)
+                entity = entities_by_class.get(cls_name, {})
+                entry["architecture_roles"].update(entity.get("roles", []))
+                entry["architecture_roles"].update(entity.get("dominant_roles", []))
+                entry["ranking_boost"] += float(match.get("match_score", 0) or 0) + float(entity.get("score", 0) or 0)
+                for evidence in entity.get("evidence", [])[:4]:
+                    _append_unique(entry["architecture_evidence"], evidence)
+                for field_candidate in state_fields_by_class.get(cls_name, [])[:6]:
+                    entry["semantic_guesses"].add(field_candidate.get("semantic_guess", "state_value"))
+                    entry["reader_tags"].update(field_candidate.get("reader_tags", []))
+                    entry["writer_tags"].update(field_candidate.get("writer_tags", []))
+                    _append_hidden_state_field(entry, field_candidate)
+            seeded_now = len(pack_seeded_classes) - seeded_before
+            if seeded_now > 0:
+                report_progress(9.5, f"Loaded persisted application knowledge seeds: {len(pack_seeded_classes)} classes")
+
+        # 1. Search all string constants by substring instead of exact-key lookup.
+        #    SmaliIndex stores usages as (file, line) tuples, not method signatures.
+        total_literals = len(si.string_index)
+        report_progress(10, f"Scanning {total_literals} string literals for {len(focus_terms)} focus terms")
+        for literal_index, (literal, usages) in enumerate(si.string_index.items(), start=1):
+            literal_lower = literal.lower()
+            matched_terms = [term for term in focus_terms if term in literal_lower]
+            if not matched_terms:
+                _emit_progress(
+                    10,
+                    28,
+                    literal_index,
+                    total_literals,
+                    f"String scan: {literal_index}/{total_literals} literals | {len(candidate_classes)} candidates",
+                )
+                continue
+            for file_path, line_number in usages:
+                for cls_name in file_to_classes.get(_normalize_path(file_path), []):
+                    entry = _ensure_candidate(cls_name)
+                    if entry is None:
+                        continue
+                    entry["string_hits"] += 1
+                    entry["ranking_boost"] += 3 + len(matched_terms)
+                    entry["keywords"].update(matched_terms)
+                    if len(entry["string_examples"]) < 8:
+                        entry["string_examples"].append({
+                            "literal": literal[:140],
+                            "line": line_number,
+                            "matched_terms": matched_terms,
+                        })
+            _emit_progress(
+                10,
+                28,
+                literal_index,
+                total_literals,
+                f"String scan: {literal_index}/{total_literals} literals | {len(candidate_classes)} candidates",
+            )
+
+        # 2. Scan app-owned classes for keyword, billing, and gate-density signals.
+        total_classes = len(si.classes)
+        report_progress(30, f"Scanning {total_classes} classes for structural gate signals")
+        for class_index, (cls_name, cls_obj) in enumerate(si.classes.items(), start=1):
+            if _is_third_party_path(cls_obj.file_path):
+                _emit_progress(
+                    30,
+                    52,
+                    class_index,
+                    total_classes,
+                    f"Class scan: {class_index}/{total_classes} | {len(candidate_classes)} seeded candidates",
+                )
+                continue
+
+            blob = _class_blob(cls_obj)
+            matched_terms = [term for term in focus_terms if term in blob]
+            billing_context = any(token in blob for token in ("billingclient", "querypurchases", "subscription", "purchase", "entitlement", "revenuecat", "qonversion"))
+            serialization_context = any(token in blob for token in ("gson", "moshi", "jackson", "fromjson", "tojson", "org/json", "jsonobject"))
+
+            gate_names: list[str] = []
+            compact_getters = 0
+            for method in cls_obj.methods:
+                if method.name in ("<init>", "<clinit>"):
+                    continue
+                if method.return_type not in ("Z", "I"):
+                    continue
+                has_field = any(instr.is_field_access for instr in method.instructions)
+                has_branch = any(instr.is_branch for instr in method.instructions)
+                if has_field and has_branch:
+                    gate_names.append(method.signature)
+                elif method.return_type == "Z" and has_field:
+                    compact_getters += 1
+
+            structural_score = 0.0
+            if matched_terms:
+                structural_score += 4 + len(matched_terms) * 2
+            if gate_names:
+                structural_score += len(gate_names) * 9
+            if compact_getters:
+                structural_score += compact_getters * 2
+            if 2 <= len(cls_obj.fields) <= 40:
+                structural_score += 2
+            if billing_context:
+                structural_score += 6
+            if serialization_context and len(cls_obj.fields) >= 3:
+                structural_score += 4
+
+            if structural_score < 6:
+                _emit_progress(
+                    30,
+                    52,
+                    class_index,
+                    total_classes,
+                    f"Class scan: {class_index}/{total_classes} | {len(candidate_classes)} seeded candidates",
+                )
+                continue
+
+            entry = _ensure_candidate(cls_name)
+            if entry is None:
+                _emit_progress(
+                    30,
+                    52,
+                    class_index,
+                    total_classes,
+                    f"Class scan: {class_index}/{total_classes} | {len(candidate_classes)} seeded candidates",
+                )
+                continue
+            entry["keywords"].update(matched_terms)
+            entry["ranking_boost"] += structural_score
+            entry["gate_methods"] = max(entry.get("gate_methods", 0), len(gate_names))
+            if gate_names:
+                entry["gate_method_names"] = gate_names[:10]
+            if billing_context:
+                entry["architecture_roles"].add("billing_flow")
+            if serialization_context:
+                entry["architecture_roles"].add("serialization_layer")
+            _emit_progress(
+                30,
+                52,
+                class_index,
+                total_classes,
+                f"Class scan: {class_index}/{total_classes} | {len(candidate_classes)} seeded candidates",
+            )
+
+        has_direct_keyword_signal = any(
+            info.get("string_hits", 0) > 0 or info.get("keywords")
+            for info in candidate_classes.values()
+        )
+        should_run_deep_fallback = not (pack_seeded_classes or has_direct_keyword_signal)
+        architecture_result: dict = {"recommended_next_targets": []}
+        hidden_state_result: dict = {"summary": {}}
+        discovery_mode = "string_plus_structure"
+
+        if should_run_deep_fallback:
+            discovery_mode = "string_plus_architecture_plus_state_model"
+            # 3. Pull in semantic architecture roles for obfuscated/hardened apps.
+            report_progress(55, f"Running semantic architecture recovery for {len(candidate_classes)} seeded classes")
+            architecture_result = _map_semantic_architecture(si, focus_hint=",".join(focus_terms), max_per_role=10)
+            architecture_hits = 0
+            for role, ranked in architecture_result.get("architecture_layers", {}).items():
+                if role not in {"state_models", "billing_flow", "serialization_layer", "network_layer", "ui_gate_controllers"}:
+                    continue
+                architecture_hits += len(ranked)
+                for item in ranked:
+                    entry = _ensure_candidate(item.get("class", ""))
+                    if entry is None:
+                        continue
+                    entry["architecture_roles"].add(role)
+                    entry["ranking_boost"] += float(item.get("score", 0) or 0)
+                    for evidence in item.get("evidence", [])[:4]:
+                        if evidence not in entry["architecture_evidence"]:
+                            entry["architecture_evidence"].append(evidence)
+            report_progress(68, f"Semantic architecture recovery complete: {architecture_hits} ranked hits")
+
+            # 4. Pull in hidden-state candidates even when obvious keywords are missing.
+            report_progress(70, f"Running hidden-state recovery across {len(si.classes)} classes")
+            hidden_state_result = _recover_hidden_state_model(si, focus_hint=",".join(focus_terms), max_candidates=60)
+            for model in hidden_state_result.get("candidate_models", [])[:20]:
+                entry = _ensure_candidate(model.get("class", ""))
+                if entry is None:
+                    continue
+                entry["architecture_roles"].add("state_models")
+                entry["ranking_boost"] += float(model.get("score", 0) or 0)
+                for evidence in model.get("evidence", [])[:4]:
+                    if evidence not in entry["architecture_evidence"]:
+                        entry["architecture_evidence"].append(evidence)
+
+            for field_candidate in hidden_state_result.get("candidate_state_fields", [])[:60]:
+                entry = _ensure_candidate(field_candidate.get("class", ""))
+                if entry is None:
+                    continue
+                entry["architecture_roles"].add("state_models")
+                entry["semantic_guesses"].add(field_candidate.get("semantic_guess", "state_value"))
+                entry["reader_tags"].update(field_candidate.get("reader_tags", []))
+                entry["writer_tags"].update(field_candidate.get("writer_tags", []))
+                entry["ranking_boost"] += float(field_candidate.get("score", 0) or 0) + float(field_candidate.get("confidence", 0) or 0) * 8
+                _append_hidden_state_field(entry, field_candidate)
+            report_progress(
+                84,
+                "Hidden-state recovery complete: "
+                f"{len(hidden_state_result.get('candidate_models', []))} models, "
+                f"{len(hidden_state_result.get('candidate_state_fields', []))} field candidates",
+            )
+        else:
+            if pack_seeded_classes:
+                discovery_mode = "pack_plus_string_plus_structure"
+            report_progress(
+                84,
+                "Fast-path discovery sufficient; skipping whole-project semantic fallback",
+            )
+
+        # 5. Expand subclasses of strong state candidates.
+        seeded_classes = list(candidate_classes.keys())
+        report_progress(86, f"Expanding subclasses from {len(seeded_classes)} seeded classes")
+        for seed_index, cls_name in enumerate(seeded_classes, start=1):
+            parent_info = candidate_classes.get(cls_name, {})
+            for sub in si.get_subclasses(cls_name)[:5]:
+                sub_entry = _ensure_candidate(sub)
+                if sub_entry is None:
+                    continue
+                sub_entry["keywords"].update(parent_info.get("keywords", set()))
+                sub_entry["ranking_boost"] += max(float(parent_info.get("ranking_boost", 0)) * 0.25, 2)
+                if "state_models" in parent_info.get("architecture_roles", set()):
+                    sub_entry["architecture_roles"].add("state_models")
+                note = f"Child class of {cls_name}"
+                if note not in sub_entry["notes"]:
+                    sub_entry["notes"].append(note)
+            _emit_progress(
+                86,
+                92,
+                seed_index,
+                len(seeded_classes),
+                f"Subclass expansion: {seed_index}/{len(seeded_classes)} seeds | {len(candidate_classes)} candidates",
+            )
+
+        # 6. Categorize and rank.
+        results = []
+        ranked_candidates = list(candidate_classes.items())
+        report_progress(93, f"Ranking {len(ranked_candidates)} candidate entity classes")
+        for rank_index, (cls_name, info) in enumerate(ranked_candidates, start=1):
+            roles = set(info.get("architecture_roles", set()))
+            name_lower = cls_name.lower()
+            if "state_models" in roles:
+                category = "entity"
+            elif "billing_flow" in roles and ("network_layer" in roles or "serialization_layer" in roles):
+                category = "manager"
+            elif any(w in name_lower for w in ("activity", "fragment", "view", "adapter", "dialog")):
+                category = "UI"
+            elif any(w in name_lower for w in ("manager", "helper", "util", "service", "handler")):
+                category = "manager"
+            elif any(w in name_lower for w in ("api", "request", "response", "client", "network")):
+                category = "network"
+            elif any(w in name_lower for w in ("entity", "model", "bean", "dto", "info", "data")):
+                category = "entity"
+            else:
+                category = "other"
+
+            score = (
+                info.get("gate_methods", 0) * 10
+                + info.get("string_hits", 0) * 2
+                + len(info.get("keywords", set())) * 3
+                + float(info.get("ranking_boost", 0))
+            )
+            if category == "entity":
+                score += 5
+            if "billing_flow" in roles:
+                score += 4
+            if "network_layer" in roles and "serialization_layer" in roles:
+                score += 3
+
+            results.append({
+                "class": cls_name,
+                "file": info.get("file", ""),
+                "category": category,
+                "relevance_score": round(score, 2),
+                "gate_methods": info.get("gate_methods", 0),
+                "gate_method_names": info.get("gate_method_names", []),
+                "keywords_matched": sorted(info.get("keywords", set())),
+                "string_hits": info.get("string_hits", 0),
+                "string_examples": info.get("string_examples", []),
+                "fields": info.get("fields", [])[:10],
+                "super_class": info.get("super_class", ""),
+                "architecture_roles": sorted(roles),
+                "architecture_evidence": info.get("architecture_evidence", [])[:6],
+                "semantic_guesses": sorted(info.get("semantic_guesses", set())),
+                "hidden_state_fields": info.get("hidden_state_fields", [])[:6],
+                "reader_tags": sorted(info.get("reader_tags", set())),
+                "writer_tags": sorted(info.get("writer_tags", set())),
+                "notes": info.get("notes", [])[:6],
+            })
+            _emit_progress(
+                93,
+                99,
+                rank_index,
+                len(ranked_candidates),
+                f"Ranking candidates: {rank_index}/{len(ranked_candidates)}",
+            )
+
+        results.sort(key=lambda x: (-x["relevance_score"], -x["gate_methods"], x["class"]))
+        report_progress(100, f"discover_entity_classes complete: {len(results)} ranked classes")
+
+        return json.dumps({
+            "success": True,
+            "discovery_mode": discovery_mode,
+            "total_entity_classes": len(results),
+            "architecture_summary": architecture_result.get("recommended_next_targets", [])[:4],
+            "hidden_state_summary": hidden_state_result.get("summary", {}),
+            "entity_classes": results[:30],
+            "instruction": (
+                f"Found {len(results)} subscription/premium-related classes. "
+                "Prioritize classes with state_models/billing_flow roles and hidden_state_fields before patching UI symptoms. "
+                "For each top class: 1) cross_reference_map to see full usage, 2) analyze_subscription_model to find gate methods, "
+                "3) smart_entity_patch(mode='preview') or generate_constructor_override to plan the root-cause bypass."
+            ),
+        }, ensure_ascii=False, indent=2)[:20000]
+
+    return _safe_call(_run, "discover_entity_classes")
+
+
+@tool
+def detect_gate_chain(start_class: str) -> str:
+    """Detect and trace the full CHAIN of gate methods from an entity class.
+
+    Follows call chains across classes to find ALL methods that ultimately
+    control a feature gate. For example: Activity.checkPremium() -> Manager.isPro()
+    -> Entity.getType() -> field read. ALL methods in this chain must be patched.
+
+    Uses SmaliIndex api_callers to build the REVERSE call graph, then walks
+    UP from entity gate methods to find every caller chain.
+
+    Args:
+        start_class: Smali class descriptor of the entity class, e.g. 'Lcom/app/UserInfo;'
+
+    Returns: JSON with gate_chains — each chain shows the path from UI down to
+    the entity gate, with file locations and patch recommendations.
+    """
+    def _run():
+        si = _ensure_smali_index()
+        if not si:
+            return json.dumps({"success": False, "error": "SmaliIndex not available. Run build_graph_and_index first."})
+
+        cls_obj = si.get_class(start_class)
+        if not cls_obj:
+            return json.dumps({"success": False, "error": f"Class {start_class} not found in SmaliIndex."})
+
+        # Find gate methods in this class
+        gate_methods = []
+        for method in cls_obj.methods:
+            if method.name in ("<init>", "<clinit>"):
+                continue
+            if method.return_type not in ("Z", "I", "Ljava/lang/String;"):
+                continue
+            has_field = any(i.is_field_access for i in method.instructions)
+            has_branch = any(i.is_branch and i.opcode.startswith("if-") for i in method.instructions)
+            if has_field and (has_branch or method.return_type == "Z"):
+                gate_methods.append(method)
+
+        chains: list[dict] = []
+
+        for gate in gate_methods[:15]:
+            # Build call chain upward from this gate method
+            full_sig = f"{start_class}->{gate.signature}"
+            chain: list[dict] = [{"method": full_sig, "class": start_class, "depth": 0, "type": "gate_source"}]
+
+            visited = {full_sig}
+            frontier = [full_sig]
+            depth = 0
+
+            while frontier and depth < 4:
+                depth += 1
+                next_frontier = []
+                for method_sig in frontier:
+                    callers = si.find_api_callers(method_sig)
+                    for caller in callers[:10]:
+                        if caller in visited:
+                            continue
+                        visited.add(caller)
+                        caller_cls = caller.split("->")[0] if "->" in caller else ""
+                        caller_method = si.get_method(caller)
+                        chain.append({
+                            "method": caller[:120],
+                            "class": caller_cls,
+                            "depth": depth,
+                            "type": "caller",
+                            "file": caller_method.full_signature if caller_method else "",
+                        })
+                        next_frontier.append(caller)
+                frontier = next_frontier
+
+            if len(chain) > 1:
+                chains.append({
+                    "gate_method": gate.signature,
+                    "gate_return_type": gate.return_type,
+                    "chain_length": len(chain),
+                    "chain": chain[:20],
+                    "patch_all": [c["method"] for c in chain if c["type"] == "caller"][:10],
+                })
+
+        return json.dumps({
+            "success": True,
+            "start_class": start_class,
+            "total_gates": len(gate_methods),
+            "chains_found": len(chains),
+            "gate_chains": chains[:20],
+            "instruction": (
+                f"Found {len(chains)} gate chains from {start_class}. "
+                f"CRITICAL: Each chain shows every method between UI and the entity gate. "
+                f"You must patch the gate_source AND any intermediate caller that also checks "
+                f"the return value. Use batch_patch_methods with all methods from 'patch_all'."
+            ),
+        }, ensure_ascii=False, indent=2)[:20000]
+
+    return _safe_call(_run, "detect_gate_chain")
+
+
+@tool
+def trace_field_writers(class_descriptor: str, field_name: str) -> str:
+    """Trace ALL code that WRITES to a specific field across the entire codebase.
+
+    Uses SmaliIndex to find every iput/sput instruction targeting a field,
+    then traces back to understand WHAT VALUE is being written and WHERE
+    the write originates (constructor, setter, deserializer, network callback).
+
+    More powerful than trace_field_access because it:
+    1. Uses SmaliIndex for instant lookup (no file scanning)
+    2. Analyzes the VALUE being written (constant, parameter, method result)
+    3. Identifies the write CONTEXT (constructor init, setter, JSON parse, etc.)
+
+    Args:
+        class_descriptor: Smali class descriptor, e.g. 'Lcom/app/UserInfo;'
+        field_name: Name of the field to trace, e.g. 'isPremium' or 'w'
+
+    Returns: JSON with writers — each shows the writing method, value analysis,
+    and context (is it a constructor, setter, deserializer, etc.).
+    """
+    def _run():
+        si = _ensure_smali_index()
+        if not si:
+            return json.dumps({"success": False, "error": "SmaliIndex not available. Run build_graph_and_index first."})
+
+        target_field = f"{class_descriptor}->{field_name}"
+        writers: list[dict] = []
+        readers: list[dict] = []
+
+        for method_sig, method_obj in si.methods.items():
+            for instr in method_obj.instructions:
+                if not instr.is_field_access:
+                    continue
+                if field_name not in (instr.target_field or ""):
+                    continue
+                if class_descriptor[1:-1] not in (instr.target_field or ""):
+                    continue
+
+                entry = {
+                    "method": method_sig[:120],
+                    "opcode": instr.opcode,
+                    "line": instr.line,
+                    "raw": instr.raw[:120],
+                }
+
+                # Determine write context
+                method_name = method_sig.split("->")[1] if "->" in method_sig else ""
+                if "<init>" in method_name:
+                    entry["context"] = "constructor"
+                elif "set" in method_name.lower() or "put" in method_name.lower():
+                    entry["context"] = "setter"
+                elif any(w in method_name.lower() for w in ("parse", "deserialize", "from", "read", "decode")):
+                    entry["context"] = "deserializer"
+                elif any(w in method_name.lower() for w in ("on", "callback", "handle", "receive")):
+                    entry["context"] = "callback"
+                else:
+                    entry["context"] = "other"
+
+                # Analyze what's being written (look at preceding instructions)
+                if instr.opcode.startswith(("iput", "sput")):
+                    # Check if a const was loaded just before
+                    idx = method_obj.instructions.index(instr)
+                    if idx > 0:
+                        prev = method_obj.instructions[idx - 1]
+                        if prev.const_value is not None:
+                            entry["written_value"] = str(prev.const_value)
+                        elif prev.string_value:
+                            entry["written_value"] = prev.string_value
+                        elif prev.is_invoke:
+                            entry["written_value"] = f"return of {prev.target_method or prev.raw[:60]}"
+                    writers.append(entry)
+                elif instr.opcode.startswith(("iget", "sget")):
+                    readers.append(entry)
+
+        return json.dumps({
+            "success": True,
+            "target_field": target_field,
+            "total_writers": len(writers),
+            "total_readers": len(readers),
+            "writers": writers[:30],
+            "readers": readers[:20],
+            "instruction": (
+                f"Found {len(writers)} write sites for {target_field}. "
+                + (f"CRITICAL: {sum(1 for w in writers if w['context'] == 'deserializer')} writes come from "
+                   f"deserializers — these will OVERWRITE your patches when data refreshes from server. "
+                   f"You MUST also patch the deserializer or intercept the network response."
+                   if any(w["context"] == "deserializer" for w in writers) else
+                   f"Patch the field initialization in constructors AND any setter methods.")
+            ),
+        }, ensure_ascii=False, indent=2)[:15000]
+
+    return _safe_call(_run, "trace_field_writers")
+
+
+@tool
+def validate_patch_completeness(target_class: str) -> str:
+    """Validate that ALL gate methods for a class have been successfully patched.
+
+    Reads the current state of smali files and checks:
+    1. Every gate method has patch markers (APK-AGI comments)
+    2. No gate methods were MISSED
+    3. Child class gates are also patched
+    4. Field writers that could overwrite patches are handled
+    5. Dynamic checks (reflection, class loading) are neutralized
+
+    Run this AFTER patching to ensure nothing was missed.
+
+    Args:
+        target_class: Smali class descriptor, e.g. 'Lcom/app/UserInfo;'
+
+    Returns: JSON with validation results — patched_methods, unpatched_methods,
+    unpatched_child_gates, field_write_risks, overall_score.
+    """
+    def _run():
+        si = _ensure_smali_index()
+        cls_obj = si.get_class(target_class) if si else None
+
+        apk_dir = _project.apktool_dir
+        patched_methods: list[dict] = []
+        unpatched_methods: list[dict] = []
+
+        # Check the target class file
+        if cls_obj and cls_obj.abs_path:
+            try:
+                content = Path(cls_obj.abs_path).read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                content = ""
+        else:
+            # Find by class name
+            class_path = target_class[1:-1] + ".smali"
+            smali_dirs = [d for d in apk_dir.iterdir() if d.is_dir() and d.name.startswith("smali")]
+            content = ""
+            for sd in smali_dirs:
+                f = sd / class_path
+                if f.exists():
+                    content = f.read_text(encoding="utf-8", errors="replace")
+                    break
+
+        # Parse methods and check for patches
+        import re
+        methods_in_file = re.findall(r'\.method\s+(.+?)$', content, re.MULTILINE)
+        for method_sig in methods_in_file:
+            # Find this method's body
+            pat = re.compile(rf'\.method\s+{re.escape(method_sig)}.*?\.end method', re.DOTALL)
+            m = pat.search(content)
+            if not m:
+                continue
+            body = m.group(0)
+            is_gate = ("return" in body) and any(rt in method_sig for rt in ("Z", ")I"))
+            has_patch = "APK-AGI" in body or "apk-agi" in body.lower()
+
+            if is_gate:
+                info = {"method": method_sig[:80], "patched": has_patch}
+                if has_patch:
+                    patched_methods.append(info)
+                else:
+                    # Check if it's actually a gate (boolean return with field/branch)
+                    has_field_access = bool(re.search(r'[is]get-\w+', body))
+                    has_branch = bool(re.search(r'if-\w+', body))
+                    if has_field_access and has_branch:
+                        info["is_gate"] = True
+                        unpatched_methods.append(info)
+
+        # Check child classes
+        unpatched_children: list[dict] = []
+        if si:
+            children = si.get_subclasses(target_class)
+            for child in children[:10]:
+                child_cls = si.get_class(child)
+                if child_cls and child_cls.abs_path:
+                    try:
+                        child_content = Path(child_cls.abs_path).read_text(encoding="utf-8", errors="replace")
+                        child_gates = re.findall(r'\.method\s+(.*?(?:Z|I)\s*)$', child_content, re.MULTILINE)
+                        for cg in child_gates:
+                            if "APK-AGI" not in child_content:
+                                unpatched_children.append({"class": child, "method": cg[:80]})
+                    except Exception:
+                        pass
+
+        total_gates = len(patched_methods) + len(unpatched_methods)
+        score = (len(patched_methods) / total_gates * 100) if total_gates > 0 else 0
+
+        return json.dumps({
+            "success": True,
+            "target_class": target_class,
+            "total_gate_methods": total_gates,
+            "patched_count": len(patched_methods),
+            "unpatched_count": len(unpatched_methods),
+            "patched_methods": patched_methods,
+            "unpatched_methods": unpatched_methods,
+            "unpatched_child_gates": unpatched_children[:20],
+            "completeness_score": round(score, 1),
+            "instruction": (
+                f"Patch completeness: {score:.0f}% ({len(patched_methods)}/{total_gates} gates patched). "
+                + (f"⚠️ {len(unpatched_methods)} UNPATCHED gate methods remain — patch these NOW. "
+                   if unpatched_methods else "All gate methods in this class are patched. ")
+                + (f"⚠️ {len(unpatched_children)} CHILD CLASS gates unpatched — these can override your patches!"
+                   if unpatched_children else "")
+            ),
+        }, ensure_ascii=False, indent=2)[:15000]
+
+    return _safe_call(_run, "validate_patch_completeness")
+
+
+@tool
+def smart_entity_patch(
+    class_descriptor: str,
+    mode: str = "auto",
+    planner_context: str = "",
+) -> str:
+    """One-shot intelligent patching of an entity class and all its gates.
+
+    Combines discover + analyze + patch in a single call:
+    1. Finds all gate methods (boolean/int return with field+branch)
+    2. Determines the correct return value for each (using NEGATIVE/POSITIVE semantics)
+    3. Generates and applies patches for ALL gates at once
+    4. Also patches child class constructors to force field values
+    5. Validates the result
+
+    This is the FASTEST way to bypass an entity class — one tool call instead of 5+.
+    Use mode='preview' to see what would be patched without applying.
+
+    Args:
+        class_descriptor: Smali class descriptor, e.g. 'Lcom/app/UserInfo;'
+        mode: 'auto' (apply all patches), 'preview' (show what would be patched)
+        planner_context: Optional free-form hypothesis from the agent. This is
+            not a keyword list; it can be any runtime note about server sync,
+            lifecycle revalidation, account creation, overwritten fields, etc.
+
+    Returns: JSON with patches_applied or patches_preview, validation results.
+    """
+    def _run():
+        from apk_agent.tools.semantic_graph import find_enforcement_surfaces as _find_surfaces
+        from apk_agent.tools.semantic_cache import get_cached_hidden_state_model as _recover_hidden_state_model
+        from apk_agent.tools.api_response_patcher import patch_api_response_flow as _patch_api_response_flow
+
+        import re
+
+        si = _ensure_smali_index()
+        cls_obj = si.get_class(class_descriptor) if si else None
+        graph = _ensure_graph()
+
+        if not cls_obj:
+            return json.dumps({"success": False, "error": f"Class {class_descriptor} not found. Run build_graph_and_index first."})
+        assert si is not None
+
+        # Semantic keywords for determining positive vs negative
+        _NEGATIVE = {"expired", "expire", "isexpired", "istrial", "istrialing",
+                      "isblocked", "banned", "disabled", "locked", "restricted",
+                      "isads", "showads", "hasads", "needpay", "shouldpay"}
+        _POSITIVE = {"ispremium", "ispro", "isvip", "issvip", "issubscribed",
+                      "isactivated", "isunlocked", "ispurchased", "haslicense",
+                      "ispaid", "isgold", "isplatinum", "unlimited"}
+        _ROLE_PRIORITY = {
+            "gate_method": 0,
+            "revalidation_boundary": 1,
+            "state_mutator": 2,
+            "gate_accessor": 3,
+            "candidate": 4,
+            "legacy_gate": 5,
+        }
+        _EXECUTION_PRIORITY = {
+            "revalidation_boundary": 0,
+            "state_mutator": 1,
+            "gate_method": 2,
+            "gate_accessor": 3,
+            "candidate": 4,
+            "legacy_gate": 5,
+        }
+
+        def _runtime_planner_context() -> str:
+            parts: list[str] = []
+            if planner_context.strip():
+                parts.append(planner_context.strip())
+            scratchpad = _get_scratchpad()
+            for key in (
+                "planner_context",
+                "analysis_hypothesis",
+                "feature_hypothesis",
+                "revalidation_hypothesis",
+                "server_state_notes",
+                "target_state_model",
+            ):
+                value = scratchpad.get(key)
+                if isinstance(value, str) and value.strip():
+                    parts.append(value.strip())
+            deduped: list[str] = []
+            seen: set[str] = set()
+            for part in parts:
+                lowered = part.lower()
+                if lowered in seen:
+                    continue
+                seen.add(lowered)
+                deduped.append(part)
+            return " | ".join(deduped)[:600]
+
+        def _response_override_plan() -> tuple[dict[str, dict], list[dict], dict, list[dict]]:
+            hidden_state_result = _recover_hidden_state_model(
+                si,
+                focus_hint=_runtime_planner_context(),
+                max_candidates=60,
+            )
+            if not hidden_state_result.get("success"):
+                return {}, [], hidden_state_result, []
+
+            candidates: list[dict] = []
+            suppressed_guess_only: list[dict] = []
+            for item in hidden_state_result.get("candidate_state_fields", []):
+                if item.get("class") != class_descriptor:
+                    continue
+                if not bool(item.get("safe_for_auto_override", False)):
+                    if item.get("suggested_unlocked_value") is not None or item.get("likely_unlocked_value") is not None:
+                        suppressed_guess_only.append(item)
+                    continue
+                if item.get("likely_unlocked_value") is None:
+                    continue
+                confidence = float(item.get("confidence", 0) or 0)
+                if confidence < 0.45:
+                    continue
+                writer_tags = {str(tag) for tag in item.get("writer_tags", [])}
+                strategy = str(item.get("recommended_patch_strategy", ""))
+                if strategy != "constructor_or_response_override" and not (writer_tags & {"network", "serialization", "billing"}):
+                    continue
+                candidates.append(item)
+
+            candidates.sort(
+                key=lambda item: (
+                    -float(item.get("confidence", 0) or 0),
+                    -float(item.get("score", 0) or 0),
+                    str(item.get("field", "")),
+                )
+            )
+
+            field_overrides: dict[str, dict] = {}
+            override_preview: list[dict] = []
+            for item in candidates:
+                field_name = str(item.get("field", "")).strip()
+                if not field_name or field_name in field_overrides:
+                    continue
+                field_overrides[field_name] = {
+                    "type": item.get("type", ""),
+                    "value": item.get("likely_unlocked_value"),
+                }
+                override_preview.append({
+                    "field": field_name,
+                    "type": item.get("type", ""),
+                    "value": item.get("likely_unlocked_value"),
+                    "suggested_unlocked_value": item.get("suggested_unlocked_value"),
+                    "semantic_guess": item.get("semantic_guess", "state_value"),
+                    "confidence": item.get("confidence", 0),
+                    "value_origin": item.get("value_origin", "semantic_guess"),
+                    "safe_for_auto_override": item.get("safe_for_auto_override", False),
+                    "exact_value_candidates": item.get("exact_value_candidates", [])[:3],
+                    "recommended_patch_strategy": item.get("recommended_patch_strategy", ""),
+                    "writer_tags": item.get("writer_tags", []),
+                    "reader_tags": item.get("reader_tags", []),
+                })
+                if len(field_overrides) >= 8:
+                    break
+
+            return field_overrides, override_preview, hidden_state_result, suppressed_guess_only
+
+        class_package = ""
+        if class_descriptor.startswith("L") and "/" in class_descriptor:
+            class_package = class_descriptor[1:class_descriptor.rfind("/")]
+
+        def _surface_links_to_class(surface: dict) -> bool:
+            for caller in surface.get("direct_callers", []):
+                if class_descriptor in caller.get("method", ""):
+                    return True
+            for callee in surface.get("direct_callees", []):
+                if class_descriptor == callee.get("class", "") or class_descriptor in callee.get("method", ""):
+                    return True
+            surface_class = str(surface.get("class", ""))
+            return bool(class_package and surface_class.startswith(f"L{class_package}"))
+
+        semantic_context = _runtime_planner_context()
+        semantic_result = _find_surfaces(si, semantic_context, graph=graph, max_results=160)
+        semantic_surfaces = semantic_result.get("surfaces", []) if semantic_result.get("success") else []
+        same_class_surfaces: dict[str, dict] = {}
+        companion_by_method: dict[str, dict] = {}
+
+        for surface in semantic_surfaces:
+            if surface.get("third_party_path"):
+                continue
+            method_sig = surface.get("method", "")
+            if not method_sig:
+                continue
+            if surface.get("class") == class_descriptor:
+                same_class_surfaces[method_sig] = surface
+                continue
+            if surface.get("surface_role") not in {"revalidation_boundary", "state_mutator"}:
+                continue
+            if not _surface_links_to_class(surface):
+                continue
+            companion_by_method[method_sig] = {
+                "method": method_sig,
+                "class": surface.get("class", ""),
+                "file": surface.get("file", ""),
+                "surface_role": surface.get("surface_role", "candidate"),
+                "score": surface.get("score", 0),
+                "api_categories": surface.get("api_categories", []),
+                "reasons": surface.get("reasons", [])[:3],
+                "recommended_tool": (
+                    "patch_api_response_flow"
+                    if surface.get("surface_role") == "revalidation_boundary"
+                    else "trace_field_access"
+                ),
+            }
+
+        companion_surfaces = sorted(
+            companion_by_method.values(),
+            key=lambda item: (_EXECUTION_PRIORITY.get(item["surface_role"], 99), -int(item.get("score", 0)), item["method"]),
+        )[:8]
+        response_field_overrides, response_override_preview, hidden_state_result, suppressed_guess_only = _response_override_plan()
+        auto_response_flow = {
+            "eligible": bool(companion_surfaces and response_field_overrides),
+            "attempted": False,
+            "applied": False,
+            "recommended_tool": "patch_api_response_flow",
+            "field_overrides": response_field_overrides,
+            "override_preview": response_override_preview,
+            "suppressed_guess_only_fields": [str(item.get("field", "")).strip() for item in suppressed_guess_only if str(item.get("field", "")).strip()],
+            "hidden_state_summary": hidden_state_result.get("summary", {}) if isinstance(hidden_state_result, dict) else {},
+        }
+        if companion_surfaces and not response_field_overrides:
+            if suppressed_guess_only:
+                auto_response_flow["reason"] = (
+                    "Companion revalidation/state writers were found, but only heuristic field suggestions were recovered. "
+                    "Automatic response-boundary overrides were disabled to avoid inventing server-facing enum/tier/string values. "
+                    "Trace field writers or compare accepted literals before patching constructors or response handlers."
+                )
+            else:
+                auto_response_flow["reason"] = (
+                    "Companion revalidation/state writers were found, but hidden-state recovery did not yield "
+                    "high-confidence response-boundary field overrides for this class."
+                )
+
+        gates: list[dict] = []
+        patches: list[dict] = []
+
+        for method in cls_obj.methods:
+            if method.name in ("<init>", "<clinit>"):
+                continue
+            if method.return_type not in ("Z", "I"):
+                continue
+
+            has_field = any(i.is_field_access for i in method.instructions)
+            has_branch = any(i.is_branch and i.opcode.startswith("if-") for i in method.instructions)
+            if not (has_field and has_branch):
+                # Also catch simple boolean getters (field read + return)
+                if method.return_type == "Z" and has_field:
+                    pass  # Still treat as gate
+                else:
+                    continue
+
+            # Determine correct return value using semantics
+            name_lower = method.name.lower()
+            if name_lower in _NEGATIVE or any(neg in name_lower for neg in ("expire", "block", "disable", "ban", "ads", "trial")):
+                target_value = 0  # Negative semantics → return false/0
+                semantics = "NEGATIVE"
+            elif name_lower in _POSITIVE or any(pos in name_lower for pos in ("premium", "pro", "vip", "subscribe", "license", "unlock", "paid", "purchase")):
+                target_value = 1  # Positive semantics → return true/1
+                semantics = "POSITIVE"
+            else:
+                target_value = 1  # Default: return true (most gates are "isPremium"-style)
+                semantics = "DEFAULT_POSITIVE"
+
+            surface = same_class_surfaces.get(method.full_signature)
+            if surface is None and same_class_surfaces and semantics == "DEFAULT_POSITIVE":
+                # Semantic surfaces already identified stronger root-cause targets for this class.
+                # Skip neutral fallback gates unless the semantic planner explicitly selected them.
+                continue
+
+            surface_role = surface.get("surface_role", "legacy_gate") if surface else "legacy_gate"
+            selection_source = "semantic_surface" if surface else "legacy_gate_fallback"
+            semantic_score = int(surface.get("score", 0)) if surface else None
+            patch_priority = (
+                0 if selection_source == "semantic_surface" else 1,
+                _ROLE_PRIORITY.get(surface_role, 99),
+                -int(semantic_score or 0),
+                method.signature,
+            )
+
+            gate_info = {
+                "method": method.signature,
+                "return_type": method.return_type,
+                "semantics": semantics,
+                "target_value": target_value,
+                "complexity": method.complexity,
+                "surface_role": surface_role,
+                "selection_source": selection_source,
+                "semantic_score": semantic_score,
+                "semantic_reasons": surface.get("reasons", [])[:3] if surface else [],
+                "plan_tier": "primary" if selection_source == "semantic_surface" else "fallback",
+                "_sort_key": patch_priority,
+            }
+            gates.append(gate_info)
+
+            # Generate smali patch
+            if method.return_type == "Z":
+                patch_code = f"    const/4 v0, {hex(target_value)}  # APK-AGI: smart_entity_patch ({semantics})\n    return v0"
+            else:
+                patch_code = f"    const/4 v0, {hex(target_value)}  # APK-AGI: smart_entity_patch ({semantics})\n    return v0"
+
+            patches.append({
+                "file": cls_obj.abs_path or cls_obj.file_path,
+                "method": method.signature,
+                "patch_code": patch_code,
+                "semantics": semantics,
+                "target_value": target_value,
+                "surface_role": surface_role,
+                "selection_source": selection_source,
+                "semantic_score": semantic_score,
+                "semantic_reasons": surface.get("reasons", [])[:3] if surface else [],
+                "plan_tier": "primary" if selection_source == "semantic_surface" else "fallback",
+                "_sort_key": patch_priority,
+            })
+
+        gates.sort(key=lambda item: item["_sort_key"])
+        patches.sort(key=lambda item: item["_sort_key"])
+        for gate in gates:
+            gate.pop("_sort_key", None)
+        for patch in patches:
+            patch.pop("_sort_key", None)
+
+        execution_order = [
+            {
+                "phase": "pre_gate_followup",
+                "surface_role": surface["surface_role"],
+                "recommended_tool": surface["recommended_tool"],
+                "method": surface["method"],
+                "class": surface["class"],
+                "score": surface["score"],
+                "why": surface["reasons"],
+            }
+            for surface in companion_surfaces
+        ]
+        execution_order.extend(
+            {
+                "phase": "gate_patch",
+                "surface_role": patch["surface_role"],
+                "recommended_tool": "smart_entity_patch",
+                "method": patch["method"],
+                "class": class_descriptor,
+                "score": patch["semantic_score"],
+                "why": patch["semantic_reasons"],
+            }
+            for patch in patches
+        )
+
+        semantic_plan = {
+            "planner_mode": "revalidation_first_semantic_surface",
+            "planner_context": semantic_context,
+            "same_class_semantic_hits": len(same_class_surfaces),
+            "primary_patch_targets": [
+                {
+                    "method": patch["method"],
+                    "surface_role": patch["surface_role"],
+                    "semantic_score": patch["semantic_score"],
+                    "selection_source": patch["selection_source"],
+                    "target_value": patch["target_value"],
+                    "semantics": patch["semantics"],
+                    "reasons": patch["semantic_reasons"],
+                }
+                for patch in patches
+                if patch["selection_source"] == "semantic_surface"
+            ],
+            "fallback_gate_targets": [
+                {
+                    "method": patch["method"],
+                    "surface_role": patch["surface_role"],
+                    "selection_source": patch["selection_source"],
+                    "target_value": patch["target_value"],
+                    "semantics": patch["semantics"],
+                }
+                for patch in patches
+                if patch["selection_source"] != "semantic_surface"
+            ],
+            "companion_followups": companion_surfaces,
+            "execution_order": execution_order,
+            "preferred_first_action": execution_order[0] if execution_order else None,
+            "requires_companion_followups_before_build": bool(companion_surfaces),
+            "role_summary": semantic_result.get("role_summary", {}) if semantic_result.get("success") else {},
+            "auto_response_flow": auto_response_flow,
+            "recommended_followups": (
+                [
+                    "Start with linked revalidation_boundary methods via patch_api_response_flow before relying on gate patches if server/account sync rewrites state.",
+                    "Trace companion state_mutator field writers/readers before build if cached or lifecycle state keeps reverting.",
+                ]
+                if companion_surfaces else
+                []
+            ),
+        }
+
+        preview_instruction = f"Preview: {len(patches)} patches ready. Call again with mode='auto' to apply."
+        if auto_response_flow["eligible"]:
+            preview_instruction = (
+                f"Semantic planner found {len(companion_surfaces)} linked revalidation/state writers and recovered "
+                f"{len(response_field_overrides)} state field override(s) for this class. "
+                "Auto mode will run patch_api_response_flow before gate-only patches so server/account creation cannot restore the free/default state. "
+            ) + preview_instruction
+        elif companion_surfaces and suppressed_guess_only:
+            preview_instruction = (
+                f"Semantic planner found {len(companion_surfaces)} linked revalidation/state writers, but recovered only heuristic field suggestions "
+                f"for {len(suppressed_guess_only)} field(s). Auto mode will not synthesize enum/tier/string values that were not proven by code evidence. "
+            ) + preview_instruction + (
+                " Recover exact accepted values first via field writers/readers before patching constructors or response handlers."
+            )
+        elif companion_surfaces:
+            preview_instruction = (
+                f"Semantic planner ranked {len(companion_surfaces)} linked revalidation/state writers ahead of direct gate patches. "
+                "Start with companion_followups or execution_order[0] before relying on gate-only patches. "
+            ) + preview_instruction + (
+                " Use patch_api_response_flow or trace_field_access before building if server/account creation can overwrite state."
+            )
+
+        if mode == "preview":
+            return json.dumps({
+                "success": True,
+                "mode": "preview",
+                "class": class_descriptor,
+                "total_gates": len(gates),
+                "gates": gates,
+                "semantic_plan": semantic_plan,
+                "patches_preview": patches,
+                "instruction": preview_instruction,
+            }, ensure_ascii=False, indent=2)[:15000]
+
+        # Apply patches
+        applied = []
+        failed = []
+        response_flow_result = None
+
+        if auto_response_flow["eligible"]:
+            auto_response_flow["attempted"] = True
+            response_flow_result = _patch_api_response_flow(
+                si,
+                _project.apktool_dir,
+                class_descriptor,
+                response_field_overrides,
+                strategy="full_pipeline",
+                backup_dir=_project.patch_backup_dir,
+                max_factory_methods=max(8, len(companion_surfaces) * 2),
+                dry_run=False,
+            )
+            auto_response_flow["patch_result"] = response_flow_result
+            auto_response_flow["applied"] = bool(response_flow_result.get("success"))
+            if response_flow_result.get("success"):
+                _patch_journal.append({
+                    "success": True,
+                    "target_file": str(cls_obj.abs_path or cls_obj.file_path),
+                    "description": (
+                        f"smart_entity_patch: response/state-boundary normalization for {class_descriptor} "
+                        f"({len(response_field_overrides)} fields)"
+                    ),
+                    "diff_text": (
+                        f"patch_api_response_flow applied {response_flow_result.get('patches_applied', 0)} response/model-boundary patches"
+                    ),
+                })
+
+        for patch in patches:
+            try:
+                fpath = Path(patch["file"])
+                if not fpath.exists():
+                    # Try resolving
+                    fpath = _resolve_file(patch["file"])
+                content = fpath.read_text(encoding="utf-8", errors="replace")
+
+                # Find the method and replace its body
+                method_name = patch["method"].split("(")[0] if "(" in patch["method"] else patch["method"]
+                # Build pattern to find the method
+                pat = re.compile(
+                    rf'(\.method\s+[^\n]*{re.escape(method_name)}\([^\n]*\n)'
+                    rf'(.*?)'
+                    rf'(\.end method)',
+                    re.DOTALL
+                )
+                m = pat.search(content)
+                if m:
+                    header = m.group(1)
+                    old_body = m.group(2)
+                    # Determine required locals
+                    locals_match = re.search(r'\.locals\s+(\d+)', old_body)
+                    locals_val = max(int(locals_match.group(1)), 1) if locals_match else 1
+                    new_body = f"    .locals {locals_val}\n\n{patch['patch_code']}\n"
+                    new_content = content[:m.start()] + header + new_body + m.group(3) + content[m.end():]
+                    fpath.write_text(new_content, encoding="utf-8")
+
+                    _patch_journal.append({
+                        "success": True,
+                        "target_file": str(fpath),
+                        "description": f"smart_entity_patch: {method_name} → {patch['target_value']} ({patch['semantics']})",
+                        "diff_text": f"Body replaced with const/{patch['target_value']} return",
+                    })
+                    applied.append(patch["method"])
+                else:
+                    failed.append({"method": patch["method"], "reason": "method not found in file"})
+            except Exception as e:
+                failed.append({"method": patch["method"], "reason": str(e)[:100]})
+
+        return json.dumps({
+            "success": True,
+            "mode": "auto",
+            "class": class_descriptor,
+            "total_gates": len(gates),
+            "applied": len(applied),
+            "failed": len(failed),
+            "applied_methods": applied,
+            "failed_methods": failed,
+            "gates": gates,
+            "semantic_plan": semantic_plan,
+            "response_flow": response_flow_result,
+            "instruction": (
+                f"Applied {len(applied)}/{len(gates)} gate patches to {class_descriptor}. "
+                + (
+                    f"Response/model-boundary normalization applied {response_flow_result.get('patches_applied', 0)} patch(es). "
+                    if response_flow_result and response_flow_result.get("success") else
+                    (
+                        "⚠️ Response/model-boundary normalization did not apply cleanly. "
+                        if auto_response_flow["attempted"] else
+                        ""
+                    )
+                )
+                + (f"⚠️ {len(failed)} patches failed — manually patch these." if failed else "")
+                + (" Review companion_followups/execution_order and patch linked revalidation/state writers before build if server or lifecycle code can revert the state." if companion_surfaces else "")
+                + " Now run validate_patch_completeness to verify, then check child classes."
+            ),
+        }, ensure_ascii=False, indent=2)[:15000]
+
+    return _safe_call(_run, "smart_entity_patch")
+
+
+@tool
+def frida_script_generator(class_descriptor: str) -> str:
+    """Generate a Frida hook script to dynamically bypass ALL gate methods of a class.
+
+    Creates a ready-to-use Frida JavaScript that:
+    1. Hooks every gate method in the class
+    2. Forces the correct return value (using NEGATIVE/POSITIVE semantics)
+    3. Includes logging to see when each gate is called
+    4. Handles overloaded methods correctly
+
+    Use this when static patching fails (e.g., the APK uses integrity checks,
+    code obfuscation, or native protection). The generated script works with
+    frida -U -l script.js -f <package>.
+
+    Args:
+        class_descriptor: Smali class descriptor, e.g. 'Lcom/app/UserInfo;'
+
+    Returns: JSON with the generated Frida script and a list of hooked methods.
+    """
+    def _run():
+        si = _ensure_smali_index()
+        cls_obj = si.get_class(class_descriptor) if si else None
+
+        if not cls_obj:
+            return json.dumps({"success": False, "error": f"Class {class_descriptor} not found."})
+
+        java_class = class_descriptor[1:-1].replace("/", ".")
+
+        _NEGATIVE = {"expired", "expire", "isexpired", "istrial",
+                      "isblocked", "banned", "disabled", "locked",
+                      "isads", "showads", "needpay"}
+        _POSITIVE = {"ispremium", "ispro", "isvip", "issubscribed",
+                      "isactivated", "isunlocked", "ispurchased",
+                      "haslicense", "ispaid"}
+
+        hooks: list[dict] = []
+        script_lines = [
+            f'// Frida hook script for {java_class}',
+            f'// Generated by APK-AGI smart_entity_patch',
+            f'// Usage: frida -U -l script.js -f <package_name>',
+            '',
+            'Java.perform(function() {',
+            f'    var cls = Java.use("{java_class}");',
+            '',
+        ]
+
+        for method in cls_obj.methods:
+            if method.name in ("<init>", "<clinit>"):
+                continue
+            if method.return_type not in ("Z", "I"):
+                continue
+
+            has_field = any(i.is_field_access for i in method.instructions)
+            if not has_field:
+                continue
+
+            name_lower = method.name.lower()
+            if name_lower in _NEGATIVE or any(n in name_lower for n in ("expire", "block", "disable", "ads", "trial")):
+                ret_val = "false" if method.return_type == "Z" else "0"
+                semantics = "NEGATIVE"
+            elif name_lower in _POSITIVE or any(p in name_lower for p in ("premium", "pro", "vip", "subscribe", "license", "unlock")):
+                ret_val = "true" if method.return_type == "Z" else "1"
+                semantics = "POSITIVE"
+            else:
+                ret_val = "true" if method.return_type == "Z" else "1"
+                semantics = "DEFAULT"
+
+            # Parse parameter types for overload
+            param_part = method.signature.split("(")[1].split(")")[0] if "(" in method.signature else ""
+            java_params = []
+            i = 0
+            while i < len(param_part):
+                if param_part[i] == "L":
+                    end = param_part.index(";", i)
+                    java_params.append('"' + param_part[i + 1:end].replace("/", ".") + '"')
+                    i = end + 1
+                elif param_part[i] == "[":
+                    java_params.append('"[TODO]"')
+                    i += 2
+                elif param_part[i] == "Z":
+                    java_params.append('"boolean"')
+                    i += 1
+                elif param_part[i] == "I":
+                    java_params.append('"int"')
+                    i += 1
+                elif param_part[i] == "J":
+                    java_params.append('"long"')
+                    i += 1
+                else:
+                    i += 1
+
+            overload = f'.overload({", ".join(java_params)})' if java_params else ""
+
+            script_lines.append(f'    // {semantics}: {method.signature}')
+            script_lines.append(f'    cls.{method.name}{overload}.implementation = function() {{')
+            script_lines.append(f'        console.log("[APK-AGI] {method.name} called → returning {ret_val}");')
+            script_lines.append(f'        return {ret_val};')
+            script_lines.append(f'    }};')
+            script_lines.append('')
+
+            hooks.append({
+                "method": method.name,
+                "signature": method.signature,
+                "return_value": ret_val,
+                "semantics": semantics,
+            })
+
+        script_lines.append('    console.log("[APK-AGI] All hooks installed for ' + java_class + '");')
+        script_lines.append('});')
+
+        script_text = "\n".join(script_lines)
+
+        # Save to outputs
+        out_dir = _project.workspace_path / "outputs"
+        out_dir.mkdir(exist_ok=True)
+        safe_name = java_class.replace(".", "_")
+        script_file = out_dir / f"frida_hook_{safe_name}.js"
+        script_file.write_text(script_text, encoding="utf-8")
+
+        return json.dumps({
+            "success": True,
+            "class": class_descriptor,
+            "java_class": java_class,
+            "hooks_count": len(hooks),
+            "hooks": hooks,
+            "script_file": str(script_file),
+            "script_preview": script_text[:3000],
+            "instruction": (
+                f"Generated Frida script with {len(hooks)} hooks for {java_class}. "
+                f"Saved to {script_file.name}. "
+                f"Run with: frida -U -l {script_file.name} -f <package_name>"
+            ),
+        }, ensure_ascii=False, indent=2)[:15000]
+
+    return _safe_call(_run, "frida_script_generator")
+
+
+@tool
+def diff_apk_variants(apk_path_1: str, apk_path_2: str) -> str:
+    """Compare two APK files (e.g., free vs premium) to find subscription differences.
+
+    Decompiles both APKs with apktool and diffs the smali code to find:
+    1. Classes that only exist in the premium version
+    2. Methods that differ between versions
+    3. Field values that change (hardcoded premium flags)
+    4. Resource differences (layouts, strings, feature toggles)
+
+    This is the ULTIMATE reverse engineering shortcut — by comparing free and paid
+    versions you can see EXACTLY what the developers change for premium.
+
+    Args:
+        apk_path_1: Path to first APK (e.g., free version)
+        apk_path_2: Path to second APK (e.g., premium version)
+
+    Returns: JSON with diffs — added_classes, removed_classes, changed_methods,
+    changed_fields, changed_resources.
+    """
+    def _run():
+        import subprocess
+        import tempfile
+
+        apk1 = Path(apk_path_1)
+        apk2 = Path(apk_path_2)
+        if not apk1.exists():
+            return json.dumps({"success": False, "error": f"APK not found: {apk_path_1}"})
+        if not apk2.exists():
+            return json.dumps({"success": False, "error": f"APK not found: {apk_path_2}"})
+
+        # Decompile both to temp dirs
+        tmp1 = Path(tempfile.mkdtemp(prefix="apk_diff_1_"))
+        tmp2 = Path(tempfile.mkdtemp(prefix="apk_diff_2_"))
+
+        apktool_jar = _project.workspace_path.parent.parent / "tools" / "bin" / "apktool.jar"
+        for apk_path, out_dir in [(apk1, tmp1), (apk2, tmp2)]:
+            cmd = ["java", "-jar", str(apktool_jar), "d", str(apk_path), "-o", str(out_dir), "-f", "--no-res"]
+            try:
+                subprocess.run(cmd, capture_output=True, timeout=120, check=True)
+            except Exception as e:
+                return json.dumps({"success": False, "error": f"Failed to decompile {apk_path.name}: {e}"})
+
+        # Collect all smali files from both
+        def get_smali_files(base: Path) -> dict[str, Path]:
+            files = {}
+            for sd in base.iterdir():
+                if sd.is_dir() and sd.name.startswith("smali"):
+                    for f in sd.rglob("*.smali"):
+                        rel = str(f.relative_to(base)).replace("\\", "/")
+                        files[rel] = f
+            return files
+
+        files1 = get_smali_files(tmp1)
+        files2 = get_smali_files(tmp2)
+
+        only_in_2 = [k for k in files2 if k not in files1]  # Added in premium
+        only_in_1 = [k for k in files1 if k not in files2]  # Removed in premium
+        common = [k for k in files1 if k in files2]
+
+        # Diff common files
+        changed_methods: list[dict] = []
+        changed_fields: list[dict] = []
+
+        for rel in common[:500]:
+            try:
+                c1 = files1[rel].read_text(encoding="utf-8", errors="replace")
+                c2 = files2[rel].read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            if c1 == c2:
+                continue
+
+            # Find differing methods
+            import re
+            methods1 = {m.group(1): m.group(0) for m in re.finditer(r'\.method\s+(.*?)\n(.*?)\.end method', c1, re.DOTALL)}
+            methods2 = {m.group(1): m.group(0) for m in re.finditer(r'\.method\s+(.*?)\n(.*?)\.end method', c2, re.DOTALL)}
+
+            for method_sig in methods1:
+                if method_sig in methods2 and methods1[method_sig] != methods2[method_sig]:
+                    changed_methods.append({
+                        "file": rel,
+                        "method": method_sig[:80],
+                        "size_diff": len(methods2[method_sig]) - len(methods1[method_sig]),
+                    })
+
+            # Find differing field declarations
+            fields1 = set(re.findall(r'\.field\s+(.+)', c1))
+            fields2 = set(re.findall(r'\.field\s+(.+)', c2))
+            for f in fields2 - fields1:
+                changed_fields.append({"file": rel, "field": f[:80], "change": "added_in_v2"})
+            for f in fields1 - fields2:
+                changed_fields.append({"file": rel, "field": f[:80], "change": "removed_in_v2"})
+
+        # Clean up temp dirs
+        import shutil
+        try:
+            shutil.rmtree(tmp1)
+            shutil.rmtree(tmp2)
+        except Exception:
+            pass
+
+        # Filter to app classes only
+        only_in_2_filtered = [f for f in only_in_2 if not any(
+            f.startswith(f"smali/{p}") for p in ("android/", "androidx/", "com/google/", "kotlin/")
+        )][:50]
+
+        return json.dumps({
+            "success": True,
+            "apk1": apk1.name,
+            "apk2": apk2.name,
+            "total_files_apk1": len(files1),
+            "total_files_apk2": len(files2),
+            "classes_only_in_apk2": only_in_2_filtered[:30],
+            "classes_only_in_apk1": only_in_1[:10],
+            "changed_methods": changed_methods[:50],
+            "changed_fields": changed_fields[:30],
+            "instruction": (
+                f"Compared {apk1.name} vs {apk2.name}: "
+                f"{len(only_in_2_filtered)} classes only in v2, "
+                f"{len(changed_methods)} method diffs, {len(changed_fields)} field diffs. "
+                f"Focus on changed methods with boolean/int returns — these are likely the premium gates."
+            ),
+        }, ensure_ascii=False, indent=2)[:20000]
+
+    return _safe_call(_run, "diff_apk_variants")
+
+
+# ---------------------------------------------------------------------------
 # SOTA Analysis tools (SmaliIndex IR, Unified Scanner, Data Flow, etc.)
 # ---------------------------------------------------------------------------
 
@@ -5896,7 +9773,6 @@ def build_smali_index() -> str:
     total_instructions, total_strings, total_api_targets,
     method_categories (dict of category→count), built_at (timestamp).
     """
-    global _smali_index
     from apk_agent.tools.smali_ir import build_index as build_smali_idx, save_index as save_smali_idx, index_stats
 
     smali_dirs = _get_all_smali_dirs()
@@ -5904,14 +9780,22 @@ def build_smali_index() -> str:
         return json.dumps({"success": False, "error": "No smali directories found. Run apktool_decompile first."})
 
     def _run():
-        global _smali_index
         from apk_agent.progress import report_progress
         idx = build_smali_idx(smali_dirs, progress_callback=report_progress)
-        out_path = Path(_project.outputs_dir) / "smali_index.pickle"
-        save_smali_idx(idx, out_path)
-        _smali_index = idx
+        clear_runtime_slots(
+            "semantic_architecture_cache",
+            "hidden_state_model_cache",
+            "guard_surface_profile_cache",
+            "architecture_context_cache",
+        )
+        set_runtime_slot("smali_index", idx)
+        out_path = _project_outputs_dir() / "smali_index.pickle"
+        save_result = save_smali_idx(idx, out_path)
         stats = index_stats(idx)
         stats["success"] = True
+        stats["persisted"] = save_result.get("success", False)
+        if not save_result.get("success", True):
+            stats["persistence_warning"] = save_result.get("recovery_hint", "SmaliIndex was built but not persisted to disk.")
         return json.dumps(stats, indent=2)
     return _safe_call(_run, "build_smali_index")
 
@@ -5970,6 +9854,61 @@ def unified_scan(severity_filter: Optional[str] = None, max_findings: int = 500)
         result = scan(idx, severity_filter=severity_filter, max_findings=max_findings)
         return json.dumps(result, ensure_ascii=False, indent=2)[:30000]
     return _safe_call(_run, "unified_scan", _cache_hint=f"{severity_filter}:{max_findings}")
+
+
+@tool
+def get_threat_model() -> str:
+    """Classify the APK's threat level based on unified scanner findings.
+    Returns: basic (no protections), obfuscated (name-mangling, string encryption),
+    or hardened (anti-tamper, anti-debug, native guards + obfuscation).
+
+    When to use: After running unified_scan, call this to understand the APK's
+    overall security posture and decide which analysis branches are needed.
+    Requires build_smali_index and unified_scan to have run first.
+
+    Returns: JSON with threat_level, category_signals, recommendation.
+    """
+    from apk_agent.tools.unified_scanner import scan, classify_threat_model, ThreatLevel
+
+    def _run():
+        idx = _ensure_smali_index()
+        if idx is None:
+            return json.dumps({"success": False, "error": "No SmaliIndex. Run build_smali_index first."})
+        result = scan(idx, max_findings=200)
+        if not result.get("success"):
+            return json.dumps({"success": False, "error": "Scan failed"})
+
+        # Reconstruct Finding objects from dicts for classification
+        from apk_agent.tools.unified_scanner import Finding
+        findings_objs = []
+        for fd in result.get("findings", []):
+            findings_objs.append(Finding(
+                id=fd["id"], rule_id=fd["rule_id"],
+                severity=fd["severity"], category=fd["category"],
+                title=fd["title"], description=fd.get("description", ""),
+                cwe=fd.get("cwe", ""),
+                tags=fd.get("tags", []),
+            ))
+
+        threat = classify_threat_model(findings_objs)
+
+        # Build recommendation
+        recs = {
+            ThreatLevel.BASIC: "Standard static analysis + patching. No special bypass needed.",
+            ThreatLevel.OBFUSCATED: "Use deep_analysis tools + string decryption. Consider targeted deobfuscation before patching.",
+            ThreatLevel.HARDENED: "Full anti-tamper bypass required. Use auto_bypass_plan, analyze native libs, and consider Frida hooks for runtime validation.",
+        }
+
+        cats = {fd["category"] for fd in result.get("findings", [])}
+        return json.dumps({
+            "success": True,
+            "threat_level": threat.value,
+            "category_signals": sorted(cats),
+            "total_findings": result["total_findings"],
+            "severity_summary": result.get("severity_summary", {}),
+            "recommendation": recs.get(threat, ""),
+        }, indent=2)
+    return _safe_call(_run, "get_threat_model")
 
 
 @tool
@@ -6073,7 +10012,11 @@ def find_hardcoded_crypto() -> str:
 
 
 @tool
-def generate_bypass_plans(max_bypasses: int = 50) -> str:
+def generate_bypass_plans(
+    max_bypasses: int = 50,
+    premium_semantic_feature: str = "",
+    max_premium_classes: int = 3,
+) -> str:
     """Generate automated bypass plans (smali patches + Frida scripts) for
     detected security protections. Runs unified_scan first, then generates
     bypasses for: root detection, emulator detection, debug detection,
@@ -6085,25 +10028,174 @@ def generate_bypass_plans(max_bypasses: int = 50) -> str:
 
     Args:
         max_bypasses: Maximum bypass plans to generate (default 50).
+        premium_semantic_feature: Optional premium/license feature context to
+            augment the output with the same semantic planner used by
+            smart_entity_patch. Leave empty to preserve the current behavior.
+        max_premium_classes: Maximum candidate entity/state classes to include
+            when premium_semantic_feature is enabled.
 
     Returns: JSON with keys: success, total_bypasses, by_type (dict of protection_type→count),
     bypasses (array of {type, target_class, target_method, difficulty (easy/medium/hard),
     smali_patch (ready-to-apply patch plan JSON), frida_script (JavaScript hook code),
-    description}).
+    description}). When premium_semantic_feature is enabled, the response also
+    includes premium_semantic_summary and premium_semantic_workflows without
+    changing the default security bypass behavior.
     """
     from apk_agent.tools.unified_scanner import scan
     from apk_agent.tools.auto_bypass import generate_bypasses
+    from apk_agent.tools.semantic_cache import get_cached_hidden_state_model as _recover_hidden_state_model
+
+    def _build_premium_semantic_workflows(index) -> dict:
+        feature = premium_semantic_feature.strip()
+        if not feature:
+            return {"enabled": False, "workflows": []}
+
+        hidden_state_result = _recover_hidden_state_model(
+            index,
+            focus_hint=feature,
+            max_candidates=max(24, max_premium_classes * 8),
+        )
+        if not hidden_state_result.get("success"):
+            return {
+                "enabled": True,
+                "feature": feature,
+                "workflow_count": 0,
+                "hidden_state_summary": {},
+                "ranked_classes": [],
+                "errors": [hidden_state_result.get("error", "recover_hidden_state_model failed")],
+                "workflows": [],
+            }
+
+        ranked_classes: dict[str, dict] = {}
+        for model in hidden_state_result.get("candidate_models", []):
+            class_name = str(model.get("class", "")).strip()
+            if not class_name:
+                continue
+            ranked_classes[class_name] = {
+                "class": class_name,
+                "file": model.get("file", ""),
+                "ranking_score": float(model.get("score", 0) or 0),
+                "best_field_confidence": 0.0,
+                "semantic_guesses": set(),
+                "field_candidates": [],
+            }
+
+        for field in hidden_state_result.get("candidate_state_fields", []):
+            class_name = str(field.get("class", "")).strip()
+            if not class_name:
+                continue
+            entry = ranked_classes.setdefault(class_name, {
+                "class": class_name,
+                "file": field.get("file", ""),
+                "ranking_score": 0.0,
+                "best_field_confidence": 0.0,
+                "semantic_guesses": set(),
+                "field_candidates": [],
+            })
+            confidence = float(field.get("confidence", 0) or 0)
+            entry["ranking_score"] += float(field.get("score", 0) or 0) + confidence * 10
+            entry["best_field_confidence"] = max(entry["best_field_confidence"], confidence)
+            semantic_guess = str(field.get("semantic_guess", "")).strip()
+            if semantic_guess:
+                entry["semantic_guesses"].add(semantic_guess)
+            if len(entry["field_candidates"]) < 6:
+                entry["field_candidates"].append({
+                    "field": field.get("field", ""),
+                    "type": field.get("type", ""),
+                    "semantic_guess": field.get("semantic_guess", "state_value"),
+                    "likely_unlocked_value": field.get("likely_unlocked_value"),
+                    "suggested_unlocked_value": field.get("suggested_unlocked_value"),
+                    "value_origin": field.get("value_origin", "semantic_guess"),
+                    "safe_for_auto_override": field.get("safe_for_auto_override", False),
+                    "exact_value_candidates": field.get("exact_value_candidates", [])[:3],
+                    "confidence": confidence,
+                    "recommended_patch_strategy": field.get("recommended_patch_strategy", ""),
+                    "writer_tags": field.get("writer_tags", []),
+                    "reader_tags": field.get("reader_tags", []),
+                })
+
+        ranked = sorted(
+            ranked_classes.values(),
+            key=lambda item: (-item["ranking_score"], -item["best_field_confidence"], item["class"]),
+        )[:max(1, max_premium_classes)]
+
+        workflows: list[dict] = []
+        errors: list[str] = []
+        for entry in ranked:
+            preview_raw = smart_entity_patch.invoke({
+                "class_descriptor": entry["class"],
+                "mode": "preview",
+                "planner_context": feature,
+            })
+            try:
+                preview = json.loads(preview_raw)
+            except json.JSONDecodeError:
+                errors.append(f"smart_entity_patch preview returned invalid JSON for {entry['class']}")
+                continue
+            if not preview.get("success"):
+                errors.append(f"{entry['class']}: {preview.get('error', 'smart_entity_patch preview failed')}")
+                continue
+            workflows.append({
+                "class": entry["class"],
+                "file": entry["file"],
+                "ranking_score": round(float(entry["ranking_score"]), 2),
+                "best_field_confidence": round(float(entry["best_field_confidence"]), 3),
+                "semantic_guesses": sorted(entry["semantic_guesses"]),
+                "field_candidates": entry["field_candidates"],
+                "semantic_plan": preview.get("semantic_plan", {}),
+                "patches_preview": preview.get("patches_preview", []),
+                "instruction": preview.get("instruction", ""),
+            })
+
+        return {
+            "enabled": True,
+            "feature": feature,
+            "workflow_count": len(workflows),
+            "hidden_state_summary": hidden_state_result.get("summary", {}),
+            "ranked_classes": [
+                {
+                    "class": entry["class"],
+                    "file": entry["file"],
+                    "ranking_score": round(float(entry["ranking_score"]), 2),
+                    "best_field_confidence": round(float(entry["best_field_confidence"]), 3),
+                    "semantic_guesses": sorted(entry["semantic_guesses"]),
+                }
+                for entry in ranked
+            ],
+            "errors": errors[:10],
+            "workflows": workflows,
+        }
 
     def _run():
         idx = _ensure_smali_index()
         if idx is None:
             return json.dumps({"success": False, "error": "No SmaliIndex. Run build_smali_index first."})
+        premium_semantic = _build_premium_semantic_workflows(idx)
         # First run the scanner to get findings
         scan_result = scan(idx)
         findings = scan_result.get("findings", [])
-        if not findings:
+        if not findings and not premium_semantic.get("enabled"):
             return json.dumps({"success": True, "bypasses": [], "message": "No security protections detected to bypass."})
-        result = generate_bypasses(idx, findings, max_bypasses=max_bypasses)
+        result = generate_bypasses(idx, findings, max_bypasses=max_bypasses) if findings else {
+            "success": True,
+            "total_bypasses": 0,
+            "by_type": {},
+            "bypasses": [],
+        }
+        if premium_semantic.get("enabled"):
+            result["premium_semantic_summary"] = {
+                key: value for key, value in premium_semantic.items() if key != "workflows"
+            }
+            result["premium_semantic_workflows"] = premium_semantic.get("workflows", [])
+            if not findings:
+                if premium_semantic.get("workflow_count", 0) > 0:
+                    result["message"] = (
+                        "No auto-patchable security protections were detected, but optional premium semantic workflows were generated."
+                    )
+                else:
+                    result["message"] = (
+                        "No security protections detected to bypass, and the optional premium semantic planner did not find usable workflows."
+                    )
         return json.dumps(result, ensure_ascii=False, indent=2)[:30000]
     return _safe_call(_run, "generate_bypass_plans")
 
@@ -6171,6 +10263,627 @@ def scan_cloud_secrets() -> str:
     return _safe_call(_run, "scan_cloud_secrets")
 
 
+@tool
+def semantic_method_slice(class_name: str, method_name: str, max_depth: int = 2) -> str:
+    """Build a graph-aware semantic slice for one method.
+
+    Uses SmaliIndex + the call graph + CFG info together. This is more context-aware
+    than plain search because it combines:
+      - method body semantics
+      - direct callers / direct callees
+      - branch blocks / gate signals
+      - field-backed and network-backed enforcement hints
+
+    When to use: After identifying a suspicious method and BEFORE patching it.
+    Prefer this over raw file reading when you need to understand whether the
+    method is a true enforcement point or just a helper.
+    """
+    from apk_agent.tools.semantic_graph import semantic_method_slice as _semantic_slice
+
+    def _run():
+        idx = _ensure_smali_index()
+        if idx is None:
+            return json.dumps({"success": False, "error": "No SmaliIndex. Run build_smali_index first."})
+        graph = _ensure_graph()
+        result = _semantic_slice(idx, class_name, method_name, graph=graph, max_depth=max_depth)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
+    return _safe_call(_run, "semantic_method_slice", _cache_hint=f"{class_name}:{method_name}:{max_depth}")
+
+
+@tool
+def find_enforcement_surfaces(feature: str = "", extra_keywords: str = "", max_results: int = 25) -> str:
+    """Find likely enforcement surfaces using architecture/state/revalidation scoring.
+
+    This complements `map_feature_checks` instead of replacing it:
+      - `map_feature_checks` is broad and exhaustive
+      - `find_enforcement_surfaces` ranks the most likely REAL enforcement methods
+
+    When to use: Before writing patches for premium/license/root/anti-tamper paths,
+    especially when there are too many hits and you need the most likely
+    enforcement surfaces first.
+
+    Notes:
+      - `feature` is optional and may be blank.
+      - `feature` and `extra_keywords` are free-form agent context, not a fixed keyword list.
+      - You may pass your own runtime hypothesis (symptoms, lifecycle guess, API names,
+        server overwrite suspicion, account creation notes, etc.) or leave both empty.
+    """
+    from apk_agent.tools.semantic_graph import find_enforcement_surfaces as _find_surfaces
+
+    def _run():
+        idx = _ensure_smali_index()
+        if idx is None:
+            return json.dumps({"success": False, "error": "No SmaliIndex. Run build_smali_index first."})
+        graph = _ensure_graph()
+        result = _find_surfaces(
+            idx,
+            feature,
+            graph=graph,
+            extra_keywords=extra_keywords,
+            max_results=max_results,
+        )
+        return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
+
+    return _safe_call(_run, "find_enforcement_surfaces", _cache_hint=f"{feature}:{extra_keywords}:{max_results}")
+
+
+@tool
+def validate_patch_pipeline(target_class: str = "", include_global_gate_check: bool = False) -> str:
+    """Run layered patch validation without replacing the old validators.
+
+    This is a pipeline wrapper over the existing validation stack:
+      1. patch journal / backup discovery of touched files
+      2. syntax validation of patched smali
+            3. optional class-level completeness (`validate_patch_completeness`)
+            4. optional global gate scan (`verify_bypass_completeness`)
+
+    It complements `validate_patch`, `validate_patch_completeness`, and
+    `verify_bypass_completeness`; it does NOT remove or replace them.
+    """
+    from apk_agent.tools.validation_pipeline import run_patch_validation_pipeline
+
+    def _run():
+        result = run_patch_validation_pipeline(
+            project_root=Path(_project.workspace_path),
+            apktool_dir=_project.apktool_dir,
+            backup_dir=_project.patch_backup_dir,
+            patch_journal=list(_patch_journal),
+        )
+
+        if target_class:
+            try:
+                class_check_raw = validate_patch_completeness.invoke({"target_class": target_class})
+                result["class_completeness"] = json.loads(class_check_raw)
+            except Exception as exc:
+                result["class_completeness"] = {"success": False, "error": f"validate_patch_completeness failed: {exc}"}
+
+        if include_global_gate_check:
+            try:
+                global_check_raw = verify_bypass_completeness.invoke({})
+                result["global_gate_check"] = json.loads(global_check_raw)
+            except Exception as exc:
+                result["global_gate_check"] = {"success": False, "error": f"verify_bypass_completeness failed: {exc}"}
+
+        return json.dumps(result, ensure_ascii=False, indent=2)[:30000]
+    return _safe_call(_run, "validate_patch_pipeline", _cache_hint=f"{target_class}:{include_global_gate_check}:{len(_patch_journal)}")
+
+
+@tool
+def generate_runtime_validation_plan(task: str = "") -> str:
+    """Generate a structured runtime validation checklist from patch history.
+
+    This is intentionally additive and safe: it does not execute anything on the
+    host or device. It turns the current patch history into a concrete runtime
+    test checklist so dynamic verification can be done consistently.
+    """
+    from apk_agent.tools.validation_pipeline import generate_runtime_validation_plan as _runtime_plan
+
+    def _run():
+        result = _runtime_plan(patch_journal=list(_patch_journal), task=task)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:20000]
+    return _safe_call(_run, "generate_runtime_validation_plan", _cache_hint=f"{task}:{len(_patch_journal)}")
+
+
+@tool
+def map_semantic_architecture(focus_hint: str = "", max_per_role: int = 12) -> str:
+    """Build a semantic architecture map from SmaliIndex behavior.
+
+    Identifies high-value layers such as entry points, network boundaries,
+    serialization, state models, state stores, UI gate controllers, security
+    guards, dynamic/native boundaries, and billing flow.
+    """
+    from apk_agent.tools.semantic_cache import get_cached_semantic_architecture as _map
+
+    def _run():
+        idx = _ensure_smali_index()
+        if idx is None:
+            return json.dumps({"success": False, "error": "No SmaliIndex. Run build_smali_index first."})
+        result = _map(idx, focus_hint=focus_hint, max_per_role=max_per_role)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
+
+    return _safe_call(_run, "map_semantic_architecture", _cache_hint=f"{focus_hint}:{max_per_role}")
+
+
+@tool
+def recover_hidden_state_model(focus_hint: str = "", max_candidates: int = 30) -> str:
+    """Recover hidden state/entity fields using behavioral signals.
+
+    Works on obfuscated APKs by inferring field meaning from read/write context,
+    network and serialization boundaries, billing adjacency, and UI consumers.
+    """
+    from apk_agent.tools.semantic_cache import get_cached_hidden_state_model as _recover
+
+    def _run():
+        idx = _ensure_smali_index()
+        if idx is None:
+            return json.dumps({"success": False, "error": "No SmaliIndex. Run build_smali_index first."})
+        result = _recover(idx, focus_hint=focus_hint, max_candidates=max_candidates)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
+
+    return _safe_call(_run, "recover_hidden_state_model", _cache_hint=f"{focus_hint}:{max_candidates}")
+
+
+@tool
+def profile_guard_and_revalidation_surface(focus_hint: str = "", max_clusters: int = 30) -> str:
+    """Profile guard clusters, runtime revalidation, and state overwrite points."""
+    from apk_agent.tools.semantic_cache import get_cached_guard_surface_profile as _profile
+
+    def _run():
+        idx = _ensure_smali_index()
+        if idx is None:
+            return json.dumps({"success": False, "error": "No SmaliIndex. Run build_smali_index first."})
+        result = _profile(idx, focus_hint=focus_hint, max_clusters=max_clusters)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
+
+    return _safe_call(_run, "profile_guard_and_revalidation_surface", _cache_hint=f"{focus_hint}:{max_clusters}")
+
+
+@tool
+def build_app_knowledge_pack(
+    focus_hint: str = "",
+    max_state_fields: int = 40,
+    max_guard_clusters: int = 40,
+) -> str:
+    """Build and persist the additive Application Knowledge Pack for the current APK.
+
+    This does not replace any existing tool. It composes semantic architecture,
+    hidden state recovery, and guard/revalidation profiling into one reusable,
+    evidence-backed knowledge layer for later queries.
+    """
+    from apk_agent.tools.app_knowledge import (
+        build_app_knowledge_pack as _build_app_knowledge_pack,
+        save_app_knowledge_pack,
+        summarize_app_knowledge_pack,
+    )
+
+    def _run():
+        idx = _ensure_smali_index()
+        if idx is None:
+            return json.dumps({"success": False, "error": "No SmaliIndex. Run build_smali_index first."})
+
+        pack = _build_app_knowledge_pack(
+            idx,
+            focus_hint=focus_hint,
+            package_name=str(getattr(_project, "package_name", "") or ""),
+            app_label=str(getattr(_project, "apk_name", "") or ""),
+            max_state_fields=max_state_fields,
+            max_guard_clusters=max_guard_clusters,
+        )
+        pack_path = _app_knowledge_pack_path()
+        save_result = save_app_knowledge_pack(pack, pack_path)
+        set_runtime_slot("app_knowledge_pack", pack)
+        return json.dumps({
+            "success": True,
+            "output_path": str(pack_path),
+            "persisted": save_result.get("success", False),
+            "persist_result": save_result,
+            "summary": summarize_app_knowledge_pack(pack).get("summary", {}),
+            "identity": pack.get("identity", {}),
+            "workflows": pack.get("knowledge", {}).get("workflows", []),
+            "warnings": pack.get("warnings", []),
+        }, ensure_ascii=False, indent=2)[:25000]
+
+    return _safe_call(
+        _run,
+        "build_app_knowledge_pack",
+        _cache_hint=f"{focus_hint}:{max_state_fields}:{max_guard_clusters}",
+    )
+
+
+@tool
+def summarize_app_knowledge() -> str:
+    """Return a compact summary of the persisted Application Knowledge Pack."""
+    from apk_agent.tools.app_knowledge import summarize_app_knowledge_pack as _summarize_app_knowledge_pack
+
+    def _run():
+        pack = _ensure_app_knowledge_pack(auto_build=True)
+        if pack is None:
+            return json.dumps({"success": False, "error": "Application Knowledge Pack unavailable. Build it first."})
+        result = _summarize_app_knowledge_pack(pack)
+        result["output_path"] = str(_app_knowledge_pack_path())
+        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
+
+    return _safe_call(_run, "summarize_app_knowledge")
+
+
+@tool
+def query_app_knowledge(
+    query: str,
+    feature: str = "",
+    class_name: str = "",
+    method_name: str = "",
+    max_results: int = 8,
+) -> str:
+    """Query the additive Application Knowledge Pack for deep, app-specific answers.
+
+    Use this when you want app-level understanding rather than another raw file
+    search. The tool searches the persisted knowledge records built from the
+    current analyzers and returns ranked evidence-backed matches.
+    """
+    from apk_agent.tools.app_knowledge import query_app_knowledge as _query_app_knowledge
+
+    def _run():
+        pack = _ensure_app_knowledge_pack(auto_build=True, focus_hint=feature or query)
+        if pack is None:
+            return json.dumps({"success": False, "error": "Application Knowledge Pack unavailable. Run build_app_knowledge_pack first."})
+        result = _query_app_knowledge(
+            pack,
+            query=query,
+            feature=feature,
+            class_name=class_name,
+            method_name=method_name,
+            max_results=max_results,
+        )
+        result["output_path"] = str(_app_knowledge_pack_path())
+        return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
+
+    return _safe_call(
+        _run,
+        "query_app_knowledge",
+        _cache_hint=f"{query}:{feature}:{class_name}:{method_name}:{max_results}",
+    )
+
+
+@tool
+def build_behavior_graph(
+    focus_hint: str = "",
+    max_surfaces: int = 25,
+    max_controls: int = 40,
+    max_transitions: int = 80,
+) -> str:
+    """Build and persist the unified behavior graph for the current APK.
+
+    This consolidates control-flow reasoning, state recovery, enforcement
+    surfaces, runtime revalidation, network-to-state boundaries, and semantic
+    symbol hints into one reusable pack.
+    """
+    from apk_agent.tools.behavior_engine import (
+        build_behavior_graph as _build_behavior_graph,
+        save_behavior_graph,
+        summarize_behavior_graph,
+    )
+
+    def _run():
+        idx = _ensure_smali_index()
+        if idx is None:
+            return json.dumps({"success": False, "error": "No SmaliIndex. Run build_smali_index first."})
+
+        graph = _ensure_graph()
+        pack = _build_behavior_graph(
+            idx,
+            graph=graph,
+            focus_hint=focus_hint,
+            package_name=str(getattr(_project, "package_name", "") or ""),
+            app_label=str(getattr(_project, "apk_name", "") or ""),
+            max_surfaces=max_surfaces,
+            max_controls=max_controls,
+            max_transitions=max_transitions,
+        )
+        pack_path = _behavior_graph_path()
+        save_result = save_behavior_graph(pack, pack_path)
+        set_runtime_slot("behavior_graph_pack", pack)
+        return json.dumps({
+            "success": True,
+            "output_path": str(pack_path),
+            "persisted": save_result.get("success", False),
+            "persist_result": save_result,
+            "summary": summarize_behavior_graph(pack).get("summary", {}),
+            "identity": pack.get("identity", {}),
+            "warnings": pack.get("warnings", []),
+        }, ensure_ascii=False, indent=2)[:25000]
+
+    return _safe_call(
+        _run,
+        "build_behavior_graph",
+        _cache_hint=f"{focus_hint}:{max_surfaces}:{max_controls}:{max_transitions}",
+    )
+
+
+@tool
+def summarize_behavior_graph() -> str:
+    """Return a compact summary of the persisted unified behavior graph."""
+    from apk_agent.tools.behavior_engine import summarize_behavior_graph as _summarize_behavior_graph
+
+    def _run():
+        pack = _ensure_behavior_graph_pack(auto_build=True)
+        if pack is None:
+            return json.dumps({"success": False, "error": "Behavior graph unavailable. Build it first."})
+        result = _summarize_behavior_graph(pack)
+        result["output_path"] = str(_behavior_graph_path())
+        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
+
+    return _safe_call(_run, "summarize_behavior_graph")
+
+
+@tool
+def query_behavior_graph(
+    query: str,
+    feature: str = "",
+    class_name: str = "",
+    method_name: str = "",
+    record_type: str = "",
+    max_results: int = 10,
+) -> str:
+    """Run a graph-aware semantic query over the unified behavior graph."""
+    from apk_agent.tools.behavior_engine import query_behavior_graph as _query_behavior_graph
+
+    def _run():
+        pack = _ensure_behavior_graph_pack(auto_build=True, focus_hint=feature or query)
+        if pack is None:
+            return json.dumps({"success": False, "error": "Behavior graph unavailable. Run build_behavior_graph first."})
+        result = _query_behavior_graph(
+            pack,
+            query=query,
+            feature=feature,
+            class_name=class_name,
+            method_name=method_name,
+            record_type=record_type,
+            max_results=max_results,
+        )
+        result["output_path"] = str(_behavior_graph_path())
+        return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
+
+    return _safe_call(
+        _run,
+        "query_behavior_graph",
+        _cache_hint=f"{query}:{feature}:{class_name}:{method_name}:{record_type}:{max_results}",
+    )
+
+
+@tool
+def locate_feature_controls(feature: str = "", class_name: str = "", method_name: str = "", max_results: int = 12) -> str:
+    """Locate activation, deactivation, and real enforcement controls for a feature."""
+    from apk_agent.tools.behavior_engine import locate_feature_controls as _locate_feature_controls
+
+    def _run():
+        pack = _ensure_behavior_graph_pack(auto_build=True, focus_hint=feature)
+        if pack is None:
+            return json.dumps({"success": False, "error": "Behavior graph unavailable. Run build_behavior_graph first."})
+        result = _locate_feature_controls(
+            pack,
+            feature=feature,
+            class_name=class_name,
+            method_name=method_name,
+            max_results=max_results,
+        )
+        result["output_path"] = str(_behavior_graph_path())
+        return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
+
+    return _safe_call(
+        _run,
+        "locate_feature_controls",
+        _cache_hint=f"{feature}:{class_name}:{method_name}:{max_results}",
+    )
+
+
+@tool
+def recover_state_transitions(class_name: str = "", field_name: str = "", max_results: int = 20) -> str:
+    """Recover state transitions and source-to-gate propagation paths."""
+    from apk_agent.tools.behavior_engine import recover_state_transitions as _recover_state_transitions
+
+    def _run():
+        pack = _ensure_behavior_graph_pack(auto_build=True, focus_hint=class_name or field_name)
+        if pack is None:
+            return json.dumps({"success": False, "error": "Behavior graph unavailable. Run build_behavior_graph first."})
+        result = _recover_state_transitions(
+            pack,
+            class_name=class_name,
+            field_name=field_name,
+            max_results=max_results,
+        )
+        result["output_path"] = str(_behavior_graph_path())
+        return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
+
+    return _safe_call(
+        _run,
+        "recover_state_transitions",
+        _cache_hint=f"{class_name}:{field_name}:{max_results}",
+    )
+
+
+@tool
+def map_security_surfaces(focus_hint: str = "", class_name: str = "", max_results: int = 20) -> str:
+    """Map validation, crypto/TLS, API, and runtime security surfaces."""
+    from apk_agent.tools.behavior_engine import map_security_surfaces as _map_security_surfaces
+
+    def _run():
+        pack = _ensure_behavior_graph_pack(auto_build=True, focus_hint=focus_hint or class_name)
+        if pack is None:
+            return json.dumps({"success": False, "error": "Behavior graph unavailable. Run build_behavior_graph first."})
+        result = _map_security_surfaces(
+            pack,
+            focus_hint=focus_hint,
+            class_name=class_name,
+            max_results=max_results,
+        )
+        result["output_path"] = str(_behavior_graph_path())
+        return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
+
+    return _safe_call(
+        _run,
+        "map_security_surfaces",
+        _cache_hint=f"{focus_hint}:{class_name}:{max_results}",
+    )
+
+
+@tool
+def plan_runtime_hooks(focus_hint: str = "", class_name: str = "", max_results: int = 12) -> str:
+    """Plan smart runtime hook points for revalidation and hardened flows."""
+    from apk_agent.tools.behavior_engine import plan_runtime_hooks as _plan_runtime_hooks
+
+    def _run():
+        pack = _ensure_behavior_graph_pack(auto_build=True, focus_hint=focus_hint or class_name)
+        if pack is None:
+            return json.dumps({"success": False, "error": "Behavior graph unavailable. Run build_behavior_graph first."})
+        result = _plan_runtime_hooks(
+            pack,
+            focus_hint=focus_hint,
+            class_name=class_name,
+            max_results=max_results,
+        )
+        result["output_path"] = str(_behavior_graph_path())
+        return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
+
+    return _safe_call(
+        _run,
+        "plan_runtime_hooks",
+        _cache_hint=f"{focus_hint}:{class_name}:{max_results}",
+    )
+
+
+@tool
+def analyze_network_behavior(focus_hint: str = "", max_results: int = 20) -> str:
+    """Analyze network-to-state behavior boundaries in the unified behavior graph."""
+    from apk_agent.tools.behavior_engine import analyze_network_behavior as _analyze_network_behavior
+
+    def _run():
+        pack = _ensure_behavior_graph_pack(auto_build=True, focus_hint=focus_hint)
+        if pack is None:
+            return json.dumps({"success": False, "error": "Behavior graph unavailable. Run build_behavior_graph first."})
+        result = _analyze_network_behavior(
+            pack,
+            focus_hint=focus_hint,
+            max_results=max_results,
+        )
+        result["output_path"] = str(_behavior_graph_path())
+        return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
+
+    return _safe_call(
+        _run,
+        "analyze_network_behavior",
+        _cache_hint=f"{focus_hint}:{max_results}",
+    )
+
+
+@tool
+def recover_semantic_symbols(class_name: str = "", max_results: int = 12) -> str:
+    """Recover semantic symbol hints for likely obfuscated high-value classes."""
+    from apk_agent.tools.behavior_engine import recover_semantic_symbols as _recover_semantic_symbols
+
+    def _run():
+        pack = _ensure_behavior_graph_pack(auto_build=True, focus_hint=class_name)
+        if pack is None:
+            return json.dumps({"success": False, "error": "Behavior graph unavailable. Run build_behavior_graph first."})
+        result = _recover_semantic_symbols(
+            pack,
+            class_name=class_name,
+            max_results=max_results,
+        )
+        result["output_path"] = str(_behavior_graph_path())
+        return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
+
+    return _safe_call(
+        _run,
+        "recover_semantic_symbols",
+        _cache_hint=f"{class_name}:{max_results}",
+    )
+
+
+@tool
+def patch_api_response_flow(
+    target_class: str,
+    field_overrides_json: str,
+    endpoint_hint: str = "",
+    strategy: str = "auto",
+    max_factory_methods: int = 8,
+    dry_run: bool = False,
+) -> str:
+    """Patch the response-to-model boundary for a target entity class.
+
+    Applies targeted overrides to constructors, setter-like methods, and
+    response/factory methods that return the entity, so server-derived values
+    enter the app already normalized to the desired state.
+    """
+    from apk_agent.tools.api_response_patcher import patch_api_response_flow as _patch
+
+    def _run():
+        idx = _ensure_smali_index()
+        if idx is None:
+            return json.dumps({"success": False, "error": "No SmaliIndex. Run build_smali_index first."})
+        overrides = json.loads(field_overrides_json)
+        if not isinstance(overrides, dict) or not overrides:
+            return json.dumps({"success": False, "error": "field_overrides_json must be a non-empty JSON object."})
+
+        result = _patch(
+            idx,
+            _project.apktool_dir,
+            target_class,
+            overrides,
+            endpoint_hint=endpoint_hint,
+            strategy=strategy,
+            backup_dir=_project.patch_backup_dir,
+            max_factory_methods=max_factory_methods,
+            dry_run=dry_run,
+        )
+        _patch_journal.append({
+            "success": result.get("success", False),
+            "target_file": result.get("target_file", target_class),
+            "description": f"API response flow patch for {target_class} — {result.get('patches_applied', 0)} patch units",
+            "steps_applied": result.get("patches_applied", 0),
+            "steps_total": result.get("patches_applied", 0),
+            "errors": result.get("errors", [])[:5],
+            "tool": "patch_api_response_flow",
+        })
+        return json.dumps(result, ensure_ascii=False, indent=2)[:30000]
+
+    return _safe_call(_run, "patch_api_response_flow")
+
+
+@tool
+def inject_runtime_override_layer(rules_json: str, reapply_on_resume: bool = False) -> str:
+    """Inject an in-APK runtime override helper and bootstrap hook.
+
+    Supported rule kinds:
+      - shared_pref
+      - static_field
+    """
+    from apk_agent.tools.runtime_override import inject_runtime_override_layer as _inject
+
+    def _run():
+        rules = json.loads(rules_json)
+        if not isinstance(rules, list) or not rules:
+            return json.dumps({"success": False, "error": "rules_json must be a non-empty JSON array."})
+
+        result = _inject(
+            _project.apktool_dir,
+            rules,
+            backup_dir=_project.patch_backup_dir,
+            reapply_on_resume=reapply_on_resume,
+        )
+        _patch_journal.append({
+            "success": result.get("success", False),
+            "target_file": result.get("helper_file", "runtime override layer"),
+            "description": f"Injected runtime override layer with {result.get('rules_applied', 0)} rules",
+            "steps_applied": result.get("rules_applied", 0),
+            "steps_total": result.get("rules_applied", 0),
+            "errors": result.get("errors", [])[:5],
+            "tool": "inject_runtime_override_layer",
+        })
+        return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
+
+    return _safe_call(_run, "inject_runtime_override_layer")
+
+
 # ---------------------------------------------------------------------------
 # Tool list for graph construction
 # ---------------------------------------------------------------------------
@@ -6190,6 +10903,11 @@ ALL_TOOLS = [
     identify_app_packages,
     analyze_attack_surface,
     analyze_network_config,
+    rename_package_identity,
+    find_resource_colors,
+    find_resource_styles,
+    replace_resource_colors,
+    list_resource_drawables,
     analyze_native_libs,
     # Smali deep analysis
     scan_smali_classes,
@@ -6201,6 +10919,13 @@ ALL_TOOLS = [
     detect_protections,
     trace_call_chain,
     reconstruct_strings,
+    find_entry_points,
+    map_hierarchy,
+    validate_patch,
+    diff_patched_file,
+    analyze_shared_prefs,
+    extract_native_strings,
+    scan_assets_secrets,
     # Vulnerability scanning
     scan_vulnerabilities,
     list_vuln_patterns,
@@ -6230,6 +10955,8 @@ ALL_TOOLS = [
     search_interceptors,
     search_native_code,
     search_dynamic_loaders,
+    search_binary_strings,
+    patch_binary_strings,
     # File operations
     read_file,
     write_file,
@@ -6261,10 +10988,21 @@ ALL_TOOLS = [
     find_dynamic_checks,
     extract_all_urls,
     verify_bypass_completeness,
+    # SmaliIndex-powered analysis (Tier 1 & 2)
+    discover_entity_classes,
+    detect_gate_chain,
+    trace_field_writers,
+    validate_patch_completeness,
+    smart_entity_patch,
+    frida_script_generator,
+    diff_apk_variants,
     # Patching
+    apply_text_patch,
+    preview_text_patch,
     apply_smali_patch,
     preview_smali_patch,
     restore_smali_backup,
+    patch_binary_hex,
     # Automated bypass engine (APK Patcher)
     auto_patch_bypass,
     patch_flutter_ssl,
@@ -6282,10 +11020,32 @@ ALL_TOOLS = [
     build_smali_index,
     smali_index_stats,
     unified_scan,
+    get_threat_model,
     analyze_data_flow,
     run_taint_analysis,
     find_hardcoded_crypto,
     generate_bypass_plans,
     analyze_manifest_deep,
     scan_cloud_secrets,
+    map_semantic_architecture,
+    recover_hidden_state_model,
+    profile_guard_and_revalidation_surface,
+    build_app_knowledge_pack,
+    summarize_app_knowledge,
+    query_app_knowledge,
+    build_behavior_graph,
+    summarize_behavior_graph,
+    query_behavior_graph,
+    locate_feature_controls,
+    recover_state_transitions,
+    map_security_surfaces,
+    plan_runtime_hooks,
+    analyze_network_behavior,
+    recover_semantic_symbols,
+    patch_api_response_flow,
+    inject_runtime_override_layer,
+    semantic_method_slice,
+    find_enforcement_surfaces,
+    validate_patch_pipeline,
+    generate_runtime_validation_plan,
 ]

@@ -13,8 +13,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from apk_agent.parallelism import recommended_file_scan_workers
+
 # Shared thread pool for parallel file scanning
-_VULN_POOL = ThreadPoolExecutor(max_workers=8)
+_VULN_POOL = ThreadPoolExecutor(max_workers=recommended_file_scan_workers())
 
 
 @dataclass

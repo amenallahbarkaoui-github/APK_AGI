@@ -37,6 +37,32 @@ def _unescape_smali(pattern: str) -> str:
     )
 
 
+_SMALI_ACCESS_FLAGS = {
+    "public", "private", "protected", "static", "final", "synchronized",
+    "bridge", "varargs", "native", "abstract", "strictfp", "synthetic",
+    "constructor", "declared-synchronized", "transient",
+}
+
+
+def _extract_method_name(pattern: str) -> str:
+    """Best-effort extraction of a smali method name from a `.method ...` pattern."""
+    raw = _unescape_smali(pattern).strip()
+    if not raw.startswith(".method"):
+        return ""
+
+    line = raw.splitlines()[0].replace("...", " ")
+    if "(" in line:
+        line = line.split("(", 1)[0]
+
+    tokens = re.findall(r"[\w<>$-]+", line)
+    for token in reversed(tokens):
+        lowered = token.lower()
+        if lowered == "method" or lowered in _SMALI_ACCESS_FLAGS:
+            continue
+        return token
+    return ""
+
+
 def _write_with_retry(path: Path, content: str, retries: int = 3, delay: float = 0.3) -> None:
     """Write text to a file with retry on Windows file lock errors (WinError 32)."""
     import time
@@ -55,6 +81,7 @@ def _write_with_retry(path: Path, content: str, retries: int = 3, delay: float =
 class PatchOperation(str, Enum):
     REPLACE_LINE = "replace_line"
     REPLACE_BLOCK = "replace_block"
+    REPLACE_ALL = "replace_all"
     INSERT_BEFORE = "insert_before"
     INSERT_AFTER = "insert_after"
     DELETE_BLOCK = "delete_block"
@@ -87,7 +114,7 @@ class PatchPlan:
         steps = []
         for s in data.get("steps", []):
             steps.append(PatchStep(
-                operation=PatchOperation(s["operation"]),
+                operation=PatchOperation(str(s["operation"]).strip().lower()),
                 match_pattern=s["match_pattern"],
                 replacement=s.get("replacement", ""),
                 content=s.get("content", ""),
@@ -211,7 +238,12 @@ class PatchEngine:
 
     def restore_backup(self, target_file: str) -> dict:
         """Restore a file from its backup (undo all patches)."""
-        backup_path = self.backup_dir / target_file
+        normalized_target = target_file.replace("\\", "/").lstrip("/")
+        backup_path = self.backup_dir / normalized_target
+        if not backup_path.is_file():
+            legacy_flattened = self.backup_dir / normalized_target.replace("/", "_").replace("\\", "_")
+            if legacy_flattened.is_file():
+                backup_path = legacy_flattened
         if not backup_path.is_file():
             return {"success": False, "error": f"No backup found for {target_file}"}
 
@@ -255,26 +287,20 @@ class PatchEngine:
                         raise
         result.backup_path = str(backup_path)
 
-        # Read original
+        # Read original and compute the full patch transaction in memory first.
+        # If any step fails, abort without modifying the file.
         original = target.read_text(encoding="utf-8", errors="replace")
-        current = original
+        current, errors = self._apply_steps(original, plan.steps, collect_errors=True)
+        result.errors.extend(errors)
+        result.steps_applied = max(0, result.steps_total - len(errors))
 
-        # Apply steps one by one
-        for i, step in enumerate(plan.steps):
-            new_content = self._apply_single_step(current, step)
-            if new_content is None:
+        if current is None:
+            if result.steps_applied == 0 and not result.errors:
+                result.errors.append("No steps were applied — all patterns failed to match.")
+            elif result.steps_applied > 0:
                 result.errors.append(
-                    f"Step {i+1}/{len(plan.steps)} failed "
-                    f"({step.operation.value}): pattern not found — "
-                    f"'{step.match_pattern[:80]}...'"
+                    "Patch plan aborted without modifying the file because one or more steps failed."
                 )
-                # Continue trying other steps (don't abort entire plan)
-                continue
-            current = new_content
-            result.steps_applied += 1
-
-        if result.steps_applied == 0:
-            result.errors.append("No steps were applied — all patterns failed to match.")
             return result
 
         # Write modified file with retry for Windows file locks
@@ -295,7 +321,7 @@ class PatchEngine:
         diff_file.parent.mkdir(parents=True, exist_ok=True)
         _write_with_retry(diff_file, result.diff_text)
 
-        result.success = result.steps_applied == result.steps_total
+        result.success = True
         return result
 
     def _apply_steps(self, text: str, steps: list[PatchStep],
@@ -333,6 +359,8 @@ class PatchEngine:
                 return self._op_replace_line(text, step)
             case PatchOperation.REPLACE_BLOCK:
                 return self._op_replace_block(text, step)
+            case PatchOperation.REPLACE_ALL:
+                return self._op_replace_all(text, step)
             case PatchOperation.INSERT_BEFORE:
                 return self._op_insert(text, step, before=True)
             case PatchOperation.INSERT_AFTER:
@@ -527,8 +555,57 @@ class PatchEngine:
         """Replace an entire block of text."""
         m = self._find_pattern(text, step.match_pattern, step.is_regex)
         if m is None:
-            return None
+            fuzzy = self._find_unique_method_block(text, step.match_pattern)
+            if fuzzy is None:
+                return None
+            m = fuzzy
         return text[:m.start()] + step.replacement + text[m.end():]
+
+    def _find_unique_method_block(self, text: str, pattern: str) -> Optional["_FakeMatch"]:
+        """Fallback for replace_block when the LLM guessed the exact method header badly.
+
+        If the pattern targets `.method ...` and uniquely identifies a method name in the
+        file, replace the full method block for that method instead of failing outright.
+        This is intentionally narrow to avoid fuzzy matches on arbitrary blocks.
+        """
+        method_name = _extract_method_name(pattern)
+        if not method_name:
+            return None
+
+        method_block_re = re.compile(
+            rf'^\s*\.method\b[^\n]*\b{re.escape(method_name)}\([^\n]*\n.*?^\s*\.end method\b',
+            re.MULTILINE | re.DOTALL,
+        )
+        matches = list(method_block_re.finditer(text))
+        if len(matches) != 1:
+            return None
+
+        match = matches[0]
+        return _FakeMatch(match.start(), match.end(), match.group(0))
+
+    def _op_replace_all(self, text: str, step: PatchStep) -> Optional[str]:
+        """Replace every occurrence of the pattern in the file."""
+        if step.is_regex:
+            try:
+                updated, count = re.subn(
+                    step.match_pattern,
+                    step.replacement,
+                    text,
+                    flags=re.MULTILINE | re.DOTALL,
+                )
+            except re.error:
+                return None
+            return updated if count else None
+
+        candidates = [step.match_pattern]
+        unescaped = _unescape_smali(step.match_pattern)
+        if unescaped != step.match_pattern:
+            candidates.append(unescaped)
+
+        for candidate in candidates:
+            if candidate in text:
+                return text.replace(candidate, step.replacement)
+        return None
 
     def _op_insert(self, text: str, step: PatchStep, before: bool) -> Optional[str]:
         """Insert content before or after the match pattern."""
@@ -578,3 +655,107 @@ class _FakeMatch:
 
     def group(self, n: int = 0) -> str:
         return self._group0
+
+
+class PatchTransaction:
+    """Atomic multi-file patch transaction with automatic rollback.
+
+    Usage:
+        tx = PatchTransaction(engine)
+        tx.add(plan1)
+        tx.add(plan2)
+        result = tx.commit()  # Applies all or rolls back everything on failure
+
+    If any plan fails to apply, ALL previously applied plans in this transaction
+    are rolled back to their state BEFORE the transaction began.
+    """
+
+    def __init__(self, engine: PatchEngine, require_all: bool = True):
+        self.engine = engine
+        self.require_all = require_all  # If True, rollback on any failure
+        self.plans: list[PatchPlan] = []
+        self._snapshots: dict[str, str] = {}  # file_path → original content
+        self._modified_files: list[Path] = []
+
+    def add(self, plan: PatchPlan) -> None:
+        self.plans.append(plan)
+
+    def commit(self) -> dict:
+        """Apply all plans atomically. Returns transaction result."""
+        results: list[PatchResult] = []
+        all_success = True
+
+        # Phase 1: Snapshot all target files before any modifications
+        for plan in self.plans:
+            target = self.engine._find_target(plan.target_file)
+            if target and str(target) not in self._snapshots:
+                try:
+                    self._snapshots[str(target)] = target.read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                except Exception:
+                    pass
+
+        # Phase 2: Apply all plans
+        for plan in self.plans:
+            result = self.engine.apply_plan(plan)
+            results.append(result)
+            if result.success:
+                for f in result.files_modified:
+                    if f not in [str(p) for p in self._modified_files]:
+                        self._modified_files.append(Path(f))
+            else:
+                all_success = False
+                if self.require_all:
+                    break
+
+        # Phase 3: Rollback if needed
+        if not all_success and self.require_all:
+            rollback_count = 0
+            for file_path, original_content in self._snapshots.items():
+                try:
+                    _write_with_retry(Path(file_path), original_content)
+                    rollback_count += 1
+                except Exception:
+                    pass
+
+            return {
+                "success": False,
+                "transaction": "ROLLED_BACK",
+                "plans_attempted": len(results),
+                "plans_succeeded": sum(1 for r in results if r.success),
+                "files_rolled_back": rollback_count,
+                "errors": [e for r in results for e in r.errors],
+            }
+
+        return {
+            "success": all_success,
+            "transaction": "COMMITTED",
+            "plans_applied": len(results),
+            "plans_succeeded": sum(1 for r in results if r.success),
+            "files_modified": [str(f) for f in self._modified_files],
+            "results": [
+                {
+                    "target": r.target_file,
+                    "success": r.success,
+                    "steps_applied": r.steps_applied,
+                    "steps_total": r.steps_total,
+                    "errors": r.errors,
+                }
+                for r in results
+            ],
+        }
+
+    def rollback(self) -> dict:
+        """Manually rollback all changes from this transaction."""
+        rollback_count = 0
+        for file_path, original_content in self._snapshots.items():
+            try:
+                _write_with_retry(Path(file_path), original_content)
+                rollback_count += 1
+            except Exception:
+                pass
+        return {
+            "rolled_back": rollback_count,
+            "total_files": len(self._snapshots),
+        }

@@ -9,21 +9,30 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import click
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from apk_agent.config import AppConfig
+from apk_agent.llm.provider import is_quota_exhausted_error, is_retryable_api_error
+from apk_agent.parallelism import build_langgraph_run_config
 from apk_agent.session import (
+    ActiveSession,
     SessionMeta,
+    clear_active_session,
     delete_session,
     get_sqlite_checkpointer,
     has_session,
+    load_active_session,
     load_session_meta,
+    save_active_session,
     save_session_meta,
+    update_active_session,
 )
 from apk_agent.ui import (
     console,
@@ -51,6 +60,12 @@ from apk_agent.ui import (
 )
 from apk_agent.workspace import Project, ProjectManager
 
+
+# ---------------------------------------------------------------------------
+# Module-level workspace root for active session updates from stream processor
+# ---------------------------------------------------------------------------
+_active_workspace_root: Path | None = None
+_last_session_update: float = 0.0  # monotonic timestamp for throttling
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -129,10 +144,15 @@ def _print_tools_status(config: AppConfig) -> None:
     console.print("[bold dim]Tools:[/]")
     console.print(table)
 
-    # Show thinking mode and model
+    # Show model
     model_display = config.model_name.split("/")[-1] if "/" in config.model_name else config.model_name
-    thinking_icon = "[bold green]●[/] ON" if config.thinking_enabled else "[bold red]○[/] OFF"
-    console.print(f"[dim]Model:[/] [bold]{model_display}[/]  │  [dim]Thinking:[/] {thinking_icon}")
+    # Resolve context window for display
+    from apk_agent.llm.provider import _FALLBACK_CONTEXT_WINDOW
+    _ctx = config.context_window if config.context_window > 0 else _FALLBACK_CONTEXT_WINDOW
+    _compact_at = int(_ctx * 0.50)
+    _ctx_display = f"{_ctx:,}" if _ctx >= 1000 else str(_ctx)
+    _ctx_note = "" if config.context_window > 0 else "  [yellow]⚠ not set, using fallback — set via --context-window or CONTEXT_WINDOW[/]"
+    console.print(f"[dim]Model:[/] [bold]{model_display}[/]  │  [dim]Context:[/] {_ctx_display} tokens  [dim](compact at {_compact_at:,})[/]{_ctx_note}")
     if config.telegram_enabled:
         telegram_status = "[bold green]●[/] configured"
     else:
@@ -360,15 +380,15 @@ def _ask_for_apk(pm: ProjectManager, config: AppConfig) -> Project | None:
 @click.argument("apk_path", required=False, default=None)
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
 @click.option("--project", "-p", "project_id", default=None, help="Open project by ID")
-@click.option("--thinking/--no-thinking", "thinking_enabled", default=None,
-              help="Enable/disable LLM deep thinking mode (default: from .env or ON)")
 @click.option("--model", "-m", "model_name", default=None,
               help="Override model name (e.g. 'anthropic/claude-sonnet-4-6-20260218')")
+@click.option("--context-window", "-c", "context_window", default=None, type=int,
+              help="Override context window size in tokens (0=auto-detect from model)")
 @click.option("--auto", "auto_mode", is_flag=True, help="Start in auto mode (no confirmations)")
 @click.option("--telegram/--no-telegram", "telegram_enabled", default=None,
             help="Start/skip the Telegram bridge background process (default: from .env)")
 def main(apk_path: str | None, verbose: bool, project_id: str | None,
-        thinking_enabled: bool | None, model_name: str | None, auto_mode: bool,
+        model_name: str | None, context_window: int | None, auto_mode: bool,
         telegram_enabled: bool | None) -> None:
     """🔬 APK Agent — Interactive Static Android APK Reverse Engineering
 
@@ -383,10 +403,10 @@ def main(apk_path: str | None, verbose: bool, project_id: str | None,
     config = AppConfig.load()
 
     # CLI overrides
-    if thinking_enabled is not None:
-        config.thinking_enabled = thinking_enabled
     if model_name is not None:
         config.model_name = model_name
+    if context_window is not None:
+        config.context_window = context_window
 
     warnings = config.validate()
 
@@ -417,6 +437,22 @@ def main(apk_path: str | None, verbose: bool, project_id: str | None,
     if not project:
         console.print("[dim]No project selected. Goodbye! 👋[/]")
         return
+
+    # Announce active project to shared state (CLI ↔ Telegram)
+    global _active_workspace_root
+    _active_workspace_root = config.workspace_path
+    save_active_session(
+        config.workspace_path,
+        ActiveSession(
+            project_id=project.id,
+            apk_name=project.apk_name,
+            started_by="cli",
+            started_at=datetime.now(timezone.utc).isoformat(),
+            status="idle",
+            pid=os.getpid(),
+            workspace_root=str(config.workspace_path),
+        ),
+    )
 
     # ------------------------------------------------------------------
     # Session restoration — check for existing session on this project
@@ -454,19 +490,14 @@ def main(apk_path: str | None, verbose: bool, project_id: str | None,
 
     # Create session meta if new
     if session_meta is None or not resumed:
-        from datetime import datetime, timezone
         session_meta = SessionMeta(
             thread_id=str(uuid.uuid4()),
             project_id=project.id,
             created_at=datetime.now(timezone.utc).isoformat(),
             last_active_at=datetime.now(timezone.utc).isoformat(),
-            thinking_mode=config.thinking_enabled,
             auto_mode=auto_mode,
         )
         save_session_meta(session_meta, project.workspace_path)
-    else:
-        # Sync thinking mode from session to config (in case user toggled last time)
-        config.thinking_enabled = session_meta.thinking_mode
 
     # Build the agent graph with SQLite checkpointer for persistence
     console.print()
@@ -490,7 +521,7 @@ def main(apk_path: str | None, verbose: bool, project_id: str | None,
 
     # Thread config for LangGraph (uses persistent thread_id)
     thread_id = session_meta.thread_id
-    graph_config = {"configurable": {"thread_id": thread_id}}
+    graph_config = build_langgraph_run_config(thread_id)
 
     # Ensure loop/nudge trackers are scoped to this session
     from apk_agent.agent.graph import set_active_thread
@@ -600,27 +631,6 @@ def main(apk_path: str | None, verbose: bool, project_id: str | None,
 
 
 # ---------------------------------------------------------------------------
-# Hot-reload LLM with new thinking setting
-# ---------------------------------------------------------------------------
-
-def _rebuild_llm_if_needed(graph, config: AppConfig, project) -> None:
-    """Rebuild the LLM instance when thinking mode is toggled mid-session."""
-    try:
-        import apk_agent.agent.graph as _graph_mod
-        from apk_agent.llm.provider import get_llm
-        from apk_agent.agent.tools_def import ALL_TOOLS
-
-        llm = get_llm(config)
-        _graph_mod._raw_llm = llm
-        _graph_mod._llm_with_tools = llm.bind_tools(ALL_TOOLS)
-
-        status = "[green]ON[/]" if config.thinking_enabled else "[red]OFF[/]"
-        console.print(f"[bold]🧠 Thinking mode: {status}[/] — LLM reconfigured.")
-    except Exception as e:
-        print_error(f"Failed to reconfigure LLM: {e}")
-
-
-# ---------------------------------------------------------------------------
 # Chat loop
 # ---------------------------------------------------------------------------
 
@@ -632,6 +642,7 @@ def _chat_loop(
     """Main interactive chat loop with normal and orchestrator modes."""
     orchestrator_mode = session_meta.orchestrator_mode
     auto_mode = session_meta.auto_mode
+    human_mode = session_meta.human_mode
 
     while True:
         try:
@@ -639,10 +650,10 @@ def _chat_loop(
             mode_parts = []
             if auto_mode:
                 mode_parts.append("[bold yellow]auto[/]")
+            if human_mode:
+                mode_parts.append("[bold cyan]human[/]")
             if orchestrator_mode:
                 mode_parts.append("[bold magenta]orchestrator[/]")
-            if config.thinking_enabled:
-                mode_parts.append("[green]🧠[/]")
 
             mode_tag = f" [{', '.join(mode_parts)}]" if mode_parts else ""
             user_input = console.input(f"\n[bold green]You{mode_tag} ➜ [/]").strip()
@@ -652,6 +663,7 @@ def _chat_loop(
             session_meta.status = "active"
             session_meta.touch()
             save_session_meta(session_meta, project.workspace_path)
+            update_active_session(config.workspace_path, status="idle", phase="exited")
             break
 
         if not user_input:
@@ -665,6 +677,7 @@ def _chat_loop(
                 session_meta.status = "active"
                 session_meta.touch()
                 save_session_meta(session_meta, project.workspace_path)
+                update_active_session(config.workspace_path, status="idle", phase="quit")
                 break
             elif result == "orchestrator_on":
                 orchestrator_mode = True
@@ -689,17 +702,18 @@ def _chat_loop(
                 session_meta.auto_mode = False
                 print_success("Auto mode disabled — back to interactive confirmations.")
                 continue
-            elif result == "thinking_on":
-                config.thinking_enabled = True
-                session_meta.thinking_mode = True
-                # Rebuild LLM with thinking enabled
-                _rebuild_llm_if_needed(graph, config, project)
+            elif result == "human_on":
+                human_mode = True
+                session_meta.human_mode = True
+                print_success(
+                    "Human Thinking mode ON — you guide each step.\n"
+                    "The agent will execute one action at a time and ask you what to do next."
+                )
                 continue
-            elif result == "thinking_off":
-                config.thinking_enabled = False
-                session_meta.thinking_mode = False
-                # Rebuild LLM with thinking disabled
-                _rebuild_llm_if_needed(graph, config, project)
+            elif result == "human_off":
+                human_mode = False
+                session_meta.human_mode = False
+                print_success("Human Thinking mode OFF — agent runs autonomously.")
                 continue
             if result is not None:
                 continue
@@ -712,13 +726,16 @@ def _chat_loop(
         session_meta.last_user_input = user_input
         session_meta.touch()
 
+        update_active_session(config.workspace_path, status="running", phase="agent_turn")
+
         if orchestrator_mode:
             _run_orchestrator_turn(user_input, project, config)
         else:
-            _run_agent_turn(graph, graph_config, user_input, project, session_meta, auto_mode=auto_mode)
+            _run_agent_turn(graph, graph_config, user_input, project, session_meta, auto_mode=auto_mode, human_mode=human_mode)
 
         # Save session after each turn
         save_session_meta(session_meta, project.workspace_path)
+        update_active_session(config.workspace_path, status="idle", phase="turn_complete")
 
 
 def _handle_command(
@@ -757,6 +774,35 @@ def _handle_command(
                 print_info("Reset cancelled.")
         case "/compact":
             _manual_compact(session_meta)
+        case "/context":
+            from apk_agent.llm.provider import _FALLBACK_CONTEXT_WINDOW as _fb_ctx
+            if arg:
+                try:
+                    val = int(arg.strip())
+                    if val <= 0:
+                        raise ValueError
+                    config.context_window = val
+                    threshold = int(val * 0.50)
+                    print_success(f"Context window → {val:,} tokens (compact at {threshold:,})")
+                    # Hot-update compactor threshold
+                    try:
+                        from apk_agent.agent.graph import _compactor
+                        if _compactor:
+                            _compactor.token_threshold = threshold
+                    except Exception:
+                        pass
+                except ValueError:
+                    print_error("Usage: /context <tokens>  (e.g. /context 128000, /context 1000000)")
+            else:
+                if config.context_window > 0:
+                    threshold = int(config.context_window * 0.50)
+                    console.print(f"[dim]Context window:[/] [bold]{config.context_window:,}[/] tokens")
+                    console.print(f"[dim]Compact at:[/] {threshold:,} tokens (50%)")
+                else:
+                    threshold = int(_fb_ctx * 0.50)
+                    console.print(f"[yellow]Context window not set[/] — using fallback {_fb_ctx:,} tokens")
+                    console.print(f"[dim]Compact at:[/] {threshold:,} tokens (50%)")
+                    console.print(f"[dim]Set with:[/] /context <tokens>  (e.g. /context 128000)")
         case "/tokens":
             _show_token_count()
         case "/logs":
@@ -798,10 +844,10 @@ def _handle_command(
             if session_meta.auto_mode:
                 return "auto_off"
             return "auto_on"
-        case "/thinking":
-            if session_meta.thinking_mode:
-                return "thinking_off"
-            return "thinking_on"
+        case "/human":
+            if session_meta.human_mode:
+                return "human_off"
+            return "human_on"
         case "/stop":
             print_info("Operation stopped.")
         case "/quit" | "/exit" | "/q":
@@ -834,11 +880,12 @@ def _handle_command(
 # Agent turn (normal mode)
 # ---------------------------------------------------------------------------
 
-def _run_agent_turn(graph, graph_config: dict, user_input: str, project: Project, session_meta: SessionMeta, *, auto_mode: bool = False) -> None:
+def _run_agent_turn(graph, graph_config: dict, user_input: str, project: Project, session_meta: SessionMeta, *, auto_mode: bool = False, human_mode: bool = False) -> None:
     """Run one turn of the agent with streaming output and error recovery."""
     # Set auto_mode flag at graph/tool level so interrupts are skipped entirely
     import apk_agent.agent.tools_def as _td
     _td._auto_mode = auto_mode
+    _td._human_mode = human_mode
 
     from apk_agent.progress import progress_manager
     progress_manager.set_overall_task(user_input)
@@ -911,6 +958,8 @@ def _run_agent_turn(graph, graph_config: dict, user_input: str, project: Project
 
         while True:
             interrupt_info = None
+            token_tracker.set_agent_phase("waiting for model")
+            live_bar.update()
 
             try:
                 if is_resume:
@@ -946,6 +995,18 @@ def _run_agent_turn(graph, graph_config: dict, user_input: str, project: Project
                     import time as _t; _t.sleep(0.5)
                     continue  # retry the same stream_input
                 raise
+            except Exception as stream_err:
+                _transient = is_retryable_api_error(stream_err)
+                if _transient and error_count < max_consecutive_errors:
+                    error_count += 1
+                    _wait = error_count * 5
+                    print_warning(
+                        f"Transient API error ({error_count}/{max_consecutive_errors}): "
+                        f"{str(stream_err)[:100]} — retrying in {_wait}s..."
+                    )
+                    import time as _t; _t.sleep(_wait)
+                    continue  # retry the same stream_input
+                raise
 
             if error_count >= max_consecutive_errors:
                 break
@@ -966,11 +1027,32 @@ def _run_agent_turn(graph, graph_config: dict, user_input: str, project: Project
                                     last_ai = m
                                     break
                             if last_ai:
-                                content = (last_ai.content or "").strip().lower() if isinstance(last_ai.content, str) else ""
+                                # Extract text from both str and list content
+                                raw = last_ai.content
+                                if isinstance(raw, str):
+                                    content = (raw or "").strip().lower()
+                                elif isinstance(raw, list):
+                                    # List of content blocks — extract text parts
+                                    parts = []
+                                    for blk in raw:
+                                        if isinstance(blk, str):
+                                            parts.append(blk)
+                                        elif isinstance(blk, dict) and blk.get("type") == "text":
+                                            parts.append(blk.get("text", ""))
+                                    content = " ".join(parts).strip().lower()
+                                else:
+                                    content = ""
+
+                                # If the last AI message only called tools
+                                # (no text), the agent clearly isn't done —
+                                # it just returned tool_calls with no text.
+                                has_tool_calls = bool(last_ai.tool_calls)
+
                                 # Detect if the agent is truly done (final report,
-                                # explicit completion, or empty response)
+                                # explicit completion, or empty response WITH
+                                # no pending tool calls)
                                 is_done = (
-                                    not content
+                                    (not content and not has_tool_calls)
                                     or any(phrase in content for phrase in [
                                         "task is complete", "task complete",
                                         "all done", "analysis complete",
@@ -997,8 +1079,9 @@ def _run_agent_turn(graph, graph_config: dict, user_input: str, project: Project
                                     is_resume = False
                                     live_bar.start()
                                     continue  # loop back to stream again
-                    except Exception:
-                        pass  # fall through to break
+                    except Exception as _auto_err:
+                        # Log but don't silently swallow — helps debug auto-mode issues
+                        print_warning(f"Auto-continue check error: {_auto_err}")
                 break  # truly done or not auto mode
 
             # Resume with user's response
@@ -1011,10 +1094,12 @@ def _run_agent_turn(graph, graph_config: dict, user_input: str, project: Project
     except Exception as e:
         error_str = str(e)
         err_lower = error_str.lower()
-        if "rate_limit" in err_lower or "429" in error_str:
-            print_warning("Rate limited by API. Wait a moment and try again.")
-        elif "api key limit" in err_lower or ("403" in error_str and "limit" in err_lower):
+        if is_quota_exhausted_error(e):
             print_error("API quota exhausted. Top up your API credits or wait for reset.")
+        elif "rate_limit" in err_lower or "429" in error_str:
+            print_warning("Rate limited by API. Wait a moment and try again.")
+        elif "502" in error_str or "fetch failed" in err_lower or "bad gateway" in err_lower:
+            print_warning("API gateway timeout (502). The proxy reset the connection. Try again — this is transient.")
         elif "timeout" in err_lower:
             print_warning("API timeout. The request took too long. Try a simpler query.")
         elif "authentication" in err_lower or "401" in error_str:
@@ -1077,8 +1162,6 @@ def _show_session_info(session_meta: SessionMeta, project: Project) -> None:
     if not mode_parts:
         mode_parts.append("Normal")
     table.add_row("Mode", " + ".join(mode_parts))
-    thinking_str = "[green]● ON[/]" if session_meta.thinking_mode else "[red]○ OFF[/]"
-    table.add_row("Thinking", thinking_str)
     table.add_row("Status", session_meta.status)
 
     # Token usage
@@ -1107,7 +1190,7 @@ def _show_session_info(session_meta: SessionMeta, project: Project) -> None:
 def _manual_compact(session_meta: SessionMeta) -> None:
     """Manually trigger a compaction."""
     console.print("[bold yellow]Manual compact is not yet supported from the CLI.[/]")
-    console.print("[dim]Auto-compact triggers automatically when context exceeds 200K tokens.[/]")
+    console.print("[dim]Auto-compact triggers automatically when context reaches the configured threshold.[/]")
     try:
         from apk_agent.agent.graph import _compactor
         if _compactor:
@@ -1254,7 +1337,7 @@ def _run_orchestrator_turn(user_input: str, project, config) -> None:
         print_warning("Orchestrator interrupted by user.")
     except Exception as e:
         err_str = str(e).lower()
-        if "403" in err_str and ("api key limit" in err_str or "forbidden" in err_str):
+        if is_quota_exhausted_error(e):
             print_error("API quota exhausted. Top up your API credits or wait for reset.")
         elif "429" in err_str or "rate_limit" in err_str:
             print_error("Rate limited by API. Wait a moment and try again.")
@@ -1281,6 +1364,8 @@ def _process_stream_event(event: dict, graph, graph_config: dict, *, auto_mode: 
             messages = node_output.get("messages", [])
             for msg in messages:
                 if isinstance(msg, AIMessage):
+                    token_tracker.clear_agent_phase()
+                    live_bar.update()
                     # Track token usage from response metadata
                     usage = getattr(msg, "usage_metadata", None) or getattr(msg, "response_metadata", {}).get("token_usage", {})
                     if usage:
@@ -1298,15 +1383,72 @@ def _process_stream_event(event: dict, graph, graph_config: dict, *, auto_mode: 
                             token_tracker.record_call(prompt_t, compl_t, cached_t)
                             live_bar.update()
 
+                    # Display thinking/reasoning if captured from API
+                    from apk_agent.llm.provider import pop_last_reasoning
+                    from apk_agent.ui import print_thinking
+                    reasoning = pop_last_reasoning()
+                    # Also check additional_kwargs for reasoning (some LangChain versions)
+                    if not reasoning:
+                        ak = getattr(msg, "additional_kwargs", {}) or {}
+                        reasoning = (
+                            ak.get("reasoning_text")
+                            or ak.get("reasoning_content")
+                            or ak.get("thinking")
+                        )
+                        if reasoning and isinstance(reasoning, str) and reasoning.strip():
+                            reasoning = reasoning.strip()
+                        else:
+                            reasoning = None
+                    if reasoning:
+                        print_thinking(reasoning)
+
+                    # Extract text content (handle both str and list formats)
+                    text_content = ""
+                    if isinstance(msg.content, str):
+                        text_content = msg.content.strip()
+                    elif isinstance(msg.content, list):
+                        # Some models return content as list of blocks
+                        parts = []
+                        for block in msg.content:
+                            if isinstance(block, str):
+                                parts.append(block)
+                            elif isinstance(block, dict):
+                                btype = block.get("type", "")
+                                if btype == "text":
+                                    parts.append(block.get("text", ""))
+                                elif btype in ("thinking", "reasoning"):
+                                    # Display inline thinking blocks too
+                                    think_text = block.get("thinking") or block.get("text") or ""
+                                    if think_text.strip() and not reasoning:
+                                        print_thinking(think_text.strip())
+                        text_content = "\n".join(p for p in parts if p.strip())
+
                     # Print text content
-                    if msg.content and isinstance(msg.content, str) and msg.content.strip():
-                        print_ai_message(msg.content)
+                    if text_content:
+                        print_ai_message(text_content)
                     # Show tool calls being made with args summary
                     if msg.tool_calls:
                         n_calls = len(msg.tool_calls)
+                        tool_names = [tc["name"] for tc in msg.tool_calls if tc.get("name")]
                         if n_calls > 1:
                             console.print(f"[dim]  ⚡ {n_calls} tools in parallel[/]")
+                            token_tracker.sync_running_tools(tool_names)
                         for tc in msg.tool_calls:
+                            # Update active session so Telegram can see live tool progress
+                            # Throttled to max once per 2 seconds to avoid disk I/O spam
+                            import time as _time
+                            global _last_session_update
+                            _now = _time.monotonic()
+                            if _active_workspace_root and (_now - _last_session_update) > 2.0:
+                                _last_session_update = _now
+                                try:
+                                    update_active_session(
+                                        _active_workspace_root,
+                                        status="running",
+                                        last_tool=tc['name'],
+                                    )
+                                except Exception:
+                                    pass
                             args = tc.get("args", {})
                             arg_summary = ""
                             if args:
@@ -1316,7 +1458,8 @@ def _process_stream_event(event: dict, graph, graph_config: dict, *, auto_mode: 
                                     parts.append(f"{k}={v_str}")
                                 arg_summary = ", ".join(parts)
                             print_tool_start(tc['name'], arg_summary)
-                            token_tracker.set_active_tool(tc['name'])
+                            if n_calls == 1:
+                                token_tracker.set_active_tool(tc['name'])
                             live_bar.update()
 
         elif node_name == "tools":
@@ -1324,7 +1467,6 @@ def _process_stream_event(event: dict, graph, graph_config: dict, *, auto_mode: 
             messages = node_output.get("messages", [])
             for msg in messages:
                 if isinstance(msg, ToolMessage):
-                    token_tracker.clear_active_tool()
                     live_bar.update()
                     # Better success detection
                     content_start = msg.content[:100].lower()
@@ -1361,9 +1503,12 @@ def _process_stream_event(event: dict, graph, graph_config: dict, *, auto_mode: 
             if isinstance(interrupts, (list, tuple)):
                 for intr in interrupts:
                     value = intr.value if hasattr(intr, 'value') else str(intr)
+                    value_str = str(value)
 
-                    if auto_mode:
-                        value_str = str(value)
+                    # Human Thinking mode interrupts always require user input
+                    is_human_step = "💬 What should I do next?" in value_str
+
+                    if auto_mode and not is_human_step:
                         if "❓" in value_str:
                             human_response = "Proceed with your best judgment."
                             console.print("[dim]⚡ Auto-mode: agent question auto-answered[/]")
@@ -1371,8 +1516,9 @@ def _process_stream_event(event: dict, graph, graph_config: dict, *, auto_mode: 
                             human_response = "yes"
                             console.print("[dim]⚡ Auto-mode: patch auto-approved[/]")
                     else:
-                        print_hitl_prompt(str(value))
-                        human_response = console.input("[bold magenta]Your response: [/]").strip()
+                        print_hitl_prompt(value_str)
+                        prompt_label = "[bold cyan]Next step: [/]" if is_human_step else "[bold magenta]Your response: [/]"
+                        human_response = console.input(prompt_label).strip()
 
                     return {"interrupt": True, "response": human_response}
 

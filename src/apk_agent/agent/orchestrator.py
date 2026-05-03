@@ -27,7 +27,8 @@ from apk_agent.agent.state import AgentState
 from apk_agent.agent.sub_agents import SUB_AGENT_CATALOG, SubAgentDef
 from apk_agent.agent.tools_def import ALL_TOOLS, set_tool_context
 from apk_agent.config import AppConfig
-from apk_agent.llm.provider import get_llm
+from apk_agent.llm.provider import get_llm, is_quota_exhausted_error, is_retryable_api_error
+from apk_agent.parallelism import build_langgraph_run_config
 from apk_agent.progress import ProgressManager, TaskStatus, progress_manager
 from apk_agent.workspace import Project
 
@@ -243,7 +244,7 @@ def _build_sub_agent_graph(agent_def: SubAgentDef, config: AppConfig, project: P
     if not agent_tools:
         raise ValueError(f"No tools found for sub-agent '{agent_def.name}'")
 
-    llm = get_llm(config, temperature=1.0)
+    llm = get_llm(config, temperature=1.0, capture_reasoning=False)
     llm_with_tools = llm.bind_tools(agent_tools)
 
     _sub_llm_store = {"llm": llm_with_tools}
@@ -373,14 +374,7 @@ def _build_sub_agent_graph(agent_def: SubAgentDef, config: AppConfig, project: P
                 break
             except Exception as e:
                 err_str = str(e).lower()
-                is_retryable = any(k in err_str for k in [
-                    "429", "rate_limit", "rate limit",
-                    "503", "service unavailable", "overloaded",
-                    "500", "internal server error",
-                    "tool name is required",
-                    "must be in json format", "invalidparameter",
-                    "tool_call_id", "is not found",
-                ])
+                is_retryable = is_retryable_api_error(e)
                 if "tool_call_id" in err_str and "not found" in err_str:
                     logger.warning("Sub-agent orphaned tool_call_id — re-sanitizing...")
                     messages = _sanitize_messages(messages)
@@ -389,6 +383,8 @@ def _build_sub_agent_graph(agent_def: SubAgentDef, config: AppConfig, project: P
                     for _m in messages:
                         if isinstance(_m, AIMessage) and _m.tool_calls:
                             _m.tool_calls = [tc for tc in _m.tool_calls if tc.get("name")]
+                if is_quota_exhausted_error(e):
+                    logger.error("Sub-agent API quota exhausted — stopping retries: %s", str(e)[:160])
                 if not is_retryable or attempt >= max_retries:
                     raise
                 wait = 2 ** attempt * 3
@@ -446,7 +442,7 @@ def run_sub_agent(
 
         graph = _build_sub_agent_graph(agent_def, config, project)
         thread_id = str(uuid.uuid4())
-        graph_config = {"configurable": {"thread_id": thread_id}}
+        graph_config = build_langgraph_run_config(thread_id)
 
         input_state = {
             "messages": [HumanMessage(content=task)],
@@ -546,7 +542,7 @@ def run_sub_agent(
                 + "\n\n".join(tool_context_parts[-12:])
             )
             try:
-                raw_llm = get_llm(config, temperature=1.0)
+                raw_llm = get_llm(config, temperature=1.0, capture_reasoning=False)
                 summary_resp = raw_llm.invoke([HumanMessage(content=summary_prompt)])
                 if summary_resp.content and isinstance(summary_resp.content, str) and summary_resp.content.strip():
                     final_state = summary_resp.content.strip()
@@ -634,7 +630,7 @@ class Orchestrator:
         if not Orchestrator._previous_results:
             return "dispatch"
 
-        llm = get_llm(self.config, temperature=0.0)
+        llm = get_llm(self.config, temperature=0.0, capture_reasoning=False)
         route_prompt = (
             "You are a router for an APK security analysis orchestrator.\n"
             "The user is in orchestrator mode. Previous analysis results exist.\n\n"
@@ -664,7 +660,7 @@ class Orchestrator:
 
     def chat(self, user_input: str) -> str:
         """Answer conversationally using previous results as context."""
-        llm = get_llm(self.config, temperature=1.0)
+        llm = get_llm(self.config, temperature=1.0, capture_reasoning=False)
 
         # Build context from previous results
         context_parts = []
@@ -796,7 +792,7 @@ class Orchestrator:
 
     def _create_plan(self, user_task: str) -> dict:
         """Use LLM to create an execution plan mapping task to sub-agents."""
-        llm = get_llm(self.config, temperature=1.0)
+        llm = get_llm(self.config, temperature=1.0, capture_reasoning=False)
 
         plan_prompt = f"""You are an orchestrator planning how to analyze an Android APK.
 

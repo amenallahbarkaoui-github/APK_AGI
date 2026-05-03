@@ -22,8 +22,10 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from apk_agent.parallelism import recommended_file_scan_workers
+
 # Thread pool for parallel file indexing
-_INDEX_POOL = ThreadPoolExecutor(max_workers=8)
+_INDEX_POOL = ThreadPoolExecutor(max_workers=recommended_file_scan_workers())
 
 # ---------------------------------------------------------------------------
 # Regex patterns

@@ -43,7 +43,7 @@ def print_welcome(project_id: str | None = None, apk_name: str | None = None) ->
     if project_id and apk_name:
         console.print(f"  [bold bright_cyan]📦[/] [bold]{apk_name}[/]  [dim]({project_id[:12]}…)[/]")
     console.print()
-    console.print("[dim]Modes: normal chat │ /orchestrator (parallel) │ /auto (one-shot) │ /thinking (toggle reasoning)[/]")
+    console.print("[dim]Modes: normal chat │ /orchestrator (parallel) │ /auto (one-shot) │ /human (step-by-step)[/]")
     console.print("[dim]Commands: /dashboard /findings /patches /tools /status /session /tokens /help[/]")
     console.print("[dim]Type your task (e.g., 'full security audit', 'bypass premium', 'remove ads')[/]")
     console.print()
@@ -60,6 +60,15 @@ def print_ai_message(content: str) -> None:
         console.print(Panel(md, title="[bold bright_cyan]🤖 AI Agent[/]", border_style="bright_cyan", padding=(0, 1)))
     except Exception:
         console.print(Panel(content, title="[bold bright_cyan]🤖 AI Agent[/]", border_style="bright_cyan", padding=(0, 1)))
+
+
+def print_thinking(content: str) -> None:
+    """Render model reasoning/thinking in a blue panel."""
+    try:
+        md = Markdown(content)
+        console.print(Panel(md, title="[bold bright_blue]💭 Thinking[/]", border_style="bright_blue", padding=(0, 1)))
+    except Exception:
+        console.print(Panel(content, title="[bold bright_blue]💭 Thinking[/]", border_style="bright_blue", padding=(0, 1)))
 
 
 def print_tool_output(tool_name: str, content: str, success: bool = True) -> None:
@@ -130,11 +139,16 @@ class TokenTracker:
         self.turn_calls: int = 0
         self.turn_start: float = 0.0
         self._active_tool: str = ""
+        self._active_tool_names: list[str] = []
         self._active_tool_start: float = 0.0
+        self._running_tools: int = 0
         self._tool_progress_pct: float = 0.0
         self._tool_progress_detail: str = ""
         self._tools_completed_this_turn: int = 0
         self._last_tool_completed: str = ""
+        self._completed_tool_names: list[str] = []
+        self._agent_phase: str = ""
+        self._agent_phase_start: float = 0.0
 
     def start_turn(self) -> None:
         with self._lock:
@@ -143,8 +157,17 @@ class TokenTracker:
             self.turn_cached_tokens = 0
             self.turn_calls = 0
             self.turn_start = time.time()
+            self._active_tool = ""
+            self._active_tool_names = []
+            self._active_tool_start = 0.0
+            self._running_tools = 0
+            self._tool_progress_pct = 0.0
+            self._tool_progress_detail = ""
             self._tools_completed_this_turn = 0
             self._last_tool_completed = ""
+            self._completed_tool_names = []
+            self._agent_phase = ""
+            self._agent_phase_start = 0.0
 
     def record_call(self, prompt_tokens: int = 0, completion_tokens: int = 0, cached_tokens: int = 0) -> None:
         with self._lock:
@@ -159,10 +182,43 @@ class TokenTracker:
 
     def set_active_tool(self, name: str) -> None:
         with self._lock:
-            self._active_tool = name
-            self._active_tool_start = time.time()
+            normalized = str(name or "").strip()
+            if not normalized:
+                return
+            if normalized not in self._active_tool_names:
+                self._active_tool_names.append(normalized)
+            label = normalized if len(self._active_tool_names) == 1 else f"{len(self._active_tool_names)} tools running"
+            if self._active_tool != label:
+                self._active_tool_start = time.time()
+            self._active_tool = label
+            if self._running_tools <= 0:
+                self._running_tools = len(self._active_tool_names) or 1
             self._tool_progress_pct = 0.0
             self._tool_progress_detail = ""
+            self._agent_phase = ""
+            self._agent_phase_start = 0.0
+
+    def sync_running_tools(self, names: list[str]) -> None:
+        with self._lock:
+            active_names = [str(name) for name in names if str(name).strip()]
+            self._active_tool_names = active_names
+            self._running_tools = len(active_names)
+            if not active_names:
+                self._active_tool = ""
+                self._active_tool_start = 0.0
+                self._tool_progress_pct = 0.0
+                self._tool_progress_detail = ""
+                return
+
+            label = active_names[0] if len(active_names) == 1 else f"{len(active_names)} tools running"
+            if self._active_tool != label:
+                self._active_tool_start = time.time()
+                if len(active_names) > 1:
+                    self._tool_progress_pct = 0.0
+                    self._tool_progress_detail = ""
+            self._active_tool = label
+            self._agent_phase = ""
+            self._agent_phase_start = 0.0
 
     def update_tool_progress(self, pct: float, detail: str = "") -> None:
         with self._lock:
@@ -170,14 +226,44 @@ class TokenTracker:
             if detail:
                 self._tool_progress_detail = detail
 
-    def clear_active_tool(self) -> None:
+    def clear_active_tool(self, completed_name: str = "") -> None:
         with self._lock:
-            if self._active_tool:
+            completed_label = completed_name.strip()
+            if completed_label:
+                self._last_tool_completed = completed_label
+                self._tools_completed_this_turn += 1
+                self._active_tool_names = [name for name in self._active_tool_names if name != completed_label]
+                if completed_label not in self._completed_tool_names:
+                    self._completed_tool_names.append(completed_label)
+                    self._completed_tool_names = self._completed_tool_names[-6:]
+            elif self._active_tool and not self._active_tool.endswith("tools running"):
                 self._last_tool_completed = self._active_tool
                 self._tools_completed_this_turn += 1
-            self._active_tool = ""
+            if self._running_tools > 0:
+                self._running_tools -= 1
+            if self._active_tool_names:
+                self._active_tool = self._active_tool_names[0] if len(self._active_tool_names) == 1 else f"{len(self._active_tool_names)} tools running"
+            else:
+                self._active_tool = ""
+            self._active_tool_start = 0.0
             self._tool_progress_pct = 0.0
             self._tool_progress_detail = ""
+
+    def set_agent_phase(self, label: str) -> None:
+        normalized = str(label or "").strip()
+        with self._lock:
+            if not normalized:
+                self._agent_phase = ""
+                self._agent_phase_start = 0.0
+                return
+            if self._agent_phase != normalized:
+                self._agent_phase_start = time.time()
+            self._agent_phase = normalized
+
+    def clear_agent_phase(self) -> None:
+        with self._lock:
+            self._agent_phase = ""
+            self._agent_phase_start = 0.0
 
     @property
     def active_tool(self) -> str:
@@ -188,6 +274,12 @@ class TokenTracker:
         if not self._active_tool:
             return 0
         return time.time() - self._active_tool_start
+
+    @property
+    def agent_phase_elapsed(self) -> float:
+        if not self._agent_phase or not self._agent_phase_start:
+            return 0
+        return time.time() - self._agent_phase_start
 
     @property
     def turn_elapsed(self) -> float:
@@ -274,29 +366,44 @@ class LiveStatusBar:
         parts: list[str] = []
 
         # ── Active tool with spinner + progress ──
-        if tt._active_tool:
+        if tt._active_tool_names:
             elapsed = tt.active_tool_elapsed
-            tool_str = f"{spinner} [bold cyan]{tt._active_tool}[/bold cyan]"
-            if tt._tool_progress_pct > 0:
+            if len(tt._active_tool_names) == 1:
+                tool_label = tt._active_tool_names[0]
+            else:
+                names = tt._active_tool_names[:4]
+                suffix = "" if len(tt._active_tool_names) <= 4 else f", +{len(tt._active_tool_names) - 4} more"
+                tool_label = f"{len(tt._active_tool_names)} tools: {', '.join(names)}{suffix}"
+            tool_str = f"{spinner} [bold cyan]{tool_label}[/bold cyan]"
+            if tt._tool_progress_pct > 0 and len(tt._active_tool_names) <= 1:
                 pct = tt._tool_progress_pct
                 bar_width = 15
                 filled = int(pct / 100 * bar_width)
                 bar = "━" * filled + "[dim]━[/dim]" * (bar_width - filled)
                 tool_str += f" [{bar}] {pct:.0f}%"
             tool_str += f" {elapsed:.1f}s"
-            if tt._tool_progress_detail:
+            if tt._tool_progress_detail and len(tt._active_tool_names) <= 1:
                 detail = tt._tool_progress_detail
                 if len(detail) > 40:
                     detail = detail[:37] + "..."
                 tool_str += f" [dim]│ {detail}[/dim]"
             parts.append(tool_str)
+        elif tt._agent_phase:
+            parts.append(
+                f"{spinner} [bold blue]{tt._agent_phase}[/bold blue] {tt.agent_phase_elapsed:.1f}s"
+            )
+
+        if tt._completed_tool_names:
+            done_names = tt._completed_tool_names[-4:]
+            suffix = "" if tt._tools_completed_this_turn <= 4 else f", +{tt._tools_completed_this_turn - 4} more"
+            parts.append(f"[green]✓[/green] done: {', '.join(done_names)}{suffix}")
         elif tt._tools_completed_this_turn > 0:
             parts.append(f"[green]✓[/green] {tt._tools_completed_this_turn} tools done")
 
         # ── Turn timing ──
         if tt.turn_start:
             turn_t = tt.turn_elapsed
-            parts.append(f"[dim]⏱[/dim] {turn_t:.0f}s")
+            parts.append(f"[dim]⏱ turn[/dim] {turn_t:.0f}s")
 
         # ── LLM calls this turn ──
         if tt.turn_calls:
@@ -352,16 +459,24 @@ def _live_progress_listener(event: str, task) -> None:
     Replaces old print-based listener. Now updates the token_tracker's
     tool progress and triggers a bar refresh.
     """
+    from apk_agent.progress import progress_manager
+
+    active_names = [t.name for t in progress_manager.get_active_tasks()]
+
     if event == "start":
-        token_tracker.set_active_tool(task.name)
+        token_tracker.sync_running_tools(active_names or [task.name])
         live_bar.update()
     elif event == "update":
+        token_tracker.sync_running_tools(active_names or [task.name])
         pct = task.progress_pct
         detail = task.metadata.get("detail", "")
         token_tracker.update_tool_progress(pct, detail)
         live_bar.update()
     elif event == "complete":
-        token_tracker.clear_active_tool()
+        token_tracker.clear_active_tool(task.name)
+        token_tracker.sync_running_tools(active_names)
+        if not active_names:
+            token_tracker.set_agent_phase("processing tool results")
         live_bar.update()
 
 
@@ -623,20 +738,21 @@ def print_help() -> None:
   [cyan]/plan[/]               — Show the agent's current task plan
 
 [bold cyan]━━━ Modes ━━━[/]
-  [cyan]/thinking[/]           — Toggle LLM deep thinking/reasoning mode [bold](🧠)[/]
   [cyan]/auto[/]               — Toggle auto mode (no confirmations, one-shot)
+  [cyan]/human[/]              — Toggle Human Thinking mode (you guide each step)
   [cyan]/orchestrator[/]       — Switch to orchestrator mode (parallel sub-agents)
   [cyan]/normal[/]             — Switch back to normal chat mode
 
 [bold cyan]━━━ Control ━━━[/]
+  [cyan]/context[/]            — View/set context window (e.g. /context 1000000)
   [cyan]/compact[/]            — Show compaction status
   [cyan]/reset[/]              — Delete session history (start fresh)
   [cyan]/stop[/]               — Stop the current operation
   [cyan]/quit[/]               — Exit APK Agent
 
 [bold cyan]━━━ CLI Flags ━━━[/]
-  [dim]--thinking / --no-thinking[/]  — Enable/disable thinking at launch
   [dim]--model / -m MODEL[/]         — Override LLM model name
+  [dim]--context-window / -c N[/]    — Set context window in tokens (0=auto)
   [dim]--auto[/]                      — Start in auto mode
   [dim]--verbose / -v[/]             — Enable debug logging
 
@@ -1039,21 +1155,21 @@ def print_tools_list() -> None:
             categories["Manifest & Components"].append(name)
         elif name in ("scan_smali_classes", "analyze_smali_class", "find_string_decryption_patterns", "find_method_xrefs", "analyze_method_deep", "detect_protections", "trace_call_chain", "reconstruct_strings"):
             categories["Smali Analysis"].append(name)
-        elif "graph_" in name or "index_" in name or name in ("build_graph_and_index", "build_smali_index", "smali_index_stats"):
+        elif "graph_" in name or "index_" in name or name in ("build_graph_and_index", "build_smali_index", "smali_index_stats", "semantic_method_slice", "find_enforcement_surfaces", "build_behavior_graph", "summarize_behavior_graph", "query_behavior_graph", "recover_state_transitions"):
             categories["Graph & Index"].append(name)
         elif name in ("context_search", "multi_search", "xref_search", "directory_overview", "refine_search", "batch_read_smali_methods", "smart_search", "extract_strings", "search_in_code", "search_interceptors", "search_native_code", "search_dynamic_loaders"):
             categories["Search & Discovery"].append(name)
-        elif name in ("scan_vulnerabilities", "list_vuln_patterns", "unified_scan", "analyze_data_flow", "run_taint_analysis", "find_hardcoded_crypto", "scan_cloud_secrets"):
+        elif name in ("scan_vulnerabilities", "list_vuln_patterns", "unified_scan", "analyze_data_flow", "run_taint_analysis", "find_hardcoded_crypto", "scan_cloud_secrets", "generate_runtime_validation_plan", "map_security_surfaces", "analyze_network_behavior"):
             categories["Security & Scanning"].append(name)
-        elif name in ("map_feature_checks", "analyze_subscription_model", "auto_patch_bypass", "patch_flutter_ssl", "inject_network_security_config", "patch_manifest_security", "remove_ads", "list_bypass_categories", "generate_bypass_plans"):
+        elif name in ("map_feature_checks", "analyze_subscription_model", "auto_patch_bypass", "patch_flutter_ssl", "inject_network_security_config", "patch_manifest_security", "remove_ads", "list_bypass_categories", "generate_bypass_plans", "locate_feature_controls"):
             categories["Premium Bypass"].append(name)
-        elif name in ("trace_field_access", "find_class_instantiations", "inject_smali_code", "generate_constructor_override", "inject_startup_hook", "batch_patch_methods", "trace_data_pipeline", "map_ui_gates", "patch_shared_prefs_reads", "identify_server_checks"):
+        elif name in ("trace_field_access", "find_class_instantiations", "inject_smali_code", "generate_constructor_override", "inject_startup_hook", "batch_patch_methods", "trace_data_pipeline", "map_ui_gates", "patch_shared_prefs_reads", "identify_server_checks", "plan_runtime_hooks", "recover_semantic_symbols"):
             categories["Deep Tracing & Injection"].append(name)
         elif name in ("cross_reference_map", "deobfuscate_names", "find_dynamic_checks", "extract_all_urls", "verify_bypass_completeness"):
             categories["SOTA Analysis"].append(name)
         elif name in ("read_file", "write_file", "list_files", "save_evidence", "load_evidence", "search_evidence", "get_evidence_summary", "generate_report"):
             categories["File & Evidence"].append(name)
-        elif name in ("apply_smali_patch", "preview_smali_patch", "restore_smali_backup"):
+        elif name in ("apply_smali_patch", "preview_smali_patch", "restore_smali_backup", "validate_patch_pipeline"):
             categories["Patching"].append(name)
         else:
             # Default to SOTA

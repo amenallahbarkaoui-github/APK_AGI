@@ -5,11 +5,13 @@ from __future__ import annotations
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from apk_agent.progress import report_progress
 from pathlib import Path
 
+from apk_agent.parallelism import recommended_file_scan_workers
+from apk_agent.progress import report_progress
+
 # Thread pool shared across searches (file I/O bound)
-_SEARCH_POOL = ThreadPoolExecutor(max_workers=8)
+_SEARCH_POOL = ThreadPoolExecutor(max_workers=recommended_file_scan_workers())
 
 
 def read_file(path: str | Path, max_lines: int = 500, start_line: int = 0, end_line: int = 0) -> dict:

@@ -17,10 +17,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from apk_agent.parallelism import recommended_file_scan_workers
 from apk_agent.progress import report_progress
 
 # Shared thread pool for parallel search I/O
-_ADV_SEARCH_POOL = ThreadPoolExecutor(max_workers=8)
+_ADV_SEARCH_POOL = ThreadPoolExecutor(max_workers=recommended_file_scan_workers())
 
 # Smart search result cache: (query, search_type, frozenset(base_dirs)) → (timestamp, result)
 _smart_search_cache: dict[tuple, tuple[float, dict]] = {}

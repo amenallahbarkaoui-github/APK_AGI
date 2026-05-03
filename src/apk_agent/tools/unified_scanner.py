@@ -27,10 +27,31 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from apk_agent.tools.smali_ir import SmaliIndex, SmaliMethod, SmaliInstruction
+
+
+# ---------------------------------------------------------------------------
+# Enums for structured classification
+# ---------------------------------------------------------------------------
+
+class ValidationState(str, Enum):
+    """Lifecycle state of a finding's validation."""
+    PENDING = "pending"                  # default — static-only, not yet verified
+    VALIDATED = "validated"              # confirmed by runtime / dynamic check
+    FAILED = "failed"                    # runtime check disproved the finding
+    MANUAL_PENDING = "manual_pending"    # needs human review
+    NOT_APPLICABLE = "not_applicable"    # cannot be validated dynamically
+
+
+class ThreatLevel(str, Enum):
+    """APK-wide threat classification."""
+    BASIC = "basic"           # no protections, straightforward app
+    OBFUSCATED = "obfuscated" # name-mangling, string encryption, some guards
+    HARDENED = "hardened"     # anti-tamper, anti-debug, runtime checks, native guards
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +81,12 @@ class Finding:
     method_signature: str = ""             # where it was found
     class_name: str = ""
     exploitability: str = "unknown"        # trivial, easy, moderate, hard
-    confidence: str = "high"               # high, medium, low
+    confidence: str = "high"               # legacy string — kept for backwards compat
+    confidence_score: float = 0.8          # numeric [0.0 – 1.0]
+    risk_score: float = 0.0               # computed composite score
+    evidence_strength: str = "single"     # single, corroborated, strong
+    validation_state: str = ValidationState.PENDING.value
+    threat_level: str = ThreatLevel.BASIC.value
     remediation: str = ""
     related_findings: list[str] = field(default_factory=list)
     auto_patchable: bool = False
@@ -624,6 +650,103 @@ RULES: list[DetectionRule] = [
 
 
 # ---------------------------------------------------------------------------
+# Scoring & ranking utilities
+# ---------------------------------------------------------------------------
+
+_SEVERITY_WEIGHT: dict[str, float] = {
+    "CRITICAL": 1.0, "HIGH": 0.8, "MEDIUM": 0.5, "LOW": 0.25, "INFO": 0.1,
+}
+
+_EXPLOITABILITY_WEIGHT: dict[str, float] = {
+    "trivial": 1.0, "easy": 0.8, "moderate": 0.5, "hard": 0.25, "unknown": 0.4,
+}
+
+_EXPLOITABILITY_BASE_CONFIDENCE: dict[str, float] = {
+    "trivial": 0.95, "easy": 0.85, "moderate": 0.70, "hard": 0.55, "unknown": 0.60,
+}
+
+
+def _compute_confidence_score(rule: "DetectionRule", evidence_count: int) -> float:
+    """Numeric confidence [0.0–1.0] from rule exploitability + evidence density."""
+    base = _EXPLOITABILITY_BASE_CONFIDENCE.get(rule.exploitability, 0.60)
+    # More evidence → higher confidence (diminishing returns)
+    if evidence_count >= 3:
+        boost = 0.10
+    elif evidence_count >= 2:
+        boost = 0.05
+    else:
+        boost = 0.0
+    return min(1.0, base + boost)
+
+
+def _evidence_strength(evidence_count: int) -> str:
+    """Classify evidence strength."""
+    if evidence_count >= 3:
+        return "strong"
+    elif evidence_count >= 2:
+        return "corroborated"
+    return "single"
+
+
+def compute_risk_score(
+    severity: str,
+    exploitability: str,
+    confidence_score: float,
+    auto_patchable: bool,
+) -> float:
+    """Composite risk score: severity × exploitability × confidence × patchability.
+
+    Range: 0.0 – 1.0. Higher = more important to fix.
+    """
+    sev = _SEVERITY_WEIGHT.get(severity, 0.3)
+    exp = _EXPLOITABILITY_WEIGHT.get(exploitability, 0.4)
+    patch_bonus = 1.0 if auto_patchable else 0.85  # patchable → slightly prioritized
+    return round(sev * exp * confidence_score * patch_bonus, 4)
+
+
+def rank_findings(findings: list[Finding]) -> list[Finding]:
+    """Sort findings by risk_score descending, then severity."""
+    severity_order = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}
+    return sorted(
+        findings,
+        key=lambda f: (-f.risk_score, -severity_order.get(f.severity, 0)),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Threat-model classification
+# ---------------------------------------------------------------------------
+
+def classify_threat_model(findings: list[Finding]) -> ThreatLevel:
+    """Classify an APK's threat level from its findings.
+
+    Heuristic:
+      - hardened: anti-tamper / anti-debug / native guards + obfuscation
+      - obfuscated: obfuscation indicators or >2 protection categories
+      - basic: everything else
+    """
+    cats = {f.category for f in findings}
+    tags_all = set()
+    for f in findings:
+        tags_all.update(f.tags)
+
+    has_obfuscation = "Obfuscation" in cats
+    has_anti_tamper = bool({"Anti-Tamper", "Anti-Debug"} & cats)
+    has_native = "Native Code" in cats
+    has_root_detect = "Root Detection" in cats
+    protection_count = sum(1 for c in cats if c in {
+        "Root Detection", "Anti-Tamper", "Anti-Debug",
+        "Obfuscation", "SSL/TLS", "Native Code",
+    })
+
+    if has_anti_tamper and (has_obfuscation or has_native):
+        return ThreatLevel.HARDENED
+    if has_obfuscation or protection_count >= 3:
+        return ThreatLevel.OBFUSCATED
+    return ThreatLevel.BASIC
+
+
+# ---------------------------------------------------------------------------
 # Scanner engine
 # ---------------------------------------------------------------------------
 
@@ -675,6 +798,12 @@ def scan(index: "SmaliIndex", rules: list[DetectionRule] | None = None,
                 if sev_val < min_sev:
                     continue
 
+                conf_score = _compute_confidence_score(rule, len(evidences))
+                risk = compute_risk_score(
+                    rule.severity, rule.exploitability,
+                    conf_score, rule.auto_patchable,
+                )
+
                 finding = Finding(
                     id=f"{rule.rule_id}-{cls.name}->{method.name}",
                     rule_id=rule.rule_id,
@@ -687,9 +816,12 @@ def scan(index: "SmaliIndex", rules: list[DetectionRule] | None = None,
                     method_signature=method.full_signature,
                     class_name=cls.name,
                     exploitability=rule.exploitability,
+                    confidence_score=conf_score,
+                    risk_score=risk,
+                    evidence_strength=_evidence_strength(len(evidences)),
                     remediation=rule.remediation,
                     auto_patchable=rule.auto_patchable,
-                    tags=rule.tags,
+                    tags=list(rule.tags),
                 )
 
                 findings.append(finding)
@@ -700,8 +832,14 @@ def scan(index: "SmaliIndex", rules: list[DetectionRule] | None = None,
         if len(findings) >= max_findings:
             break
 
-    # Sort by severity
-    findings.sort(key=lambda f: -severity_order.get(f.severity, 0))
+    # Rank by composite risk score (replaces simple severity sort)
+    findings = rank_findings(findings)
+
+    # Classify APK threat model
+    threat = classify_threat_model(findings)
+    # Stamp threat_level on each finding so downstream consumers see it
+    for f in findings:
+        f.threat_level = threat.value
 
     # Build summary
     sev_counts: dict[str, int] = defaultdict(int)
@@ -713,6 +851,7 @@ def scan(index: "SmaliIndex", rules: list[DetectionRule] | None = None,
     return {
         "success": True,
         "total_findings": len(findings),
+        "threat_level": threat.value,
         "severity_summary": dict(sorted(sev_counts.items(),
                                         key=lambda x: -severity_order.get(x[0], 0))),
         "category_summary": dict(sorted(cat_counts.items(), key=lambda x: -x[1])),
@@ -807,6 +946,11 @@ def _finding_to_dict(f: Finding) -> dict:
         "class": f.class_name,
         "exploitability": f.exploitability,
         "confidence": f.confidence,
+        "confidence_score": f.confidence_score,
+        "risk_score": f.risk_score,
+        "evidence_strength": f.evidence_strength,
+        "validation_state": f.validation_state,
+        "threat_level": f.threat_level,
         "remediation": f.remediation,
         "auto_patchable": f.auto_patchable,
         "tags": f.tags,

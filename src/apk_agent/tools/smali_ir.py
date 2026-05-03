@@ -25,6 +25,8 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
+from apk_agent.parallelism import recommended_file_scan_workers
+
 
 # ---------------------------------------------------------------------------
 # Core IR dataclasses
@@ -62,6 +64,18 @@ class TryCatchBlock:
 
 
 @dataclass
+class BasicBlock:
+    """A basic block in a method's control flow graph."""
+    id: int
+    start_idx: int           # first instruction index in method.instructions
+    end_idx: int             # last instruction index (inclusive)
+    successors: list[int] = field(default_factory=list)   # successor block IDs
+    predecessors: list[int] = field(default_factory=list)  # predecessor block IDs
+    is_entry: bool = False
+    is_exit: bool = False
+
+
+@dataclass
 class SmaliField:
     """A .field declaration."""
     name: str
@@ -93,6 +107,89 @@ class SmaliMethod:
     string_constants: list[str] = field(default_factory=list)
     complexity: int = 0       # branches + try/catch + switches
     category: str = "general" #  crypto / network / ssl_tls / storage / ipc / …
+    basic_blocks: list[BasicBlock] = field(default_factory=list)  # CFG blocks
+
+    def build_cfg(self) -> list[BasicBlock]:
+        """Build basic blocks and CFG edges from instructions.
+
+        A new basic block starts at:
+        - The first instruction
+        - Any branch target (label)
+        - The instruction after a branch or goto
+        """
+        if not self.instructions:
+            return []
+
+        # Find block boundaries
+        leaders: set[int] = {0}  # first instruction is always a leader
+        for i, instr in enumerate(self.instructions):
+            if instr.is_branch or instr.opcode.startswith("goto"):
+                # Instruction after branch is a new leader
+                if i + 1 < len(self.instructions):
+                    leaders.add(i + 1)
+                # Branch target is a new leader (via label)
+                for op in instr.operands:
+                    if op.startswith(":"):
+                        target_idx = self.labels.get(op)
+                        if target_idx is not None:
+                            leaders.add(target_idx)
+            elif instr.is_return:
+                if i + 1 < len(self.instructions):
+                    leaders.add(i + 1)
+
+        sorted_leaders = sorted(leaders)
+        leader_to_block: dict[int, int] = {}
+
+        blocks: list[BasicBlock] = []
+        for bid, start in enumerate(sorted_leaders):
+            end = (sorted_leaders[bid + 1] - 1) if bid + 1 < len(sorted_leaders) else len(self.instructions) - 1
+            bb = BasicBlock(id=bid, start_idx=start, end_idx=end,
+                            is_entry=(bid == 0))
+            blocks.append(bb)
+            leader_to_block[start] = bid
+
+        # Build edges
+        for bb in blocks:
+            last_instr = self.instructions[bb.end_idx]
+            if last_instr.is_return:
+                bb.is_exit = True
+                continue
+            if last_instr.opcode.startswith("goto"):
+                for op in last_instr.operands:
+                    if op.startswith(":"):
+                        target_idx = self.labels.get(op)
+                        if target_idx is not None and target_idx in leader_to_block:
+                            succ = leader_to_block[target_idx]
+                            bb.successors.append(succ)
+                            blocks[succ].predecessors.append(bb.id)
+                continue
+            if last_instr.is_branch:
+                # Conditional branch: fall-through + target
+                if bb.end_idx + 1 < len(self.instructions):
+                    fall_idx = bb.end_idx + 1
+                    if fall_idx in leader_to_block:
+                        succ = leader_to_block[fall_idx]
+                        bb.successors.append(succ)
+                        blocks[succ].predecessors.append(bb.id)
+                for op in last_instr.operands:
+                    if op.startswith(":"):
+                        target_idx = self.labels.get(op)
+                        if target_idx is not None and target_idx in leader_to_block:
+                            succ = leader_to_block[target_idx]
+                            if succ not in bb.successors:
+                                bb.successors.append(succ)
+                                blocks[succ].predecessors.append(bb.id)
+                continue
+            # Fall-through
+            if bb.end_idx + 1 < len(self.instructions):
+                fall_idx = bb.end_idx + 1
+                if fall_idx in leader_to_block:
+                    succ = leader_to_block[fall_idx]
+                    bb.successors.append(succ)
+                    blocks[succ].predecessors.append(bb.id)
+
+        self.basic_blocks = blocks
+        return blocks
 
 
 @dataclass
@@ -568,7 +665,7 @@ def parse_smali_file(file_path: Path, base_dir: Path | None = None) -> SmaliClas
 # Build full index from smali directories (parallel)
 # ---------------------------------------------------------------------------
 
-_PARSE_POOL = ThreadPoolExecutor(max_workers=8)
+_PARSE_POOL = ThreadPoolExecutor(max_workers=recommended_file_scan_workers())
 
 
 def build_index(
@@ -577,7 +674,7 @@ def build_index(
 ) -> SmaliIndex:
     """Parse all smali files under *smali_dirs* and build a SmaliIndex.
 
-    Uses 8-thread parallel I/O for fast parsing.
+    Uses a CPU-aware parallel I/O worker count for fast parsing.
     ``progress_callback(pct: float, msg: str)`` is called periodically.
     """
     index = SmaliIndex()
@@ -665,8 +762,26 @@ def save_index(index: SmaliIndex, output_path: str | Path) -> dict:
     """Persist index to a pickle file."""
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "wb") as f:
-        pickle.dump(index, f, protocol=pickle.HIGHEST_PROTOCOL)
+    temp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    try:
+        with open(temp_path, "wb") as f:
+            pickle.dump(index, f, protocol=pickle.HIGHEST_PROTOCOL)
+        temp_path.replace(output_path)
+    except MemoryError:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return {
+            "success": False,
+            "path": str(output_path),
+            "error_type": "MemoryError",
+            "error": "SmaliIndex is too large to serialize with pickle in the current process memory budget.",
+            "recovery_hint": "Index remains available in the current session, but it was not persisted to disk.",
+            "classes": len(index.classes),
+            "methods": len(index.methods),
+            "strings": len(index.string_index),
+        }
     size_kb = output_path.stat().st_size / 1024
     return {
         "success": True,
@@ -683,8 +798,11 @@ def load_index(index_path: str | Path) -> SmaliIndex | None:
     p = Path(index_path)
     if not p.is_file():
         return None
-    with open(p, "rb") as f:
-        return pickle.load(f)
+    try:
+        with open(p, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return None
 
 
 def index_stats(index: SmaliIndex) -> dict:

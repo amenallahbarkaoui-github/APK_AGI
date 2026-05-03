@@ -80,8 +80,9 @@ class ProgressManager:
             self._tasks[task_id] = task
             if task_id not in self._task_order:
                 self._task_order.append(task_id)
-            self._notify("start", task)
-            return task
+            listeners = list(self._listeners)
+        self._notify("start", task, listeners)
+        return task
 
     def update_task(self, task_id: str, progress_pct: float = 0,
                     status: TaskStatus | None = None,
@@ -98,7 +99,8 @@ class ProgressManager:
                 metadata["detail"] = detail
             if metadata:
                 task.metadata.update(metadata)
-            self._notify("update", task)
+            listeners = list(self._listeners)
+        self._notify("update", task, listeners)
 
     def complete_task(self, task_id: str, success: bool = True, error: str = "") -> None:
         with self._lock:
@@ -109,7 +111,8 @@ class ProgressManager:
             task.completed_at = time.time()
             task.progress_pct = 100.0 if success else task.progress_pct
             task.error = error
-            self._notify("complete", task)
+            listeners = list(self._listeners)
+        self._notify("complete", task, listeners)
 
     def retry_task(self, task_id: str) -> bool:
         """Mark a task for retry. Returns False if max retries exceeded."""
@@ -124,8 +127,9 @@ class ProgressManager:
             task.started_at = time.time()
             task.completed_at = 0.0
             task.error = ""
-            self._notify("retry", task)
-            return True
+            listeners = list(self._listeners)
+        self._notify("retry", task, listeners)
+        return True
 
     def get_summary(self) -> dict:
         """Get a summary of all task progress."""
@@ -169,10 +173,12 @@ class ProgressManager:
             ]
 
     def add_listener(self, callback) -> None:
-        self._listeners.append(callback)
+        with self._lock:
+            self._listeners.append(callback)
 
-    def _notify(self, event: str, task: TaskProgress) -> None:
-        for listener in self._listeners:
+    def _notify(self, event: str, task: TaskProgress, listeners: list | None = None) -> None:
+        listeners = list(listeners) if listeners is not None else list(self._listeners)
+        for listener in listeners:
             try:
                 listener(event, task)
             except Exception:

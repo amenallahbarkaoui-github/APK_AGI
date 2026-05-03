@@ -35,6 +35,7 @@ class AgentState(TypedDict):
 
     # ---- graph / index readiness ----
     graph_ready: bool                # True after code graph + index built successfully
+    smali_index_ready: bool          # True after SmaliIndex IR is built (build_smali_index tool)
 
     # ---- analysis results ----
     findings: list[dict[str, Any]]
@@ -45,7 +46,7 @@ class AgentState(TypedDict):
     patch_registry: list[dict[str, Any]]  # durable patch journal — every patch attempt with full details
 
     # ---- execution history ----
-    tool_history: list[dict[str, Any]]  # [{tool, success, duration}, ...]
+    tool_history: list[dict[str, Any]]  # [{tool, success, summary, timestamp}, ...]
 
     # ---- plan execution ----
     current_plan: str   # name/description of the currently executing plan

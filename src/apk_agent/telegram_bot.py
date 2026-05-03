@@ -26,11 +26,15 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.types import Command
 
 from apk_agent.config import AppConfig
+from apk_agent.parallelism import build_langgraph_run_config
 from apk_agent.session import (
     SessionMeta,
     get_sqlite_checkpointer,
+    load_active_session,
     load_session_meta,
+    save_active_session,
     save_session_meta,
+    update_active_session,
 )
 from apk_agent.workspace import Project, ProjectManager
 
@@ -67,6 +71,16 @@ def _repo_root() -> Path:
 def _pid_is_alive(pid: int) -> bool:
     if pid <= 0:
         return False
+    if sys.platform == "win32":
+        # os.kill(pid, 0) can hang on Windows — use ctypes instead
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        kernel32.CloseHandle(handle)
+        return True
     try:
         os.kill(pid, 0)
     except OSError:
@@ -196,6 +210,7 @@ def ensure_telegram_bot_running(config: AppConfig, *, verbose: bool = False) -> 
         stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL,
         creationflags=creationflags,
+        env={**os.environ, "WORKSPACE_ROOT": str(config.workspace_path)},
     )
 
     _write_process_status(
@@ -213,8 +228,8 @@ def ensure_telegram_bot_running(config: AppConfig, *, verbose: bool = False) -> 
 @dataclass
 class TelegramChatState:
     current_project_id: str = ""
-    thinking_enabled: bool = True
     auto_mode: bool = False
+    human_mode: bool = False
     pending_interrupt: bool = False
     awaiting_mode_choice: bool = False
     busy: bool = False
@@ -223,6 +238,18 @@ class TelegramChatState:
     status_message_id: int = 0
     status_text: str = ""
     status_recent_events: list[str] = field(default_factory=list)
+    # Progress tracking
+    task_start_time: float = 0.0
+    tools_run: int = 0
+    tools_failed: int = 0
+    findings_count: int = 0
+    patches_count: int = 0
+    current_phase: str = ""
+    last_tool_name: str = ""
+    # Token tracking
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cached_tokens: int = 0
 
 
 class TelegramStateStore:
@@ -257,15 +284,15 @@ class TelegramStateStore:
             self._data["last_update_id"] = update_id
             self._save()
 
-    def get_chat(self, chat_id: int, default_thinking: bool) -> TelegramChatState:
+    def get_chat(self, chat_id: int, _default_thinking: bool = True) -> TelegramChatState:
         with self._lock:
             raw = (self._data.get("chats") or {}).get(str(chat_id)) or {}
             if not raw:
-                return TelegramChatState(thinking_enabled=default_thinking)
+                return TelegramChatState()
             return TelegramChatState(
                 current_project_id=raw.get("current_project_id", ""),
-                thinking_enabled=raw.get("thinking_enabled", default_thinking),
                 auto_mode=raw.get("auto_mode", False),
+                human_mode=raw.get("human_mode", False),
                 pending_interrupt=raw.get("pending_interrupt", False),
                 awaiting_mode_choice=raw.get("awaiting_mode_choice", False),
                 busy=raw.get("busy", False),
@@ -274,6 +301,16 @@ class TelegramStateStore:
                 status_message_id=int(raw.get("status_message_id", 0) or 0),
                 status_text=str(raw.get("status_text", "") or ""),
                 status_recent_events=list(raw.get("status_recent_events", []) or [])[-_MAX_STATUS_EVENTS:],
+                task_start_time=float(raw.get("task_start_time", 0.0) or 0.0),
+                tools_run=int(raw.get("tools_run", 0) or 0),
+                tools_failed=int(raw.get("tools_failed", 0) or 0),
+                findings_count=int(raw.get("findings_count", 0) or 0),
+                patches_count=int(raw.get("patches_count", 0) or 0),
+                current_phase=str(raw.get("current_phase", "") or ""),
+                last_tool_name=str(raw.get("last_tool_name", "") or ""),
+                prompt_tokens=int(raw.get("prompt_tokens", 0) or 0),
+                completion_tokens=int(raw.get("completion_tokens", 0) or 0),
+                cached_tokens=int(raw.get("cached_tokens", 0) or 0),
             )
 
     def save_chat(self, chat_id: int, state: TelegramChatState) -> None:
@@ -443,12 +480,126 @@ def _format_tool_batch(messages: list[ToolMessage]) -> str:
     return "\n\n".join(lines)
 
 
+def _phase_icon(headline: str) -> str:
+    """Return an emoji icon based on the current phase headline."""
+    h = headline.lower()
+    if "upload" in h or "receiv" in h:
+        return "📥"
+    if "download" in h:
+        return "⬇️"
+    if "import" in h:
+        return "📂"
+    if "decompil" in h:
+        return "🔬"
+    if "running" in h or "tool" in h:
+        return "⚙️"
+    if "analys" in h or "scan" in h:
+        return "🔍"
+    if "patch" in h:
+        return "🩹"
+    if "sign" in h or "build" in h:
+        return "📝"
+    if "complet" in h or "done" in h or "finished" in h:
+        return "✅"
+    if "fail" in h or "error" in h:
+        return "❌"
+    if "wait" in h or "idle" in h:
+        return "💤"
+    if "approv" in h or "auto" in h:
+        return "🤖"
+    if "queued" in h or "start" in h:
+        return "🚀"
+    if "nudge" in h:
+        return "💡"
+    if "busy" in h:
+        return "⏳"
+    if "setting" in h or "updated" in h:
+        return "⚙️"
+    if "reset" in h:
+        return "🔄"
+    return "📡"
+
+
+def _format_elapsed(seconds: float) -> str:
+    """Format elapsed seconds into a human-readable string."""
+    seconds = max(0, seconds)
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    minutes = int(seconds // 60)
+    secs = int(seconds % 60)
+    if minutes < 60:
+        return f"{minutes}m {secs}s"
+    hours = minutes // 60
+    mins = minutes % 60
+    return f"{hours}h {mins}m"
+
+
+def _extract_tool_insight(tool_name: str, content: str) -> str:
+    """Extract a brief human-readable insight from a tool result."""
+    content = str(content or "").strip()
+    if not content:
+        return ""
+    # Try to parse JSON for structured results
+    try:
+        data = json.loads(content)
+        if isinstance(data, dict):
+            # Common patterns in tool results
+            if "findings" in data and isinstance(data["findings"], list):
+                return f"found {len(data['findings'])} items"
+            if "classes" in data:
+                count = data["classes"] if isinstance(data["classes"], int) else len(data["classes"])
+                return f"{count} classes"
+            if "matches" in data and isinstance(data["matches"], list):
+                return f"{len(data['matches'])} matches"
+            if "vulnerabilities" in data and isinstance(data["vulnerabilities"], list):
+                return f"{len(data['vulnerabilities'])} vulns"
+            if "graph" in data and isinstance(data["graph"], dict):
+                nodes = data["graph"].get("nodes", 0)
+                edges = data["graph"].get("edges", 0)
+                return f"{nodes} nodes, {edges} edges"
+            if "patched" in data:
+                return "patch applied" if data.get("success") else "patch failed"
+            if data.get("success") is False:
+                err = data.get("error", "")
+                return f"failed: {_shorten(str(err), max_chars=60)}" if err else "failed"
+            if data.get("success") is True:
+                return "success"
+    except (json.JSONDecodeError, TypeError, KeyError):
+        pass
+    return ""
+
+
+def _categorize_tools(tool_names: list[str]) -> dict[str, list[str]]:
+    """Group tool names into categories for display."""
+    categories: dict[str, list[str]] = {}
+    for name in tool_names:
+        lower = name.lower()
+        if any(k in lower for k in ("scan", "vuln", "finding", "detect")):
+            cat = "🔍 Analysis"
+        elif any(k in lower for k in ("patch", "smali", "bypass")):
+            cat = "🩹 Patching"
+        elif any(k in lower for k in ("graph", "index", "build")):
+            cat = "📊 Indexing"
+        elif any(k in lower for k in ("manifest", "component", "resource")):
+            cat = "📄 Inspection"
+        elif any(k in lower for k in ("sign", "align", "apk")):
+            cat = "📦 Packaging"
+        elif any(k in lower for k in ("read", "write", "file", "search", "list")):
+            cat = "📁 File ops"
+        elif any(k in lower for k in ("taint", "flow", "trace", "xref")):
+            cat = "🔗 Tracing"
+        else:
+            cat = "⚙️ Tools"
+        categories.setdefault(cat, []).append(name)
+    return categories
+
+
 def _reply_keyboard() -> dict[str, Any]:
     return {
         "keyboard": [
-            [{"text": "thinking on"}, {"text": "thinking off"}],
-            [{"text": "/auto on"}, {"text": "/auto off"}],
-            [{"text": "/status"}, {"text": "/new"}],
+            [{"text": "/status"}, {"text": "/auto on"}, {"text": "/auto off"}],
+            [{"text": "/human on"}, {"text": "/human off"}, {"text": "/context"}],
+            [{"text": "/new"}, {"text": "/help"}],
         ],
         "resize_keyboard": True,
         "one_time_keyboard": False,
@@ -471,6 +622,47 @@ class TelegramBotService:
         self._status_lock = threading.Lock()
         self._recent_messages: dict[tuple[int, str], float] = {}
         self._process_lock: TelegramProcessLock | None = None
+
+    def _load_chat_state(self, chat_id: int) -> TelegramChatState:
+        state = self.state_store.get_chat(chat_id, True)
+        return self._recover_stale_busy_state(chat_id, state)
+
+    def _recover_stale_busy_state(self, chat_id: int, state: TelegramChatState) -> TelegramChatState:
+        """Clear persisted busy state when no Telegram worker actually owns it anymore."""
+        if not state.busy:
+            return state
+
+        # If this process is still actively serving this chat, keep the busy flag.
+        if self.active_chat_id == chat_id and self.worker_lock.locked():
+            return state
+
+        active = load_active_session(self.config.workspace_path)
+        shared_task_running = bool(
+            active
+            and active.started_by == "telegram"
+            and active.status == "running"
+            and (not state.current_project_id or active.project_id == state.current_project_id)
+        )
+        if shared_task_running:
+            return state
+
+        state.busy = False
+        state.pending_interrupt = False
+        state.task_start_time = 0.0
+        state.current_phase = "recovered"
+        state.last_tool_name = ""
+        self._append_status_event(state, "Recovered stale Telegram task state")
+        self.state_store.save_chat(chat_id, state)
+
+        if active and active.started_by == "telegram":
+            update_active_session(
+                self.config.workspace_path,
+                status="idle",
+                phase="recovered stale task",
+                last_tool="",
+            )
+
+        return state
 
     def _prune_recent_messages(self, now: float) -> None:
         expire_before = now - max(30.0, _OUTBOUND_DEDUPE_WINDOW_SEC * 6)
@@ -530,25 +722,69 @@ class TelegramBotService:
         state.status_recent_events = state.status_recent_events[-_MAX_STATUS_EVENTS:]
 
     def _build_status_text(self, state: TelegramChatState, headline: str, detail: str = "") -> str:
-        lines = [
-            "APK Agent Live Status",
-            f"Project: {state.current_project_id or 'none'}",
-            f"Thinking: {'ON' if state.thinking_enabled else 'OFF'} | Auto: {'ON' if state.auto_mode else 'OFF'} | Busy: {'YES' if state.busy else 'NO'}",
-        ]
+        lines: list[str] = []
 
-        if headline:
-            lines.append(f"Stage: {_shorten(headline, max_chars=220)}")
+        # Header with phase icon
+        phase_icon = _phase_icon(headline)
+        lines.append(f"{phase_icon} {headline}")
 
+        # Project info
+        if state.current_project_id:
+            lines.append(f"📦 Project: {state.current_project_id[:12]}")
+
+        # Elapsed time
+        if state.task_start_time > 0 and state.busy:
+            elapsed = time.time() - state.task_start_time
+            lines.append(f"⏱ Elapsed: {_format_elapsed(elapsed)}")
+
+        # Progress bar (visual)
+        if state.tools_run > 0:
+            lines.append("")
+            lines.append(f"🔧 Tools: {state.tools_run} run" + (f" ({state.tools_failed} failed)" if state.tools_failed else ""))
+            if state.findings_count > 0:
+                lines.append(f"🔍 Findings: {state.findings_count}")
+            if state.patches_count > 0:
+                lines.append(f"🩹 Patches: {state.patches_count}")
+
+        # Token usage
+        total_tokens = state.prompt_tokens + state.completion_tokens
+        if total_tokens > 0:
+            lines.append(f"📊 Tokens: {total_tokens:,} (in:{state.prompt_tokens:,} out:{state.completion_tokens:,})"
+                         + (f" cached:{state.cached_tokens:,}" if state.cached_tokens else ""))
+
+        # Current tool
+        if state.last_tool_name and state.busy:
+            lines.append(f"\n⚙️ Current: {state.last_tool_name}")
+
+        # Mode badges
+        mode_parts: list[str] = []
+        if state.auto_mode:
+            mode_parts.append("🤖 Auto")
+        if state.human_mode:
+            mode_parts.append("🧠 Human")
+        if state.busy:
+            mode_parts.append("⏳ Working")
+        elif state.pending_interrupt:
+            mode_parts.append("❓ Awaiting reply")
+        else:
+            mode_parts.append("💤 Idle")
+        lines.append("\n" + " │ ".join(mode_parts))
+
+        # Detail text
         if detail:
-            for raw_line in str(detail).splitlines():
-                raw_line = raw_line.strip()
-                if raw_line:
-                    lines.append(_shorten(raw_line, max_chars=240))
+            detail_lines = str(detail).strip().splitlines()
+            if detail_lines:
+                lines.append("")
+                for raw_line in detail_lines[:4]:
+                    raw_line = raw_line.strip()
+                    if raw_line:
+                        lines.append(_shorten(raw_line, max_chars=240))
 
+        # Recent activity log
         if state.status_recent_events:
-            lines.append("Recent activity:")
+            lines.append("\n📋 Recent:")
             for event in state.status_recent_events[-6:]:
-                lines.append(f"- {event}")
+                lines.append(f"  • {event}")
 
         text = "\n".join(lines)
         if len(text) > _STATUS_TEXT_LIMIT:
@@ -615,7 +851,20 @@ class TelegramBotService:
         final_error = ""
 
         try:
-            me = self.api.get_me()
+            # Retry get_me() — transient DNS / network failures shouldn't kill the bridge
+            for _attempt in range(5):
+                try:
+                    me = self.api.get_me()
+                    break
+                except Exception as _net_err:
+                    if _attempt >= 4:
+                        raise
+                    wait = (_attempt + 1) * 5
+                    logger.warning(
+                        "get_me() failed (attempt %d/5): %s — retrying in %ds",
+                        _attempt + 1, _net_err, wait,
+                    )
+                    time.sleep(wait)
             _write_process_status(
                 self.config.workspace_path,
                 {
@@ -694,16 +943,19 @@ class TelegramBotService:
     def _handle_command(self, chat_id: int, text: str) -> None:
         cmd, _, arg = text.partition(" ")
         arg = arg.strip().lower()
-        state = self.state_store.get_chat(chat_id, self.config.thinking_enabled)
+        state = self._load_chat_state(chat_id)
 
         if cmd == "/start":
             self._send_message(
                 chat_id,
-                "APK Agent Telegram bridge is ready.\n\n"
-                "1. Send an APK or XAPK file.\n"
-                "2. Choose thinking mode with `thinking on` or `thinking off`.\n"
-                "3. Send your task, for example: `bypass premium and return the signed apk`.\n\n"
-                "Commands: /help /status /new /thinking /auto",
+                "🔬 APK Agent — Android RE & Patching\n\n"
+                "📥 Send an APK or XAPK file to start\n"
+                "💬 Then describe your task\n\n"
+                "Examples:\n"
+                "• \"full security audit\"\n"
+                "• \"bypass premium and return signed apk\"\n"
+                "• \"remove ads and root detection\"\n\n"
+                "Commands: /help /status /auto /context /new",
                 reply_markup=_reply_keyboard(),
             )
             self._set_status(
@@ -718,12 +970,13 @@ class TelegramBotService:
         if cmd == "/help":
             self._send_message(
                 chat_id,
-                "Commands:\n"
-                "/status - show current project and modes\n"
-                "/new - clear current project and wait for a new APK\n"
-                "/thinking on|off - toggle deep thinking\n"
-                "/auto on|off - toggle auto-approval mode\n\n"
-                "You can also send plain text: `thinking on` / `thinking off`.",
+                "📖 APK Agent Commands\n\n"
+                "📊 /status — live progress & stats\n"
+                "🤖 /auto on|off — auto-approve mode\n"
+                "🧠 /human on|off — step-by-step mode (you guide each action)\n"
+                "📐 /context [N] — view/set context window\n"
+                "🔄 /new — reset & upload new APK\n\n"
+                "Just send an APK file, then describe your task!",
             )
             return
 
@@ -745,27 +998,22 @@ class TelegramBotService:
             return
 
         if cmd == "/status":
-            self._set_status(
-                chat_id,
-                "Current bridge state",
-                f"Pending interrupt: {'yes' if state.pending_interrupt else 'no'}",
-                record_event=None,
-            )
-            return
+            # Fast path: build text and send directly without locking / editing the pinned status
+            status_text = self._build_status_text(state, "Current status")
 
-        if cmd == "/thinking":
-            if arg in {"on", "off"}:
-                state.thinking_enabled = arg == "on"
-                state.awaiting_mode_choice = False
-                self._set_status(
-                    chat_id,
-                    state,
-                    "Setting updated",
-                    f"Thinking mode is now {'ON' if state.thinking_enabled else 'OFF'}.",
-                    record_event=f"Thinking mode -> {'ON' if state.thinking_enabled else 'OFF'}",
-                )
-            else:
-                self._send_message(chat_id, f"Thinking mode is {'ON' if state.thinking_enabled else 'OFF'}. Use /thinking on or /thinking off.")
+            # Show shared active session (may originate from CLI)
+            active = load_active_session(self.config.workspace_path)
+            if active:
+                src = "CLI" if active.started_by == "cli" else "Telegram"
+                status_text += f"\n\n🔗 Active session ({src}):"
+                status_text += f"\n📦 Project: {active.project_id[:12]}"
+                status_text += f"\n📊 Status: {active.status}"
+                if active.phase:
+                    status_text += f"\n🏷 Phase: {active.phase}"
+                if active.last_tool:
+                    status_text += f"\n⚙️ Last tool: {active.last_tool}"
+
+            self._send_message(chat_id, status_text)
             return
 
         if cmd == "/auto":
@@ -782,10 +1030,72 @@ class TelegramBotService:
                 self._send_message(chat_id, f"Auto mode is {'ON' if state.auto_mode else 'OFF'}. Use /auto on or /auto off.")
             return
 
+        if cmd == "/human":
+            if arg in {"on", "off"}:
+                state.human_mode = arg == "on"
+                if state.human_mode:
+                    msg = (
+                        "🧠 Human Thinking mode ON\n\n"
+                        "You guide each step. The agent executes one action, "
+                        "shows you the result, and waits for your next instruction."
+                    )
+                else:
+                    msg = "🧠 Human Thinking mode OFF — agent runs autonomously."
+                self._set_status(
+                    chat_id,
+                    state,
+                    "Setting updated",
+                    msg,
+                    record_event=f"Human mode -> {'ON' if state.human_mode else 'OFF'}",
+                )
+            else:
+                self._send_message(
+                    chat_id,
+                    f"🧠 Human Thinking mode is {'ON' if state.human_mode else 'OFF'}.\n"
+                    "Use /human on or /human off.",
+                )
+            return
+
+        if cmd == "/context":
+            if arg:
+                try:
+                    val = int(arg)
+                    if val <= 0:
+                        raise ValueError
+                    self.config.context_window = val
+                    threshold = int(val * 0.50)
+                    self._send_message(
+                        chat_id,
+                        f"✅ Context window → {val:,} tokens\n"
+                        f"Auto-compact at {threshold:,} tokens (50%).",
+                    )
+                except ValueError:
+                    self._send_message(chat_id, "❌ Usage: /context <tokens>\nExample: /context 128000")
+            else:
+                if self.config.context_window > 0:
+                    threshold = int(self.config.context_window * 0.50)
+                    self._send_message(
+                        chat_id,
+                        f"📐 Context window: {self.config.context_window:,} tokens\n"
+                        f"Auto-compact at: {threshold:,} tokens (50%)\n\n"
+                        "Use /context <tokens> to change.",
+                    )
+                else:
+                    from apk_agent.llm.provider import _FALLBACK_CONTEXT_WINDOW
+                    threshold = int(_FALLBACK_CONTEXT_WINDOW * 0.50)
+                    self._send_message(
+                        chat_id,
+                        f"⚠️ Context window not set — using fallback {_FALLBACK_CONTEXT_WINDOW:,} tokens\n"
+                        f"Auto-compact at: {threshold:,} tokens (50%)\n\n"
+                        "Set it: /context <tokens>\n"
+                        "Example: /context 128000",
+                    )
+            return
+
         self._send_message(chat_id, "Unknown command. Use /help.")
 
     def _handle_document(self, chat_id: int, message: dict[str, Any]) -> None:
-        state = self.state_store.get_chat(chat_id, self.config.thinking_enabled)
+        state = self._load_chat_state(chat_id)
         if state.busy:
             self._send_message(chat_id, "A task is already running. Wait for it to finish before uploading another APK.")
             return
@@ -807,6 +1117,18 @@ class TelegramBotService:
             )
             return
 
+        # -----------------------------------------------------------
+        # Check if there's already an active project (from CLI or earlier)
+        # If so, import the APK into that project instead of creating new
+        # -----------------------------------------------------------
+        active = load_active_session(self.config.workspace_path)
+        existing_project: Project | None = None
+        if active and active.project_id:
+            try:
+                existing_project = self.pm.open_project(active.project_id)
+            except Exception:
+                existing_project = None
+
         chat_upload_dir = self.config.workspace_path / "telegram_uploads" / str(chat_id)
         download_path = chat_upload_dir / file_name
 
@@ -824,8 +1146,18 @@ class TelegramBotService:
             self._send_chat_action(chat_id, "upload_document")
             self._set_status(chat_id, state, "Downloading APK from Telegram", f"Downloading {file_name} from Telegram cloud.", record_event=f"Downloading {file_name}")
             self.api.download_file(telegram_file["file_path"], download_path)
-            self._set_status(chat_id, state, "Importing APK into workspace", f"Creating project from {file_name}.", record_event="Importing APK into workspace")
-            project = self.pm.create_project(download_path, self.config.max_apk_size_mb)
+
+            if existing_project:
+                # Import into the existing active project instead of creating new
+                import shutil
+                dest = Path(existing_project.workspace_path) / "input" / "original.apk"
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(download_path), str(dest))
+                project = existing_project
+                self._set_status(chat_id, state, "APK added to existing project", f"Linked to active project {project.id[:12]}.", record_event=f"APK added to project {project.id[:12]}")
+            else:
+                self._set_status(chat_id, state, "Importing APK into workspace", f"Creating project from {file_name}.", record_event="Importing APK into workspace")
+                project = self.pm.create_project(download_path, self.config.max_apk_size_mb)
         except Exception as exc:
             logger.exception("Failed to import Telegram APK")
             self._set_status(
@@ -850,42 +1182,69 @@ class TelegramBotService:
         state.busy = False
         state.last_artifact_path = ""
         state.last_artifact_mtime = 0.0
+
+        # Announce project to shared state so CLI can see it
+        from apk_agent.session import ActiveSession
+        save_active_session(
+            self.config.workspace_path,
+            ActiveSession(
+                project_id=project.id,
+                apk_name=project.apk_name,
+                started_by="telegram",
+                started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                status="idle",
+                pid=os.getpid(),
+            ),
+        )
+
+        linked_label = "linked to active project" if existing_project else "new project created"
         self._set_status(
             chat_id,
             state,
             "APK imported successfully",
-            f"Project: {project.id}\nFile: {project.apk_name}\nChoose thinking mode, then send your task.",
-            record_event=f"Project ready: {project.id}",
+            f"Project: {project.id}\nFile: {project.apk_name}\n({linked_label})\nSend your task.",
+            record_event=f"Project ready: {project.id} ({linked_label})",
         )
 
         self._send_message(
             chat_id,
-            f"APK received successfully.\nProject: {project.id}\nFile: {project.apk_name}\n\n"
-            f"Thinking is currently {'ON' if state.thinking_enabled else 'OFF'}.\n"
-            "Reply with `thinking on` or `thinking off`, then send your task.",
+            f"✅ APK imported!\n\n"
+            f"📦 {project.apk_name}\n"
+            f"🆔 {project.id[:12]}\n"
+            f"{'🔗 Linked to active project' if existing_project else '🆕 New project created'}\n\n"
+            "Now send your task. Examples:\n"
+            "• \"full security audit\"\n"
+            "• \"bypass premium\"\n"
+            "• \"remove ads and sign\"",
             reply_markup=_reply_keyboard(),
             dedupe_key=f"apk-ready:{project.id}",
         )
 
     def _handle_text(self, chat_id: int, text: str) -> None:
-        state = self.state_store.get_chat(chat_id, self.config.thinking_enabled)
+        state = self._load_chat_state(chat_id)
         lowered = text.strip().lower()
 
-        if lowered in {"thinking on", "thinking off"}:
-            state.thinking_enabled = lowered.endswith("on")
-            state.awaiting_mode_choice = False
-            self._set_status(
-                chat_id,
-                state,
-                "Setting updated",
-                f"Thinking mode is now {'ON' if state.thinking_enabled else 'OFF'}. Now send your task.",
-                record_event=f"Thinking mode -> {'ON' if state.thinking_enabled else 'OFF'}",
-            )
-            return
-
         if not state.current_project_id:
-            self._send_message(chat_id, "No active project yet. Send an APK or XAPK file first.")
-            return
+            # Auto-link to an active project started from CLI (or another Telegram session)
+            active = load_active_session(self.config.workspace_path)
+            if active and active.project_id:
+                try:
+                    project = self.pm.open_project(active.project_id)
+                    state.current_project_id = project.id
+                    self.state_store.save_chat(chat_id, state)
+                    src = "CLI" if active.started_by == "cli" else "Telegram"
+                    self._send_message(
+                        chat_id,
+                        f"🔗 Auto-linked to active project from {src}:\n"
+                        f"📦 {project.apk_name}\n"
+                        f"🆔 {project.id[:12]}",
+                    )
+                except Exception:
+                    self._send_message(chat_id, "No active project yet. Send an APK or XAPK file first.")
+                    return
+            else:
+                self._send_message(chat_id, "No active project yet. Send an APK or XAPK file first.")
+                return
 
         if state.busy:
             self._send_message(chat_id, "A task is already running. Wait for the current run to finish.")
@@ -912,7 +1271,7 @@ class TelegramBotService:
 
     def _run_turn_worker(self, chat_id: int, text: str, resume: bool) -> None:
         if not self.worker_lock.acquire(blocking=False):
-            state = self.state_store.get_chat(chat_id, self.config.thinking_enabled)
+            state = self.state_store.get_chat(chat_id, True)
             state.busy = False
             self._set_status(
                 chat_id,
@@ -928,35 +1287,57 @@ class TelegramBotService:
             self._run_turn(chat_id, text, resume=resume)
         except Exception as exc:
             logger.exception("Telegram turn failed")
-            state = self.state_store.get_chat(chat_id, self.config.thinking_enabled)
+            state = self.state_store.get_chat(chat_id, True)
             state.pending_interrupt = False
             state.busy = False
+            state.current_phase = "error"
+            update_active_session(self.config.workspace_path, status="idle", phase="error")
+            elapsed = time.time() - state.task_start_time if state.task_start_time > 0 else 0
             self._set_status(
                 chat_id,
                 state,
                 "Agent run failed",
-                str(exc),
-                record_event=f"Run failed: {_shorten(str(exc), max_chars=120)}",
+                f"Error: {_shorten(str(exc), max_chars=200)}\n"
+                f"After {_format_elapsed(elapsed)}, {state.tools_run} tools run",
+                record_event=f"❌ Failed: {_shorten(str(exc), max_chars=120)}",
             )
-            self._send_message(chat_id, f"Agent run failed: {exc}")
+            self._send_message(chat_id, f"❌ Agent run failed after {_format_elapsed(elapsed)}:\n{_shorten(str(exc), max_chars=300)}")
         finally:
             self.active_chat_id = None
             self.worker_lock.release()
 
     def _run_turn(self, chat_id: int, text: str, *, resume: bool) -> None:
-        state = self.state_store.get_chat(chat_id, self.config.thinking_enabled)
+        state = self.state_store.get_chat(chat_id, True)
         project = self.pm.open_project(state.current_project_id)
         config = AppConfig.load()
-        config.thinking_enabled = state.thinking_enabled
         config.validate()
 
+        # Announce active session so CLI can see it
+        from apk_agent.session import ActiveSession
+        save_active_session(
+            config.workspace_path,
+            ActiveSession(
+                project_id=project.id,
+                apk_name=project.apk_name,
+                started_by="telegram",
+                started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                status="running",
+                pid=os.getpid(),
+            ),
+        )
+
         session_meta = self._load_or_create_session_meta(project, config, auto_mode=state.auto_mode)
+
+        # Set mode flags at graph/tool level
+        import apk_agent.agent.tools_def as _td
+        _td._auto_mode = state.auto_mode
+        _td._human_mode = state.human_mode
 
         from apk_agent.agent.graph import build_graph, set_active_thread
 
         checkpointer = get_sqlite_checkpointer(project.workspace_path)
         graph, _ = build_graph(config, project, checkpointer=checkpointer)
-        graph_config = {"configurable": {"thread_id": session_meta.thread_id}}
+        graph_config = build_langgraph_run_config(session_meta.thread_id)
         set_active_thread(session_meta.thread_id)
 
         stream_input: Any
@@ -971,13 +1352,23 @@ class TelegramBotService:
 
         state.status_recent_events = []
         state.pending_interrupt = False
+        state.task_start_time = time.time()
+        state.tools_run = 0
+        state.tools_failed = 0
+        state.findings_count = 0
+        state.patches_count = 0
+        state.prompt_tokens = 0
+        state.completion_tokens = 0
+        state.cached_tokens = 0
+        state.last_tool_name = ""
+        state.current_phase = "starting"
         self._send_chat_action(chat_id, "typing")
         self._set_status(
             chat_id,
             state,
             "Starting task",
             f"Project: {project.id}\nRequest: {_shorten(text, max_chars=240)}",
-            record_event=f"Task started: {_shorten(text, max_chars=120)}",
+            record_event=f"🚀 Task started: {_shorten(text, max_chars=120)}",
         )
 
         while True:
@@ -996,28 +1387,33 @@ class TelegramBotService:
             if not interrupt_info:
                 break
 
-            if state.auto_mode:
+            is_human_step = interrupt_info.get("human_step", False)
+
+            if state.auto_mode and not is_human_step:
                 prompt_preview = _shorten(interrupt_info.get("prompt", ""), max_chars=220)
                 self._set_status(
                     chat_id,
                     state,
-                    "Auto-approving agent prompt",
+                    "Auto-approving",
                     prompt_preview,
-                    record_event="Auto approval sent to agent",
+                    record_event="🤖 Auto-approved",
                 )
                 stream_input = interrupt_info["response"]
                 is_resume = True
                 continue
 
+            # Pause and wait for user input (always for human_step, or non-auto mode)
             state.pending_interrupt = True
             state.busy = False
+            headline = "🧠 What's next?" if is_human_step else "Waiting for your reply"
+            event_tag = "🧠 Awaiting next step" if is_human_step else "❓ Awaiting user input"
             self.state_store.save_chat(chat_id, state)
             self._set_status(
                 chat_id,
                 state,
-                "Waiting for your reply",
+                headline,
                 interrupt_info.get("prompt", ""),
-                record_event="Awaiting Telegram reply",
+                record_event=event_tag,
             )
             self._send_message(
                 chat_id,
@@ -1030,15 +1426,45 @@ class TelegramBotService:
 
         state.pending_interrupt = False
         state.busy = False
+        state.last_tool_name = ""
+        state.current_phase = "completed"
+        update_active_session(self.config.workspace_path, status="idle", phase="completed")
+
+        # Build completion summary
+        elapsed = time.time() - state.task_start_time if state.task_start_time > 0 else 0
+        summary_parts = [f"⏱ Time: {_format_elapsed(elapsed)}"]
+        if state.tools_run:
+            summary_parts.append(f"🔧 Tools: {state.tools_run}" + (f" ({state.tools_failed} failed)" if state.tools_failed else ""))
+        if state.findings_count:
+            summary_parts.append(f"🔍 Findings: {state.findings_count}")
+        if state.patches_count:
+            summary_parts.append(f"🩹 Patches: {state.patches_count}")
+        total_tokens = state.prompt_tokens + state.completion_tokens
+        if total_tokens > 0:
+            summary_parts.append(f"📊 Tokens: {total_tokens:,} (in:{state.prompt_tokens:,} out:{state.completion_tokens:,})"
+                                 + (f" cached:{state.cached_tokens:,}" if state.cached_tokens else ""))
+
         self._set_status(
             chat_id,
             state,
             "Task completed",
-            "Checking final signed APK and preparing delivery.",
-            record_event="Task finished",
+            "\n".join(summary_parts),
+            record_event="✅ Task finished",
         )
         session_meta.touch()
         save_session_meta(session_meta, project.workspace_path)
+
+        # Send completion summary as a separate message
+        self._send_message(
+            chat_id,
+            f"✅ Task completed!\n\n" + "\n".join(summary_parts),
+            dedupe_key=f"complete:{session_meta.thread_id}:{state.tools_run}",
+        )
+
+        # Send report if available
+        self._send_report_if_ready(chat_id, project)
+
+        # Send final signed APK
         self._send_final_artifact_if_ready(chat_id, project, state)
 
     def _build_input_state(self, graph, graph_config: dict[str, Any], user_input: str, project: Project) -> dict[str, Any]:
@@ -1081,7 +1507,6 @@ class TelegramBotService:
     def _load_or_create_session_meta(self, project: Project, config: AppConfig, *, auto_mode: bool) -> SessionMeta:
         meta = load_session_meta(project.workspace_path)
         if meta is not None:
-            meta.thinking_mode = config.thinking_enabled
             meta.auto_mode = auto_mode
             return meta
 
@@ -1090,7 +1515,6 @@ class TelegramBotService:
             project_id=project.id,
             created_at=_now_iso(),
             last_active_at=_now_iso(),
-            thinking_mode=config.thinking_enabled,
             auto_mode=auto_mode,
         )
         save_session_meta(meta, project.workspace_path)
@@ -1102,52 +1526,221 @@ class TelegramBotService:
                 messages = node_output.get("messages", [])
                 for msg in messages:
                     if isinstance(msg, AIMessage):
-                        if msg.content and isinstance(msg.content, str) and msg.content.strip():
+                        # ── Thinking / reasoning (mirrors CLI exactly) ──
+                        from apk_agent.llm.provider import pop_last_reasoning
+                        reasoning = pop_last_reasoning()
+                        if not reasoning:
+                            ak = getattr(msg, "additional_kwargs", {}) or {}
+                            reasoning = (
+                                ak.get("reasoning_text")
+                                or ak.get("reasoning_content")
+                                or ak.get("thinking")
+                            )
+                            if reasoning and isinstance(reasoning, str) and reasoning.strip():
+                                reasoning = reasoning.strip()
+                            else:
+                                reasoning = None
+                        if reasoning:
                             self._send_message(
                                 chat_id,
-                                msg.content,
-                                dedupe_key=f"ai:{hashlib.sha1(msg.content.encode('utf-8')).hexdigest()}",
+                                f"💭 Thinking:\n\n{_summarize_tool_content(reasoning, max_chars=3200)}",
+                                dedupe_key=f"think:{hashlib.sha1(reasoning.encode('utf-8')).hexdigest()}",
+                                dedupe_window_sec=4.0,
+                            )
+
+                        # ── Token usage tracking (mirrors CLI) ──
+                        usage = getattr(msg, "usage_metadata", None) or getattr(msg, "response_metadata", {}).get("token_usage", {})
+                        if usage:
+                            prompt_t = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
+                            compl_t = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
+                            cached_t = 0
+                            if isinstance(usage, dict):
+                                ptd = usage.get("prompt_tokens_details") or {}
+                                cached_t = ptd.get("cached_tokens", 0)
+                            elif hasattr(usage, "get"):
+                                ptd = usage.get("prompt_tokens_details") or {}
+                                cached_t = ptd.get("cached_tokens", 0)
+                            state.prompt_tokens += int(prompt_t or 0)
+                            state.completion_tokens += int(compl_t or 0)
+                            state.cached_tokens += int(cached_t or 0)
+
+                        # ── Extract text content (handle str + list) ──
+                        text_content = ""
+                        if isinstance(msg.content, str):
+                            text_content = msg.content.strip()
+                        elif isinstance(msg.content, list):
+                            parts: list[str] = []
+                            for block in msg.content:
+                                if isinstance(block, str):
+                                    parts.append(block)
+                                elif isinstance(block, dict):
+                                    btype = block.get("type", "")
+                                    if btype == "text":
+                                        parts.append(block.get("text", ""))
+                                    elif btype in ("thinking", "reasoning"):
+                                        think_text = block.get("thinking") or block.get("text") or ""
+                                        if think_text.strip() and not reasoning:
+                                            self._send_message(
+                                                chat_id,
+                                                f"💭 Thinking:\n\n{_summarize_tool_content(think_text.strip(), max_chars=3200)}",
+                                                dedupe_key=f"think:{hashlib.sha1(think_text.encode('utf-8')).hexdigest()}",
+                                                dedupe_window_sec=4.0,
+                                            )
+                            text_content = "\n".join(p for p in parts if p.strip())
+
+                        # ── Send AI text ──
+                        if text_content:
+                            self._send_message(
+                                chat_id,
+                                f"🤖 Agent:\n\n{text_content}",
+                                dedupe_key=f"ai:{hashlib.sha1(text_content.encode('utf-8')).hexdigest()}",
                                 dedupe_window_sec=12.0,
                             )
+
+                        # ── Tool calls with args (mirrors CLI) ──
                         if msg.tool_calls:
                             tool_names = [tc.get("name", "tool") for tc in msg.tool_calls]
-                            headline = "Running tool" if len(tool_names) == 1 else f"Running {len(tool_names)} tools in parallel"
-                            detail = "Current tool: " + tool_names[0] if len(tool_names) == 1 else "Current tools:\n" + "\n".join(f"- {name}" for name in tool_names[:6])
+                            state.last_tool_name = ", ".join(tool_names[:3])
+                            if len(tool_names) > 3:
+                                state.last_tool_name += f" (+{len(tool_names) - 3})"
+
+                            tool_lines: list[str] = []
+                            if len(msg.tool_calls) > 1:
+                                tool_lines.append(f"⚡ {len(msg.tool_calls)} tools in parallel")
+                            for tc in msg.tool_calls:
+                                name = tc.get("name", "tool")
+                                args = tc.get("args", {})
+                                arg_summary = ""
+                                if args:
+                                    arg_parts = []
+                                    for k, v in list(args.items())[:3]:
+                                        v_str = str(v)[:60]
+                                        arg_parts.append(f"{k}={v_str}")
+                                    arg_summary = ", ".join(arg_parts)
+                                if arg_summary:
+                                    tool_lines.append(f"🔧 {name}({arg_summary})")
+                                else:
+                                    tool_lines.append(f"🔧 {name}")
+
+                            tool_msg_text = "\n".join(tool_lines)
+                            self._send_message(
+                                chat_id,
+                                tool_msg_text,
+                                dedupe_key=f"tc:{hashlib.sha1(tool_msg_text.encode('utf-8')).hexdigest()}",
+                                dedupe_window_sec=6.0,
+                                disable_notification=True,
+                            )
+
+                            # Status update
+                            categories = _categorize_tools(tool_names)
+                            if len(tool_names) == 1:
+                                headline = f"Running: {tool_names[0]}"
+                            else:
+                                headline = f"Running {len(tool_names)} tools in parallel"
+
+                            detail_lines: list[str] = []
+                            for cat, names in categories.items():
+                                detail_lines.append(f"{cat}: {', '.join(names)}")
+                            detail = "\n".join(detail_lines)
+
                             self._send_chat_action(chat_id, "typing")
                             self._set_status(
                                 chat_id,
                                 state,
                                 headline,
                                 detail,
-                                extra_events=[f"Tool scheduled: {name}" for name in tool_names],
+                                extra_events=[f"⚙️ {name}" for name in tool_names[:4]],
                             )
 
             elif node_name == "tools":
                 tool_messages = [m for m in node_output.get("messages", []) if isinstance(m, ToolMessage)]
                 if tool_messages:
-                    summaries: list[str] = []
+                    event_lines: list[str] = []
                     for tool_msg in tool_messages:
                         content = str(tool_msg.content or "")
                         lower = content[:200].lower()
                         failed = '"success": false' in lower or '"error"' in lower[:120] or lower.startswith("error")
-                        summaries.append(f"{tool_msg.name or 'tool'}: {'failed' if failed else 'ok'}")
+                        name = tool_msg.name or "tool"
+
+                        state.tools_run += 1
+                        if failed:
+                            state.tools_failed += 1
+
+                        icon = "✅" if not failed else "❌"
+                        insight = _extract_tool_insight(name, content)
+                        suffix = f" — {insight}" if insight else ""
+                        event_lines.append(f"{icon} {name}{suffix}")
+
+                        # ── Send FULL tool output (mirrors CLI) ──
+                        truncated = _summarize_tool_content(content, max_chars=3200)
+                        self._send_message(
+                            chat_id,
+                            f"{icon} {name}:\n\n{truncated}",
+                            dedupe_key=f"tool:{name}:{hashlib.sha1(content[:500].encode('utf-8')).hexdigest()}",
+                            dedupe_window_sec=4.0,
+                            disable_notification=True,
+                        )
+
+                        # Track findings/patches from tool results
+                        self._update_counters_from_tool(state, name, content)
+
+                    # ── Task plan display (mirrors CLI) ──
+                    plan_tools = {"update_task_plan", "mark_task_done", "edit_task_plan"}
+                    if any(m.name in plan_tools for m in tool_messages if m.name):
+                        try:
+                            from apk_agent.agent.tools_def import _get_task_plan
+                            plan = _get_task_plan()
+                            if plan:
+                                plan_lines: list[str] = ["📋 Task Plan:"]
+                                for item in plan:
+                                    status = item.get("status", "pending")
+                                    label = item.get("label") or item.get("task", "")
+                                    if status == "done":
+                                        plan_lines.append(f"  ✅ {label}")
+                                    elif status == "in_progress":
+                                        plan_lines.append(f"  ⏳ {label}")
+                                    else:
+                                        plan_lines.append(f"  ⬜ {label}")
+                                self._send_message(
+                                    chat_id,
+                                    "\n".join(plan_lines),
+                                    dedupe_key=f"plan:{hashlib.sha1(str(plan).encode('utf-8')).hexdigest()}",
+                                    dedupe_window_sec=10.0,
+                                    disable_notification=True,
+                                )
+                        except Exception:
+                            pass
 
                     self._set_status(
                         chat_id,
                         state,
-                        "Tool results received",
-                        "\n".join(summaries[-4:]),
-                        extra_events=summaries,
+                        f"Results ({state.tools_run} tools so far)",
+                        "\n".join(event_lines[-6:]),
+                        extra_events=event_lines,
                     )
+                    self._send_chat_action(chat_id, "typing")
+
+            elif node_name == "tools_post":
+                # Post-processing step — keep typing indicator
+                self._send_chat_action(chat_id, "typing")
 
             elif node_name == "nudge":
+                # ── Send nudge as a message (mirrors CLI) ──
+                self._send_message(
+                    chat_id,
+                    "⚡ Auto-nudging agent to execute tools...",
+                    dedupe_key="nudge",
+                    dedupe_window_sec=10.0,
+                    disable_notification=True,
+                )
                 self._set_status(
                     chat_id,
                     state,
-                    "Agent nudged to continue",
+                    "Agent continuing analysis",
                     "The orchestration layer asked the agent to keep executing tools.",
-                    record_event="Agent nudged",
+                    record_event="💡 Agent nudged to continue",
                 )
+                self._send_chat_action(chat_id, "typing")
 
             elif node_name == "__interrupt__":
                 interrupts = node_output
@@ -1155,12 +1748,55 @@ class TelegramBotService:
                     for intr in interrupts:
                         value = intr.value if hasattr(intr, "value") else str(intr)
                         value_str = str(value)
-                        if "❓" in value_str:
+                        is_human_step = "💬 What should I do next?" in value_str
+                        if is_human_step:
+                            # Human Thinking mode — always pause for user
+                            response = ""
+                        elif "❓" in value_str:
                             response = "Proceed with your best judgment."
                         else:
                             response = "yes"
-                        return {"interrupt": True, "prompt": value_str, "response": response}
+                        return {"interrupt": True, "prompt": value_str, "response": response, "human_step": is_human_step}
         return None
+
+    def _update_counters_from_tool(self, state: TelegramChatState, tool_name: str, content: str) -> None:
+        """Update findings/patches counters from tool results."""
+        try:
+            data = json.loads(content)
+            if not isinstance(data, dict):
+                return
+            # Count findings from scanner/analyzer tools
+            if "findings" in data and isinstance(data["findings"], list):
+                state.findings_count += len(data["findings"])
+            if "vulnerabilities" in data and isinstance(data["vulnerabilities"], list):
+                state.findings_count += len(data["vulnerabilities"])
+            # Count patches
+            if tool_name in ("apply_smali_patch", "smart_entity_patch", "batch_patch") or "patch" in tool_name.lower():
+                if data.get("success"):
+                    state.patches_count += 1
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    def _send_report_if_ready(self, chat_id: int, project: Project) -> None:
+        """Send the security report as a document if it exists."""
+        report_path = Path(project.workspace_path) / "outputs" / "report.md"
+        if not report_path.is_file():
+            return
+        try:
+            report_size = report_path.stat().st_size
+            if report_size < 50:
+                return  # Too small to be meaningful
+            if report_size > _MAX_SENDABLE_DOCUMENT_BYTES:
+                self._send_message(chat_id, f"📄 Report is too large for Telegram ({report_size / 1024 / 1024:.1f} MB).")
+                return
+            self._send_chat_action(chat_id, "upload_document")
+            self.api.send_document(
+                chat_id,
+                report_path,
+                caption=f"📄 Security report for {project.apk_name}",
+            )
+        except Exception as exc:
+            logger.debug("Failed to send report: %s", exc)
 
     def _send_final_artifact_if_ready(self, chat_id: int, project: Project, state: TelegramChatState) -> None:
         signed_apk = Path(project.workspace_path) / "outputs" / "patched-signed.apk"
@@ -1242,7 +1878,21 @@ def main(run_mode: bool, check: bool, verbose: bool) -> None:
 
     api = TelegramApi(config.telegram_bot_token, poll_timeout_sec=config.telegram_poll_timeout_sec)
     try:
-        me = api.get_me()
+        # Retry get_me() — transient DNS / network failures shouldn't kill the bridge
+        me = None
+        for _attempt in range(5):
+            try:
+                me = api.get_me()
+                break
+            except Exception as _net_err:
+                if check or _attempt >= 4:
+                    raise
+                wait = (_attempt + 1) * 5
+                logger.warning(
+                    "get_me() failed (attempt %d/5): %s — retrying in %ds",
+                    _attempt + 1, _net_err, wait,
+                )
+                time.sleep(wait)
         if check and not run_mode:
             click.echo(f"Telegram bot OK: @{me.get('username', 'unknown')} ({me.get('id')})")
             return

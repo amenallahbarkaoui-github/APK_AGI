@@ -25,9 +25,10 @@ import json
 import logging
 import time
 from collections import defaultdict
+from pathlib import Path
 from typing import Any, Literal
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
@@ -38,7 +39,7 @@ from apk_agent.agent.state import AgentState
 from apk_agent.agent.tools_def import ALL_TOOLS, set_tool_context, _get_all_smali_dirs, _project, _get_scratchpad, _get_task_plan
 from apk_agent.compactor import Compactor, count_message_tokens
 from apk_agent.config import AppConfig
-from apk_agent.llm.provider import get_llm
+from apk_agent.llm.provider import get_llm, is_quota_exhausted_error, is_retryable_api_error
 from apk_agent.workspace import Project
 
 logger = logging.getLogger("apk_agent.graph")
@@ -61,8 +62,15 @@ _NEVER_BLOCK_TOOLS: set[str] = {
     "apktool_build", "apktool_decode", "sign_apk", "zipalign_apk",
     "apply_smali_patch", "apply_multi_patch", "batch_patch_methods",
     "inject_smali_code", "override_constructor_field", "add_startup_hook",
+    "patch_api_response_flow", "inject_runtime_override_layer",
     "write_file", "read_file",
 }
+
+_DURABLE_STATE_MAX_CHARS = 2600
+_DURABLE_STATE_TOOL_HISTORY_LIMIT = 6
+_DURABLE_STATE_REGISTRY_LIMIT = 6
+_DURABLE_STATE_SCRATCHPAD_LIMIT = 8
+_DURABLE_STATE_FINDING_LIMIT = 3
 
 # The active thread_id, set by build_graph / the CLI before each run
 _active_thread_id: str = "__default__"
@@ -97,7 +105,7 @@ def _hash_tool_args(args: dict) -> str:
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 
-def _check_tool_loops(tool_calls: list[dict]) -> str | None:
+def _check_tool_loops(tool_calls: list[Any]) -> str | None:
     """Track tool calls and return a warning message if loops detected."""
     tracker = _get_tool_tracker()
     warnings = []
@@ -123,6 +131,60 @@ def _check_tool_loops(tool_calls: list[dict]) -> str | None:
             )
 
     return "\n".join(warnings) if warnings else None
+
+
+def _clip_durable_state_lines(lines: list[str], max_chars: int = _DURABLE_STATE_MAX_CHARS) -> str:
+    selected: list[str] = []
+    used = 0
+    total_lines = len(lines)
+
+    for idx, line in enumerate(lines):
+        normalized = str(line or "").rstrip()
+        if not normalized:
+            continue
+        line_cost = len(normalized) + 1
+        if selected and used + line_cost > max_chars:
+            remaining = total_lines - idx
+            omission = f"... [{remaining} durable-state lines omitted]"
+            omission_cost = len(omission) + 1
+            while selected and used + omission_cost > max_chars:
+                removed = selected.pop()
+                used -= len(removed) + 1
+            if used + omission_cost <= max_chars:
+                selected.append(omission)
+            break
+        selected.append(normalized)
+        used += line_cost
+
+    return "\n".join(selected)
+
+
+def _select_patch_registry_entries(registry: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    for entry in reversed(registry):
+        entry_id = str(entry.get("id", ""))
+        if entry.get("status") not in {"user_rejected", "retrying", "failed"}:
+            continue
+        if entry_id in seen_ids:
+            continue
+        selected.append(entry)
+        seen_ids.add(entry_id)
+        if len(selected) >= _DURABLE_STATE_REGISTRY_LIMIT:
+            break
+
+    for entry in reversed(registry):
+        if len(selected) >= _DURABLE_STATE_REGISTRY_LIMIT:
+            break
+        entry_id = str(entry.get("id", ""))
+        if entry_id in seen_ids:
+            continue
+        selected.append(entry)
+        seen_ids.add(entry_id)
+
+    selected.reverse()
+    return selected
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +243,27 @@ def agent_node(state: AgentState) -> dict:
     if not messages or not isinstance(messages[0], SystemMessage):
         messages.insert(0, SystemMessage(content=SYSTEM_PROMPT))
 
+    _total_tool_msgs_so_far = sum(1 for m in state["messages"] if isinstance(m, ToolMessage))
+    if _total_tool_msgs_so_far == 0:
+        messages.insert(
+            1,
+            HumanMessage(
+                content=(
+                    "[DYNAMIC TOOL CATALOG]\n"
+                    "Additional strategic tools available beyond the base static reference:\n"
+                    "- Entry/recovery: find_entry_points, map_hierarchy, analyze_shared_prefs, extract_native_strings, scan_assets_secrets\n"
+                    "- Validation: validate_patch, diff_patched_file, validate_patch_pipeline, generate_runtime_validation_plan\n"
+                    "- Architecture recovery: map_semantic_architecture, recover_hidden_state_model, profile_guard_and_revalidation_surface, find_enforcement_surfaces, semantic_method_slice\n"
+                    "- Runtime/response control: patch_api_response_flow, inject_runtime_override_layer\n"
+                    "- Working memory: update_scratchpad (save any free-form hypothesis, suspicious class, state field, or server-overwrite note for later turns)\n"
+                    "- Text/resource/binary patching: apply_text_patch, preview_text_patch, patch_binary_hex, find_resource_colors, find_resource_styles, replace_resource_colors, list_resource_drawables\n"
+                    "- Clone/install identity: rename_package_identity\n"
+                    "- Advanced scanning/memory: unified_scan, analyze_data_flow, run_taint_analysis, find_hardcoded_crypto, generate_bypass_plans, save_evidence, load_evidence, search_evidence, get_evidence_summary\n"
+                    "- Large outputs are lossless: if a tool returns tool_output_spilled/output_file, inspect the FULL saved payload with read_file(output_file, ...) or search_in_code in outputs/tool_payloads instead of relying on the preview."
+                )
+            ),
+        )
+
     # Inject durable findings summary as a reminder (survives compaction)
     findings = state.get("findings") or []
     patches = state.get("patch_results") or []
@@ -203,6 +286,11 @@ def agent_node(state: AgentState) -> dict:
             "⏳ Code graph: NOT BUILT YET — run apktool_decompile first (it auto-builds the graph)."
         )
 
+    summary_parts.append(
+        "📦 Oversized tool results may be spilled to outputs/tool_payloads with output_file. "
+        "That preview is not truncation of the real data: read_file(output_file, ...) or search_in_code() on the payload directory to inspect/search the full saved content."
+    )
+
     # Package scope — critical for avoiding third-party SDK noise
     if target_pkgs:
         summary_parts.append(f"🎯 App packages (YOUR SCOPE): {', '.join(target_pkgs)}")
@@ -217,30 +305,53 @@ def agent_node(state: AgentState) -> dict:
         summary_parts.append(f"📋 Findings: {dict(by_sev)} ({len(findings)} total)")
         # Show top critical/high (capped to avoid bloat)
         critical = [f for f in findings if f.get("severity") in ("CRITICAL", "critical", "HIGH", "high")]
-        for c in critical[:5]:
-            summary_parts.append(f"  • [{c.get('severity','')}] {c.get('name','')}: {c.get('file','')}")
+        for c in critical[:_DURABLE_STATE_FINDING_LIMIT]:
+            summary_parts.append(
+                "  • "
+                f"[{c.get('severity', '')}] "
+                f"{_shorten_state_text(c.get('name', ''), max_chars=72)}: "
+                f"{_shorten_state_text(c.get('file', ''), max_chars=72)}"
+            )
     if patches:
         ok = sum(1 for p in patches if p.get("success"))
         summary_parts.append(f"🔧 Patches applied: {ok}/{len(patches)}")
 
+    tool_history = state.get("tool_history") or []
+    if tool_history:
+        summary_parts.append("🧰 Recent tool results:")
+        for entry in tool_history[-_DURABLE_STATE_TOOL_HISTORY_LIMIT:]:
+            icon = "✅" if entry.get("success", True) else "❌"
+            summary_parts.append(
+                f"  {icon} {entry.get('tool', '?')}: "
+                f"{_shorten_state_text(entry.get('summary', ''), max_chars=120)}"
+            )
+
+    # Task plan — multi-objective decomposition
+    task_plan = state.get("task_plan") or []
+    if task_plan:
+        summary_parts.append("📋 Task Plan:")
+        for t in task_plan[:8]:
+            status = t.get("status", "pending")
+            icon = "✅" if status == "done" else "🔄" if status == "in_progress" else "⬜"
+            summary_parts.append(f"  {icon} [{t.get('id', '?')}] {_shorten_state_text(t.get('desc', ''), max_chars=110)}")
+
     # Patch registry — full journal of every patch attempt (survives compaction)
     # (uses local `registry` which may have user-feedback updates from above)
-    # Cap at last 15 entries to prevent context bloat on long sessions.
     if registry:
-        display_reg = registry[-15:] if len(registry) > 15 else registry
+        display_reg = _select_patch_registry_entries(registry)
         summary_parts.append(f"\n🗂️ PATCH REGISTRY (showing {len(display_reg)}/{len(registry)}) — DO NOT re-apply patches that already succeeded:")
         for entry in display_reg:
             pid = entry.get("id", "?")
             tool = entry.get("tool", "?")
             target = entry.get("target", "?")
-            pattern_desc = entry.get("pattern", "")[:60]
+            pattern_desc = _shorten_state_text(entry.get("pattern", ""), max_chars=40)
             status = entry.get("status", "?")
             feedback = entry.get("user_feedback", "")
 
             status_icon = {"applied": "✅", "failed": "❌", "user_rejected": "🔄", "retrying": "🔄", "verified": "✔️"}.get(status, "❓")
             line = f"  {status_icon} #{pid} [{tool}] {target} — {pattern_desc}"
             if feedback:
-                line += f" | USER: {feedback[:40]}"
+                line += f" | USER: {_shorten_state_text(feedback, max_chars=28)}"
             summary_parts.append(line)
 
         # Highlight patches the user rejected (need re-doing)
@@ -254,21 +365,12 @@ def agent_node(state: AgentState) -> dict:
     scratchpad = state.get("scratchpad") or {}
     if scratchpad:
         summary_parts.append("📝 Scratchpad (working memory):")
-        for k, v in list(scratchpad.items())[:15]:
-            val_str = str(v)[:120]
+        for k, v in list(scratchpad.items())[:_DURABLE_STATE_SCRATCHPAD_LIMIT]:
+            val_str = _shorten_state_text(v, max_chars=90)
             summary_parts.append(f"  • {k}: {val_str}")
 
-    # Task plan — multi-objective decomposition
-    task_plan = state.get("task_plan") or []
-    if task_plan:
-        summary_parts.append("📋 Task Plan:")
-        for t in task_plan:
-            status = t.get("status", "pending")
-            icon = "✅" if status == "done" else "🔄" if status == "in_progress" else "⬜"
-            summary_parts.append(f"  {icon} [{t.get('id', '?')}] {t.get('desc', '')}")
-
     if summary_parts:
-        state_msg = "\n".join(summary_parts)
+        state_msg = _clip_durable_state_lines(summary_parts)
         # Insert after system prompt
         insert_idx = 1 if isinstance(messages[0], SystemMessage) else 0
 
@@ -308,10 +410,10 @@ def agent_node(state: AgentState) -> dict:
 
         # Remember ALL existing message IDs before compaction
         _pre_compact_ids = [
-            m.id for m in state["messages"] if getattr(m, "id", None)
+            str(m.id) for m in state["messages"] if getattr(m, "id", None)
         ]
 
-        compacted = _compactor.compact(messages, _raw_llm, agent_state=state)
+        compacted = _compactor.compact(messages, _raw_llm, agent_state=dict(state))
         if compacted is not messages:
             messages = compacted
             logger.info(
@@ -346,7 +448,7 @@ def agent_node(state: AgentState) -> dict:
     _compacted_survived_ids: set[str] = set()
     if _pre_compact_ids:
         _compacted_survived_ids = {
-            m.id for m in messages if getattr(m, "id", None)
+            str(m.id) for m in messages if getattr(m, "id", None)
         }
 
     # Sanitize: prevent content block arrays > 5 elements (API proxy limit)
@@ -431,15 +533,7 @@ def agent_node(state: AgentState) -> dict:
             break
         except Exception as e:
             err_str = str(e).lower()
-            is_retryable = any(k in err_str for k in [
-                "429", "rate_limit", "rate limit",
-                "503", "service unavailable", "overloaded",
-                "500", "internal server error",
-                "tool name is required",
-                "must be in json format", "invalidparameter",
-                "invalid_parameter_error",
-                "tool_call_id", "is not found",
-            ])
+            is_retryable = is_retryable_api_error(e)
             # On "tool_call_id is not found" errors, re-sanitize to drop orphans
             if "tool_call_id" in err_str and "not found" in err_str:
                 logger.warning("Orphaned tool_call_id error — re-sanitizing messages...")
@@ -474,10 +568,11 @@ def agent_node(state: AgentState) -> dict:
                         "Now proceed with your task using a different approach."
                     )
                 ))
-            # 403 "API key limit" = quota exhausted, not retryable
+            if is_quota_exhausted_error(e):
+                logger.error("API quota exhausted — stopping retries: %s", str(e)[:160])
             if not is_retryable or attempt >= max_retries:
                 raise
-            wait = 2 ** attempt * 3  # 3s, 6s, 12s
+            wait = 2 ** attempt * 5  # 5s, 10s, 20s
             logger.warning(
                 "API error (attempt %d/%d): %s — retrying in %ds...",
                 attempt + 1, max_retries, str(e)[:120], wait,
@@ -566,7 +661,20 @@ def should_continue(state: AgentState) -> Literal["tools", "human_review", "nudg
 
     # No tool calls — check if this is an "announcing" message that
     # should be nudged to actually call tools, or a genuine final answer
-    content = (last_msg.content or "").strip().lower() if isinstance(last_msg.content, str) else ""
+    # Extract text from both str and list content formats
+    raw = last_msg.content
+    if isinstance(raw, str):
+        content = (raw or "").strip().lower()
+    elif isinstance(raw, list):
+        _parts = []
+        for _blk in raw:
+            if isinstance(_blk, str):
+                _parts.append(_blk)
+            elif isinstance(_blk, dict) and _blk.get("type") == "text":
+                _parts.append(_blk.get("text", ""))
+        content = " ".join(_parts).strip().lower()
+    else:
+        content = ""
 
     # Detect announcement patterns (agent says "I'll do X" but doesn't do it)
     is_announcing = any(phrase in content for phrase in [
@@ -575,7 +683,26 @@ def should_continue(state: AgentState) -> Literal["tools", "human_review", "nudg
         "going to ", "begin by", "start by", "proceed to", "kick off",
     ])
 
+    task_plan = state.get("task_plan") or []
+    pending_statuses = {"pending", "in_progress", "in-progress", "not-started", "not_started"}
+    has_pending_plan = any(
+        str(item.get("status", "")).strip().lower() in pending_statuses
+        for item in task_plan
+    )
+    looks_final = any(phrase in content for phrase in [
+        "task completed", "completed successfully", "final answer", "final report",
+        "report generated", "signed apk", "all requested work", "finished",
+    ])
+
     nudge_count = _get_nudge_count()
+    if not content and nudge_count < _MAX_NUDGES:
+        _set_nudge_count(nudge_count + 1)
+        return "nudge"
+
+    if has_pending_plan and not looks_final and nudge_count < _MAX_NUDGES:
+        _set_nudge_count(nudge_count + 1)
+        return "nudge"
+
     if is_announcing and nudge_count < _MAX_NUDGES:
         _set_nudge_count(nudge_count + 1)
         return "nudge"
@@ -611,6 +738,8 @@ def human_review_node(state: AgentState) -> dict:
     import apk_agent.agent.tools_def as _td
 
     last_msg = state["messages"][-1]
+    if not isinstance(last_msg, AIMessage):
+        return {"messages": [], "human_feedback": "rejected"}
 
     # Build a summary of what the agent wants to do
     patch_summaries = []
@@ -736,17 +865,76 @@ def human_review_router(state: AgentState) -> Literal["tools", "agent"]:
     return "agent"
 
 
+# ---------------------------------------------------------------------------
+# Human Thinking mode — step-by-step control
+# ---------------------------------------------------------------------------
+
+def human_step_node(state: AgentState) -> dict:
+    """Pause after each tool cycle so the user decides the next step.
+
+    Active only in Human Thinking mode.  Summarises what the last tool
+    batch produced, then calls ``interrupt()`` so the CLI / Telegram can
+    collect the user's next instruction.
+    """
+    from langchain_core.messages import ToolMessage as _TM
+
+    # Summarise the last tool results (walk backwards to the preceding AI message)
+    tool_summaries: list[str] = []
+    for msg in reversed(state["messages"]):
+        if isinstance(msg, _TM):
+            name = getattr(msg, "name", None) or "tool"
+            # Try to extract a short status from JSON content
+            brief = ""
+            try:
+                data = json.loads(msg.content) if isinstance(msg.content, str) else None
+                if isinstance(data, dict):
+                    if data.get("success") is True:
+                        brief = "✅"
+                    elif data.get("success") is False:
+                        brief = "❌"
+                    elif "error" in data:
+                        brief = "❌"
+                    else:
+                        brief = "✅"
+                else:
+                    brief = "✅"
+            except Exception:
+                brief = "✅"
+            tool_summaries.append(f"  {brief} {name}")
+        elif isinstance(msg, AIMessage):
+            break
+
+    summary_lines = ["🔄 Step completed."]
+    if tool_summaries:
+        summary_lines.append("")
+        summary_lines.extend(reversed(tool_summaries))
+    summary_lines.append("\n💬 What should I do next?")
+    prompt = "\n".join(summary_lines)
+
+    # Pause — the user's reply comes back as the resume value
+    user_instruction = interrupt(prompt)
+
+    return {"messages": [HumanMessage(content=str(user_instruction))]}
+
+
+def _tools_post_router(state: AgentState) -> Literal["agent", "human_step"]:
+    """After tools_post, decide whether to continue autonomously or pause for user."""
+    import apk_agent.agent.tools_def as _td
+    if getattr(_td, "_human_mode", False):
+        return "human_step"
+    return "agent"
+
+
 def _auto_build_graph_and_index():
     """Automatically build code graph + index after decompilation.
     Runs graph and index builds in parallel threads for ~2x speedup.
     Each build internally uses ThreadPoolExecutor for file I/O parallelism.
     """
     try:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import ThreadPoolExecutor
+        from apk_agent.agent.execution_context import set_runtime_slot
         from apk_agent.tools.code_graph import build_code_graph, save_graph
         from apk_agent.tools.index_cache import build_code_index, save_index
-        from apk_agent.agent.tools_def import _code_graph, _code_index
-        import apk_agent.agent.tools_def as td
         from apk_agent.progress import report_progress
 
         smali_dirs = _get_all_smali_dirs()
@@ -782,11 +970,11 @@ def _auto_build_graph_and_index():
             index_future = pool.submit(_build_index)
 
             G = graph_future.result()
-            td._code_graph = G
+            set_runtime_slot("code_graph", G)
             logger.info(f"Code graph built: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
 
             idx = index_future.result()
-            td._code_index = idx
+            set_runtime_slot("code_index", idx)
             logger.info(f"Code index built: {idx['stats']['total_classes']} classes, {idx['stats']['total_methods']} methods")
 
     except ImportError as e:
@@ -795,6 +983,130 @@ def _auto_build_graph_and_index():
     except Exception as e:
         logger.error(f"CRITICAL: Graph/index build failed: {e}")
         raise  # Let caller know graph build failed
+
+
+def _shorten_state_text(value: Any, max_chars: int = 180) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."
+
+
+def _collect_tool_refs(value: Any, refs: list[str]) -> None:
+    if len(refs) >= 6:
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in {"file", "target_file", "path", "class", "method", "package"}:
+                text = _shorten_state_text(item, max_chars=80)
+                if text and text not in refs:
+                    refs.append(text)
+                    if len(refs) >= 6:
+                        return
+            _collect_tool_refs(item, refs)
+            if len(refs) >= 6:
+                return
+    elif isinstance(value, list):
+        for item in value[:8]:
+            _collect_tool_refs(item, refs)
+            if len(refs) >= 6:
+                return
+
+
+def _summarize_tool_result(tool_name: str, content: str, timestamp: str) -> dict[str, Any]:
+    normalized = str(content or "").strip()
+    lower = normalized[:400].lower()
+    success = (
+        '"success": false' not in lower
+        and '"error"' not in lower[:160]
+        and not lower.startswith("error")
+    )
+    summary = _shorten_state_text(normalized)
+
+    try:
+        data = json.loads(normalized)
+    except (json.JSONDecodeError, TypeError):
+        data = None
+
+    if isinstance(data, dict):
+        fragments: list[str] = []
+        scalar_keys = [
+            "summary", "description", "verdict", "package", "target_file",
+            "target_class", "target_method", "helper_file", "error",
+        ]
+        for key in scalar_keys:
+            value = data.get(key)
+            if value:
+                fragments.append(f"{key}={_shorten_state_text(value, max_chars=80)}")
+
+        count_keys = [
+            "findings", "vulnerabilities", "matches", "results", "methods",
+            "classes", "gate_methods", "boolean_getters", "int_getters",
+            "shared_prefs", "callers", "paywall_methods", "patched_files",
+            "changes_made", "remaining_gates", "behavioral_hits", "billing_hits",
+        ]
+        for key in count_keys:
+            value = data.get(key)
+            if isinstance(value, (list, dict)) and value:
+                fragments.append(f"{key}={len(value)}")
+
+        refs: list[str] = []
+        _collect_tool_refs(data, refs)
+        if refs:
+            fragments.append("refs=" + ", ".join(refs[:4]))
+
+        if fragments:
+            summary = "; ".join(fragments)
+    elif isinstance(data, list) and data:
+        refs: list[str] = []
+        _collect_tool_refs(data, refs)
+        pieces = [f"items={len(data)}"]
+        if refs:
+            pieces.append("refs=" + ", ".join(refs[:4]))
+        summary = "; ".join(pieces)
+
+    return {
+        "tool": tool_name,
+        "success": success,
+        "summary": _shorten_state_text(summary, max_chars=260),
+        "timestamp": timestamp,
+    }
+
+
+def _resolve_tool_postprocess_content(content: str) -> str:
+    """Return compact postprocess content for tool results.
+
+    Spilled outputs keep the full payload on disk, but postprocess should work
+    from the compact preview to avoid expensive file reads right after the tool
+    batch completes.
+    """
+    normalized = str(content or "")
+    if not normalized:
+        return normalized
+
+    try:
+        data = json.loads(normalized)
+    except (json.JSONDecodeError, TypeError):
+        return normalized
+
+    if not isinstance(data, dict) or not data.get("tool_output_spilled"):
+        return normalized
+
+    important_preview = data.get("important_preview")
+    if not isinstance(important_preview, dict) or not important_preview:
+        return normalized
+
+    compact_payload = dict(important_preview)
+    compact_payload["tool_output_spilled"] = True
+    if "success" in data and "success" not in compact_payload:
+        compact_payload["success"] = data["success"]
+    output_file = str(data.get("output_file", "") or "").strip()
+    if output_file:
+        compact_payload["output_file"] = output_file
+    spill_summary = data.get("summary")
+    if spill_summary:
+        compact_payload["spill_summary"] = spill_summary
+    return json.dumps(compact_payload, ensure_ascii=False)
 
 
 def tools_postprocess(state: AgentState) -> dict:
@@ -808,6 +1120,7 @@ def tools_postprocess(state: AgentState) -> dict:
     new_findings: list[dict] = []
     new_patches: list[dict] = []
     new_registry_entries: list[dict] = []
+    new_tool_history: list[dict[str, Any]] = []
 
     import time as _time
     _ts = _time.strftime("%Y-%m-%d %H:%M:%S")
@@ -816,7 +1129,7 @@ def tools_postprocess(state: AgentState) -> dict:
     _PATCH_TOOLS = {
         "apply_smali_patch", "auto_patch_bypass", "patch_flutter_ssl",
         "inject_network_security_config", "patch_manifest_security",
-        "remove_ads",
+        "rename_package_identity", "remove_ads", "patch_api_response_flow", "inject_runtime_override_layer",
     }
 
     # Only look at the most recent tool messages (from last tool call batch)
@@ -824,7 +1137,9 @@ def tools_postprocess(state: AgentState) -> dict:
         if not isinstance(msg, ToolMessage):
             break
         tool_name = getattr(msg, "name", "") or ""
-        content = msg.content if isinstance(msg.content, str) else ""
+        raw_content = msg.content if isinstance(msg.content, str) else ""
+        content = _resolve_tool_postprocess_content(raw_content)
+        new_tool_history.append(_summarize_tool_result(tool_name, content, _ts))
 
         # Extract vulnerability findings
         if tool_name in ("scan_vulnerabilities", "detect_protections"):
@@ -839,6 +1154,33 @@ def tools_postprocess(state: AgentState) -> dict:
                             "severity": f.get("severity", ""),
                             "file": f.get("file", ""),
                             "category": f.get("category", ""),
+                        })
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        # Extract unified_scan findings with enriched fields
+        if tool_name == "unified_scan":
+            try:
+                data = json.loads(content)
+                if isinstance(data, dict) and data.get("findings"):
+                    for f in data["findings"][:50]:
+                        new_findings.append({
+                            "tool": tool_name,
+                            "id": f.get("id", ""),
+                            "rule_id": f.get("rule_id", ""),
+                            "severity": f.get("severity", ""),
+                            "category": f.get("category", ""),
+                            "title": f.get("title", ""),
+                            "cwe": f.get("cwe", ""),
+                            "class": f.get("class", ""),
+                            "method": f.get("method", ""),
+                            "exploitability": f.get("exploitability", ""),
+                            "confidence_score": f.get("confidence_score", 0.0),
+                            "risk_score": f.get("risk_score", 0.0),
+                            "evidence_strength": f.get("evidence_strength", "single"),
+                            "validation_state": f.get("validation_state", "pending"),
+                            "threat_level": f.get("threat_level", "basic"),
+                            "auto_patchable": f.get("auto_patchable", False),
                         })
             except (json.JSONDecodeError, KeyError):
                 pass
@@ -885,6 +1227,7 @@ def tools_postprocess(state: AgentState) -> dict:
                     "tool_success": data.get("success", False),
                     "status": "applied" if data.get("success") else "failed",
                     "errors": data.get("errors", [])[:3],
+                    "remediates": data.get("remediates", []),
                     "user_feedback": "",
                     "timestamp": _ts,
                 })
@@ -906,6 +1249,7 @@ def tools_postprocess(state: AgentState) -> dict:
                     "tool_success": success,
                     "status": "applied" if success else "failed",
                     "errors": data.get("errors", [])[:3],
+                    "remediates": data.get("remediates", []),
                     "user_feedback": "",
                     "timestamp": _ts,
                 })
@@ -921,6 +1265,7 @@ def tools_postprocess(state: AgentState) -> dict:
                     "tool_success": data.get("success", False),
                     "status": "applied" if data.get("success") else "failed",
                     "errors": data.get("errors", [])[:3] if data.get("errors") else [],
+                    "remediates": data.get("remediates", []),
                     "user_feedback": "",
                     "timestamp": _ts,
                 })
@@ -936,6 +1281,7 @@ def tools_postprocess(state: AgentState) -> dict:
                     "tool_success": data.get("success", False),
                     "status": "applied" if data.get("success") else "failed",
                     "errors": [],
+                    "remediates": data.get("remediates", []),
                     "user_feedback": "",
                     "timestamp": _ts,
                 })
@@ -952,6 +1298,24 @@ def tools_postprocess(state: AgentState) -> dict:
                     "tool_success": data.get("success", False),
                     "status": "applied" if data.get("success") else "failed",
                     "errors": data.get("warnings", [])[:3],
+                    "remediates": data.get("remediates", []),
+                    "user_feedback": "",
+                    "timestamp": _ts,
+                })
+
+            elif tool_name == "rename_package_identity":
+                changes = data.get("changes_applied") or []
+                new_registry_entries.append({
+                    "id": len(state.get("patch_registry") or []) + len(new_registry_entries) + 1,
+                    "tool": tool_name,
+                    "target": f"{data.get('old_package', '')} -> {data.get('new_package', '')}",
+                    "pattern": f"package identity rewrite; {len(changes)} manifest updates",
+                    "steps_applied": len(changes),
+                    "steps_total": len(changes),
+                    "tool_success": data.get("success", False),
+                    "status": "applied" if data.get("success") else "failed",
+                    "errors": data.get("errors", [])[:3] if isinstance(data.get("errors"), list) else [],
+                    "remediates": data.get("remediates", []),
                     "user_feedback": "",
                     "timestamp": _ts,
                 })
@@ -968,6 +1332,41 @@ def tools_postprocess(state: AgentState) -> dict:
                     "tool_success": data.get("success", False) and total_applied > 0,
                     "status": "applied" if (data.get("success", False) and total_applied > 0) else "failed",
                     "errors": data.get("errors", [])[:3],
+                    "remediates": data.get("remediates", []),
+                    "user_feedback": "",
+                    "timestamp": _ts,
+                })
+
+            elif tool_name == "patch_api_response_flow":
+                total_applied = int(data.get("patches_applied", 0) or 0)
+                new_registry_entries.append({
+                    "id": len(state.get("patch_registry") or []) + len(new_registry_entries) + 1,
+                    "tool": tool_name,
+                    "target": data.get("target_class", data.get("target_file", "response-flow")),
+                    "pattern": f"response-flow override; {total_applied} patch units",
+                    "steps_applied": total_applied,
+                    "steps_total": total_applied,
+                    "tool_success": data.get("success", False),
+                    "status": "applied" if data.get("success") else "failed",
+                    "errors": data.get("errors", [])[:3],
+                    "remediates": data.get("remediates", []),
+                    "user_feedback": "",
+                    "timestamp": _ts,
+                })
+
+            elif tool_name == "inject_runtime_override_layer":
+                rules_applied = int(data.get("rules_applied", 0) or 0)
+                new_registry_entries.append({
+                    "id": len(state.get("patch_registry") or []) + len(new_registry_entries) + 1,
+                    "tool": tool_name,
+                    "target": data.get("helper_file", "runtime override layer"),
+                    "pattern": f"runtime override layer; {rules_applied} rules",
+                    "steps_applied": rules_applied,
+                    "steps_total": rules_applied,
+                    "tool_success": data.get("success", False),
+                    "status": "applied" if data.get("success") else "failed",
+                    "errors": data.get("errors", [])[:3],
+                    "remediates": data.get("remediates", []),
                     "user_feedback": "",
                     "timestamp": _ts,
                 })
@@ -978,10 +1377,10 @@ def tools_postprocess(state: AgentState) -> dict:
                 _auto_build_graph_and_index()
                 updates["graph_ready"] = True
                 # Inject a visible message so the agent KNOWS graph is ready
-                from apk_agent.agent.tools_def import _code_graph, _code_index
-                import apk_agent.agent.tools_def as td
-                g = td._code_graph
-                idx = td._code_index
+                from apk_agent.agent.execution_context import get_runtime_slot
+
+                g = get_runtime_slot("code_graph")
+                idx = get_runtime_slot("code_index")
                 graph_info = ""
                 if g:
                     graph_info += f"{g.number_of_nodes()} nodes, {g.number_of_edges()} edges"
@@ -1012,6 +1411,10 @@ def tools_postprocess(state: AgentState) -> dict:
         existing = list(state.get("patch_registry") or [])
         existing.extend(new_registry_entries)
         updates["patch_registry"] = existing
+    if new_tool_history:
+        existing = list(state.get("tool_history") or [])
+        existing.extend(reversed(new_tool_history))
+        updates["tool_history"] = existing[-60:]
 
     # Sync working memory from module-level storage into durable state
     updates["scratchpad"] = _get_scratchpad()
@@ -1057,11 +1460,20 @@ def build_graph(config: AppConfig, project: Project, checkpointer=None):
     _raw_llm = llm  # keep a reference without tools for compaction
     _llm_with_tools = llm.bind_tools(ALL_TOOLS)
 
-    # Initialize compactor (GLM-5.1: 204k context window)
-    # token_threshold: start compacting well before the context fills up
-    # keep_recent: preserve only the last few exchanges (each exchange =
-    #   AIMessage + ToolMessages can be 5-15 messages for parallel tool calls)
-    _compactor = Compactor(token_threshold=100_000, keep_recent=20)
+    # Initialize compactor with dynamic threshold based on context window
+    from apk_agent.llm.provider import _FALLBACK_CONTEXT_WINDOW
+    ctx_window = config.context_window if config.context_window > 0 else _FALLBACK_CONTEXT_WINDOW
+    if config.context_window <= 0:
+        logger.warning(
+            "CONTEXT_WINDOW not set — using fallback %s tokens. "
+            "Set it via CONTEXT_WINDOW env var, --context-window CLI flag, or /context in Telegram.",
+            _FALLBACK_CONTEXT_WINDOW,
+        )
+
+    # Fixed ratio: compact at 50% of context window
+    COMPACTION_RATIO = 0.50
+    compaction_threshold = int(ctx_window * COMPACTION_RATIO)
+    _compactor = Compactor(token_threshold=compaction_threshold, keep_recent=20)
 
     # Build tool node
     tool_node = ToolNode(ALL_TOOLS)
@@ -1073,6 +1485,7 @@ def build_graph(config: AppConfig, project: Project, checkpointer=None):
     graph.add_node("tools", tool_node)
     graph.add_node("tools_post", tools_postprocess)
     graph.add_node("human_review", human_review_node)
+    graph.add_node("human_step", human_step_node)
     graph.add_node("nudge", nudge_node)
 
     graph.set_entry_point("agent")
@@ -1088,9 +1501,21 @@ def build_graph(config: AppConfig, project: Project, checkpointer=None):
         },
     )
 
-    # After tools execute → postprocess to extract findings → back to agent
+    # After tools execute → postprocess to extract findings
     graph.add_edge("tools", "tools_post")
-    graph.add_edge("tools_post", "agent")
+
+    # After postprocess → back to agent OR pause for human step
+    graph.add_conditional_edges(
+        "tools_post",
+        _tools_post_router,
+        {
+            "agent": "agent",
+            "human_step": "human_step",
+        },
+    )
+
+    # After human step → back to agent with user's next instruction
+    graph.add_edge("human_step", "agent")
 
     # After nudge → back to agent to retry with tool calls
     graph.add_edge("nudge", "agent")

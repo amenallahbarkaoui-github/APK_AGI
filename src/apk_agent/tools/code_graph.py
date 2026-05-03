@@ -30,13 +30,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Lock
 
+from apk_agent.parallelism import recommended_file_scan_workers
+
 try:
     import networkx as nx
 except ImportError:
     nx = None  # Will check at runtime
 
 # Thread pool for parallel smali parsing
-_GRAPH_POOL = ThreadPoolExecutor(max_workers=8)
+_GRAPH_POOL = ThreadPoolExecutor(max_workers=recommended_file_scan_workers())
 
 
 # ---------------------------------------------------------------------------
@@ -287,8 +289,8 @@ def load_graph(graph_path: Path) -> "nx.DiGraph | None":
 def query_callers(G: "nx.DiGraph", method_name: str, depth: int = 3) -> dict:
     """Find all callers of a method (reverse call chain).
 
-    Unlike trace_call_chain in deep_analyzer.py, this is INSTANT because
-    the graph is pre-built. No file scanning needed.
+    Handles virtual dispatch: if a parent class defines the method,
+    also finds callers of override methods in subclasses (and vice versa).
     """
     _ensure_networkx()
 
@@ -306,17 +308,36 @@ def query_callers(G: "nx.DiGraph", method_name: str, depth: int = 3) -> dict:
             "hint": "Method not in graph. Try a different name or rebuild the graph.",
         }
 
+    # Virtual dispatch: expand targets to include overrides in subclasses
+    # If target is Lcom/Parent;->isVip, also add Lcom/Child;->isVip
+    expanded_targets = set(targets[:5])
+    for target in list(expanded_targets):
+        if "->" in target:
+            short_name = target.split("->")[1]
+            class_name = target.split("->")[0]
+            # Find subclasses via "extends" edges
+            for node in G.nodes():
+                if G.nodes.get(node, {}).get("type") == "class":
+                    for pred in G.predecessors(node):
+                        edge = G.edges.get((pred, node), {})
+                        if edge.get("relation") == "extends" and node == class_name:
+                            # pred extends class_name — check if pred has same method
+                            override_sig = f"{pred}->{short_name}"
+                            if override_sig in G.nodes:
+                                expanded_targets.add(override_sig)
+
     all_chains = []
     visited = set()
 
-    for target in targets[:5]:  # Limit to 5 matches
+    for target in list(expanded_targets)[:10]:
         _trace_callers_recursive(G, target, depth, 0, all_chains, visited)
 
     return {
         "success": True,
         "method": method_name,
         "found": True,
-        "matched_nodes": targets[:5],
+        "matched_nodes": list(expanded_targets)[:10],
+        "virtual_dispatch": len(expanded_targets) > len(targets[:5]),
         "total_callers": len(all_chains),
         "call_chains": all_chains[:100],
     }
@@ -543,7 +564,7 @@ def get_graph_stats(G: "nx.DiGraph") -> dict:
     }
 
 
-def find_security_methods(G: "nx.DiGraph") -> dict:
+def find_security_methods(G: "nx.DiGraph", progress_callback=None) -> dict:
     """Find methods related to security based on name patterns.
 
     Returns grouped results: ssl, root_detection, crypto, anti_debug, etc.
@@ -592,28 +613,65 @@ def find_security_methods(G: "nx.DiGraph") -> dict:
         ),
     }
 
-    results = {}
-    for category, pattern in patterns.items():
-        hits = []
-        for node, data in G.nodes(data=True):
-            if data.get("type") == "method" and pattern.search(node):
-                # Count callers
-                caller_count = sum(
-                    1 for p in G.predecessors(node)
-                    if G.edges[p, node].get("relation") == "calls"
-                )
-                hits.append({
-                    "method": node,
-                    "class": data.get("class_name", ""),
-                    "file": data.get("file", ""),
-                    "line": data.get("line", 0),
-                    "caller_count": caller_count,
-                })
-        if hits:
-            results[category] = sorted(hits, key=lambda h: -h["caller_count"])
+    method_nodes = [
+        (node, data)
+        for node, data in G.nodes(data=True)
+        if data.get("type") == "method"
+    ]
+    total_methods = len(method_nodes)
+
+    if progress_callback:
+        progress_callback(5, f"Preparing security scan across {total_methods} methods")
+
+    call_in_degree = defaultdict(int)
+    for source, target, edge_data in G.edges(data=True):
+        if edge_data.get("relation") == "calls":
+            call_in_degree[target] += 1
+
+    if progress_callback:
+        progress_callback(18, f"Computed caller counts for {len(call_in_degree)} methods")
+
+    raw_results: dict[str, list[dict]] = defaultdict(list)
+    progress_interval = max(1, total_methods // 20) if total_methods else 1
+
+    for idx, (node, data) in enumerate(method_nodes, start=1):
+        for category, pattern in patterns.items():
+            if not pattern.search(node):
+                continue
+            raw_results[category].append({
+                "method": node,
+                "class": data.get("class_name", ""),
+                "file": data.get("file", ""),
+                "line": data.get("line", 0),
+                "caller_count": call_in_degree.get(node, 0),
+            })
+
+        if progress_callback and (idx == total_methods or idx % progress_interval == 0):
+            pct = 18 + (idx / total_methods * 72 if total_methods else 72)
+            hit_count = sum(len(items) for items in raw_results.values())
+            progress_callback(
+                pct,
+                f"Scanning methods: {idx}/{total_methods} | {hit_count} hits in {len(raw_results)} categories",
+            )
+
+    if progress_callback:
+        progress_callback(94, f"Sorting {sum(len(items) for items in raw_results.values())} security hits")
+
+    results = {
+        category: sorted(hits, key=lambda h: -h["caller_count"])
+        for category, hits in raw_results.items()
+        if hits
+    }
+
+    total_hits = sum(len(items) for items in results.values())
+
+    if progress_callback:
+        progress_callback(100, f"Security scan complete: {total_hits} hits in {len(results)} categories")
 
     return {
         "success": True,
         "categories_found": len(results),
+        "methods_scanned": total_methods,
+        "total_hits": total_hits,
         "methods": results,
     }

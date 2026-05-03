@@ -388,23 +388,20 @@ def _bfs_taint_forward(
                 ))
                 found += 1
 
-        # Follow callers of this method (who calls the method that has the taint?)
-        # Actually, follow the CALLEES — taint flows FORWARD
+        # Follow callees — taint flows FORWARD through invoked methods
         for api_call in method.api_calls:
-            # Find methods that are called by this method
-            # and propagate taint into them
-            callers_of_api = index.find_api_callers(api_call)
-            # But we actually want: what does *this* method call?
-            # The api_calls list gives us what this method invokes
-            # We need to find the actual body of those callees
             callee_method = index.get_method(api_call)
             if callee_method and api_call not in visited:
                 queue.append((api_call, depth + 1))
 
-        # Also: methods that call *this* method get the taint propagated
-        # (return value carries taint)
-        callers = index.api_callers.get(current_sig.split("(")[0], [])
-        # We DON'T propagate to callers — taint flows forward only
+        # Also propagate taint BACKWARD through return values:
+        # If this method is tainted, callers that use its return value
+        # also become tainted (return-value taint propagation).
+        sig_prefix = current_sig.split("(")[0] if "(" in current_sig else current_sig
+        callers = index.api_callers.get(sig_prefix, [])
+        for caller_sig in callers:
+            if caller_sig not in visited:
+                queue.append((caller_sig, depth + 1))
 
 
 def _get_class_for_method(index: "SmaliIndex", method_sig: str) -> "SmaliClass | None":

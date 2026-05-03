@@ -28,7 +28,7 @@ def zipalign(
     cmd = [zipalign_bin, "-f", "-v", str(alignment), str(input_apk), str(output_apk)]
     result = run_tool_command(cmd, log_file=log_file, timeout=120)
 
-    if result.success or output_apk.is_file():
+    if result.success and output_apk.is_file():
         result.artifacts["aligned_apk"] = str(output_apk)
     return result
 

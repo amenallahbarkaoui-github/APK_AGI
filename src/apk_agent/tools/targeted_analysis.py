@@ -13,9 +13,10 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from apk_agent.parallelism import recommended_file_scan_workers
 from apk_agent.progress import report_progress
 
-_POOL = ThreadPoolExecutor(max_workers=8)
+_POOL = ThreadPoolExecutor(max_workers=recommended_file_scan_workers())
 
 # ---- Code-only extensions used across all scanners ----
 _CODE_EXTS = (".java", ".kt", ".smali")

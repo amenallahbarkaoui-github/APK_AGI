@@ -162,8 +162,10 @@ Produce a structured summary following the format described in your instructions
 # Compactor
 # ---------------------------------------------------------------------------
 
-# Configurable thresholds (GLM-5.1 context window: 204,800 tokens, max output: 131,072)
-DEFAULT_TOKEN_THRESHOLD = 100_000  # Start compacting — leaves ~105k headroom for response + tools
+# Configurable thresholds — actual token_threshold is computed dynamically in
+# graph.py as context_window × 50% (COMPACTION_RATIO).  The constant below is
+# only a fallback default if no context window information is available.
+DEFAULT_TOKEN_THRESHOLD = 100_000  # Fallback — overridden by dynamic context_window × 50%
 KEEP_RECENT_MESSAGES = 20  # Keep the last N messages for immediate context
 MIN_MESSAGES_TO_COMPACT = 30  # Don't compact if fewer messages than this
 
@@ -255,11 +257,13 @@ class Compactor:
         recent_messages = conversation[-self.keep_recent :]
 
         # If the old messages are huge, skip the LLM summarization entirely
-        # (the LLM call itself would hang trying to process 100K+ tokens).
+        # (the LLM call itself would hang trying to process too many tokens).
         # Use the fast fallback trim instead, which extracts structured state
         # from agent_state without any LLM call.
+        # Threshold: 80% of the compaction token_threshold.
         old_tokens = count_message_tokens(old_messages)
-        if old_tokens > 80_000:
+        fallback_cutoff = int(self.token_threshold * 0.80)
+        if old_tokens > fallback_cutoff:
             logger.info(
                 "Old messages too large for LLM summary (%d tokens). "
                 "Using fast fallback trim.",
@@ -278,10 +282,13 @@ class Compactor:
             # Use LLM to summarize — retry once on empty response
             summary_text = ""
             for _attempt in range(2):
-                summary_response = llm.invoke([
-                    SystemMessage(content=COMPACT_SYSTEM_PROMPT),
-                    HumanMessage(content=compact_prompt),
-                ])
+                from apk_agent.llm.provider import suppress_reasoning_capture
+
+                with suppress_reasoning_capture():
+                    summary_response = llm.invoke([
+                        SystemMessage(content=COMPACT_SYSTEM_PROMPT),
+                        HumanMessage(content=compact_prompt),
+                    ])
 
                 # Handle content that might be a string or list of parts
                 raw_content = summary_response.content
@@ -429,6 +436,7 @@ def _fallback_trim(
         target_pkgs = agent_state.get("target_packages") or []
         scratchpad = agent_state.get("scratchpad") or {}
         task_plan = agent_state.get("task_plan") or []
+        tool_history = agent_state.get("tool_history") or []
 
         if task:
             parts.append(f"\n## Original Task\n{task}")
@@ -489,6 +497,14 @@ def _fallback_trim(
             parts.append("\n## Working Memory (Scratchpad)")
             for k, v in list(scratchpad.items())[:20]:
                 parts.append(f"- **{k}**: {str(v)[:300]}")
+
+        if tool_history:
+            parts.append("\n## Recent Tool Results")
+            for entry in tool_history[-20:]:
+                icon = "✅" if entry.get("success", True) else "❌"
+                parts.append(
+                    f"- {icon} **{entry.get('tool', '?')}**: {entry.get('summary', '')[:260]}"
+                )
 
         if task_plan:
             parts.append("\n## Task Plan")

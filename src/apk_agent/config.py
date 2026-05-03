@@ -28,8 +28,8 @@ class AppConfig:
 
     # LLM
     api_key: str = ""
-    api_base_url: str = "https://api.aimlapi.com/v1"
-    model_name: str = "anthropic/claude-sonnet-4-6-20260218"
+    api_base_url: str = ""
+    model_name: str = ""
 
     # Tool paths (empty → auto-detect from PATH)
     apktool_path: str = ""
@@ -48,8 +48,8 @@ class AppConfig:
     # Limits
     max_apk_size_mb: int = 200
 
-    # Thinking / reasoning mode
-    thinking_enabled: bool = True  # user-toggleable deep thinking for the LLM
+    # Context window in tokens — set via CONTEXT_WINDOW env var, --context-window, or /context
+    context_window: int = 0
 
     # Telegram bot bridge
     telegram_bot_token: str = ""
@@ -84,8 +84,8 @@ class AppConfig:
 
         cfg = cls(
             api_key=os.getenv("API_KEY", os.getenv("OPENROUTER_API_KEY", "")),
-            api_base_url=os.getenv("API_BASE_URL", "https://api.aimlapi.com/v1"),
-            model_name=os.getenv("MODEL_NAME", "anthropic/claude-sonnet-4-6-20260218"),
+            api_base_url=os.getenv("API_BASE_URL", "").strip(),
+            model_name=os.getenv("MODEL_NAME", "").strip(),
             apktool_path=os.getenv("APKTOOL_PATH", ""),
             jadx_path=os.getenv("JADX_PATH", ""),
             apksigner_path=os.getenv("APKSIGNER_PATH", ""),
@@ -100,7 +100,7 @@ class AppConfig:
                 key_password=os.getenv("KEY_PASSWORD", "android"),
             ),
             max_apk_size_mb=int(os.getenv("MAX_APK_SIZE_MB", "200")),
-            thinking_enabled=os.getenv("THINKING_ENABLED", "true").lower() in ("true", "1", "yes"),
+            context_window=int(os.getenv("CONTEXT_WINDOW", "0")),
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
             telegram_allowed_chat_ids=tuple(allowed_chat_ids),
             telegram_auto_start=os.getenv("TELEGRAM_AUTO_START", "false").lower() in ("true", "1", "yes"),
@@ -161,6 +161,10 @@ class AppConfig:
 
         if not self.api_key:
             warnings.append("API_KEY not set — LLM calls will fail.")
+        if not self.api_base_url:
+            warnings.append("API_BASE_URL not set — LLM provider endpoint is required.")
+        if not self.model_name:
+            warnings.append("MODEL_NAME not set — choose a model in .env or via --model.")
 
         # Tool resolution
         self._resolved_tools["apktool"] = self.resolve_tool(
@@ -221,4 +225,13 @@ class AppConfig:
 
     @property
     def workspace_path(self) -> Path:
-        return Path(self.workspace_root).resolve()
+        ws = Path(self.workspace_root)
+        if not ws.is_absolute():
+            # Resolve relative paths against the .env file location so that
+            # CLI and Telegram bot (possibly different CWDs) agree on the
+            # same workspace.  If no .env is found, fall back to CWD.
+            from dotenv import find_dotenv
+            env_file = find_dotenv(usecwd=True)
+            if env_file:
+                return (Path(env_file).resolve().parent / ws).resolve()
+        return ws.resolve()
