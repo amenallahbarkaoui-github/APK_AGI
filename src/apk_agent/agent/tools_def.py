@@ -6684,15 +6684,16 @@ def search_binary_strings(
 
 @tool
 def patch_binary_strings(file_path: str, replacements_json: str) -> str:
-    """Patch embedded strings in `.so`, `.dex`, and similar binary files.
+    """Patch embedded strings in `.so`, `.dex`, `.bundle`, and similar files.
 
     This is safer and more semantic than blind hex patching because it matches
     string constants by value and enforces file-type-specific length rules.
 
     Safety rules:
     - `.dex` / `.cdex`: replacement must have identical UTF-8 byte length.
+    - `.bundle` / `.jsbundle`: direct UTF-8 text replacement, no NUL padding.
     - Other binaries: replacement may be shorter and will be NUL-padded.
-    - Longer replacements are rejected.
+    - Longer replacements are rejected for bounded binary files.
 
     Args:
         file_path: Target binary file. Can be absolute or relative.

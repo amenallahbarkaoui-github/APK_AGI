@@ -14,6 +14,7 @@ from typing import Iterable
 _PRINTABLE_MIN = 32
 _PRINTABLE_MAX = 126
 _DEX_SUFFIXES = {".dex", ".cdex"}
+_TEXTLIKE_SUFFIXES = {".bundle", ".jsbundle"}
 
 _CATEGORY_PATTERNS: dict[str, re.Pattern[str]] = {
     "url": re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE),
@@ -173,7 +174,8 @@ def search_binary_strings(
             "matches": matches,
             "patch_rule": (
                 "Inspect the matched file paths first. Patch one concrete file at a time with patch_binary_strings; "
-                "DEX replacements must keep the exact same UTF-8 byte length, while other binaries can use shorter replacements with NUL padding."
+                "DEX replacements must keep the exact same UTF-8 byte length, text-like bundle assets use direct UTF-8 replacement without NUL padding, "
+                "and other binaries can use shorter replacements with NUL padding."
             ),
         }
 
@@ -189,6 +191,17 @@ def search_binary_strings(
         max_results=max_results,
     )
 
+    if path.suffix.lower() in _TEXTLIKE_SUFFIXES:
+        patch_rule = (
+            "Text-like bundle assets are patched as direct UTF-8 text replacements with no NUL padding. "
+            "Replacement length may grow or shrink."
+        )
+    else:
+        patch_rule = (
+            "DEX replacements must keep the exact same UTF-8 byte length. "
+            "Other binaries can use shorter replacements with NUL padding."
+        )
+
     return {
         "success": True,
         "path": str(path),
@@ -197,10 +210,7 @@ def search_binary_strings(
         "total_strings_scanned": total_strings,
         "matches_returned": len(matches),
         "matches": matches,
-        "patch_rule": (
-            "DEX replacements must keep the exact same UTF-8 byte length. "
-            "Other binaries can use shorter replacements with NUL padding."
-        ),
+        "patch_rule": patch_rule,
     }
 
 
@@ -224,6 +234,21 @@ def _find_bounded_occurrences(data: bytes, needle: bytes) -> list[int]:
     return offsets
 
 
+def _find_all_occurrences(data: bytes, needle: bytes) -> list[int]:
+    if not needle:
+        return []
+
+    offsets: list[int] = []
+    start = 0
+    while True:
+        idx = data.find(needle, start)
+        if idx < 0:
+            break
+        offsets.append(idx)
+        start = idx + 1
+    return offsets
+
+
 def patch_binary_strings(
     file_path: str | Path,
     replacements: list[dict],
@@ -241,6 +266,7 @@ def patch_binary_strings(
     original = path.read_bytes()
     data = bytearray(original)
     suffix = path.suffix.lower()
+    text_like = suffix in _TEXTLIKE_SUFFIXES
     exact_len_only = suffix in _DEX_SUFFIXES
 
     results: list[dict] = []
@@ -273,7 +299,7 @@ def patch_binary_strings(
             })
             continue
 
-        if not exact_len_only and len(new_bytes) > len(old_bytes):
+        if not text_like and not exact_len_only and len(new_bytes) > len(old_bytes):
             results.append({
                 "success": False,
                 "old_string": old_string,
@@ -284,13 +310,17 @@ def patch_binary_strings(
             })
             continue
 
-        target_offsets = _find_bounded_occurrences(bytes(data), old_bytes)
+        if text_like:
+            target_offsets = _find_all_occurrences(bytes(data), old_bytes)
+        else:
+            target_offsets = _find_bounded_occurrences(bytes(data), old_bytes)
         if not target_offsets:
+            error = "Original string not found as a text occurrence." if text_like else "Original string not found as a bounded binary string."
             results.append({
                 "success": False,
                 "old_string": old_string,
                 "new_string": new_string,
-                "error": "Original string not found as a bounded binary string.",
+                "error": error,
             })
             continue
 
@@ -307,14 +337,18 @@ def patch_binary_strings(
                 continue
             chosen_offsets = [target_offsets[occurrence - 1]]
 
-        if exact_len_only:
+        if text_like:
+            replacement_bytes = new_bytes
+            mode = "text_exact" if len(new_bytes) == len(old_bytes) else "text_replace"
+        elif exact_len_only:
             replacement_bytes = new_bytes
             mode = "exact_length"
         else:
             replacement_bytes = new_bytes + (b"\x00" * (len(old_bytes) - len(new_bytes)))
             mode = "exact_length" if len(new_bytes) == len(old_bytes) else "null_padded"
 
-        for offset in chosen_offsets:
+        write_offsets = reversed(chosen_offsets) if text_like else chosen_offsets
+        for offset in write_offsets:
             data[offset:offset + len(old_bytes)] = replacement_bytes
 
         total_patched += len(chosen_offsets)
