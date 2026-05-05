@@ -1488,6 +1488,11 @@ def _process_stream_event(event: dict, graph, graph_config: dict, *, auto_mode: 
                         except Exception:
                             pass
 
+        elif node_name == "tools_post":
+            # The tool batch is fully post-processed; the next visible wait is the model.
+            token_tracker.set_agent_phase("waiting for model")
+            live_bar.update()
+
         elif node_name == "human_review":
             pass
 
