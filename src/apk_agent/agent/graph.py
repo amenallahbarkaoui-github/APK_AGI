@@ -254,7 +254,7 @@ def agent_node(state: AgentState) -> dict:
                     "- Entry/recovery: find_entry_points, map_hierarchy, analyze_shared_prefs, extract_native_strings, scan_assets_secrets\n"
                     "- Validation: validate_patch, diff_patched_file, validate_patch_pipeline, generate_runtime_validation_plan\n"
                     "- Architecture recovery: map_semantic_architecture, recover_hidden_state_model, profile_guard_and_revalidation_surface, find_enforcement_surfaces, semantic_method_slice\n"
-                    "- Runtime/response control: patch_api_response_flow, inject_runtime_override_layer\n"
+                    "- Runtime/response control: patch_api_response_flow, inject_runtime_override_layer, inject_runtime_menu_scaffold, configure_runtime_menu_manifest\n"
                     "- Working memory: update_scratchpad (save any free-form hypothesis, suspicious class, state field, or server-overwrite note for later turns)\n"
                     "- Text/resource/binary patching: apply_text_patch, preview_text_patch, patch_binary_hex, find_resource_colors, find_resource_styles, replace_resource_colors, list_resource_drawables\n"
                     "- Clone/install identity: rename_package_identity\n"

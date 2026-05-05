@@ -10753,6 +10753,136 @@ def plan_runtime_hooks(focus_hint: str = "", class_name: str = "", max_results: 
 
 
 @tool
+def inject_runtime_menu_scaffold(
+        spec_json: str,
+        overlay_mode: str = "in_app",
+        reapply_on_resume: bool = True,
+        dry_run: bool = False,
+) -> str:
+        """Inject a first-pass runtime mod-menu scaffold into the current APK project.
+
+        The first implementation generates an in-app overlay panel attached to the
+        foreground Activity. Each button can trigger one of these runtime action kinds:
+            - shared_pref
+            - static_field
+            - invoke_static
+
+        Example spec_json:
+            {
+                "title": "Premium Runtime Menu",
+                "buttons": [
+                    {
+                        "id": "premium_pref",
+                        "label": "Force Premium Pref",
+                        "kind": "shared_pref",
+                        "prefs_name": "user_state",
+                        "key": "is_premium",
+                        "type": "boolean",
+                        "value": true,
+                        "persist_on_resume": true
+                    },
+                    {
+                        "label": "Call Premium Hook",
+                        "kind": "invoke_static",
+                        "method_descriptor": "Lcom/example/Hooks;->enableVip(Landroid/content/Context;)V"
+                    }
+                ]
+            }
+
+        Notes:
+        - This first slice creates real helper classes and startup bootstrap code.
+        - The generated menu is inside the app window itself, so no overlay permission
+            is required for overlay_mode='in_app'.
+        - If overlay_mode='system_overlay' or 'hybrid' is requested, the tool now
+            returns explicit Tier B requirements/warnings and still falls back to the
+            in-app scaffold until a full WindowManager service implementation exists.
+        - Persistent actions are re-applied on later resumes/attaches until the
+            generated reset button is pressed.
+        """
+        from apk_agent.tools.runtime_menu import inject_runtime_menu_scaffold as _inject_runtime_menu_scaffold
+
+        def _run():
+                try:
+                        spec = json.loads(spec_json)
+                except json.JSONDecodeError as exc:
+                        return json.dumps({"success": False, "error": f"Invalid JSON: {exc}"})
+
+                result = _inject_runtime_menu_scaffold(
+                        _project.apktool_dir,
+                        spec,
+                        overlay_mode=overlay_mode,
+                        backup_dir=_project.patch_backup_dir,
+                        reapply_on_resume=reapply_on_resume,
+                        dry_run=dry_run,
+                )
+                if result.get("success") and not dry_run:
+                        _patch_journal.append({
+                                "success": True,
+                                "target_file": result.get("files_modified", ["runtime menu scaffold"])[0],
+                                "description": (
+                                        f"Injected runtime menu scaffold ({result.get('overlay_mode', overlay_mode)}) "
+                                        f"with {result.get('user_buttons', 0)} user buttons"
+                                ),
+                                "steps_applied": len(result.get("files_modified", [])),
+                                "steps_total": len(result.get("files_modified", [])),
+                                "errors": result.get("errors", [])[:5],
+                                "tool": "inject_runtime_menu_scaffold",
+                        })
+                return json.dumps(result, ensure_ascii=False, indent=2)[:30000]
+
+        return _safe_call(_run, "inject_runtime_menu_scaffold")
+
+
+@tool
+def configure_runtime_menu_manifest(
+        overlay_mode: str = "in_app",
+        add_overlay_permission: bool = False,
+        require_foreground_service: bool = False,
+) -> str:
+        """Ensure AndroidManifest.xml declares the permissions needed by runtime menu modes.
+
+        Use this after planning a runtime menu when you need system-overlay or
+        foreground-service support.
+
+        Notes:
+        - in_app mode usually needs no extra permissions.
+        - system_overlay / hybrid modes typically need SYSTEM_ALERT_WINDOW.
+        - Foreground-service flows may also need FOREGROUND_SERVICE and, on newer
+            targets, POST_NOTIFICATIONS.
+        - This tool declares permissions only; Android may still require an explicit
+            runtime approval flow before overlays can draw.
+        - Tier B should be treated as high-risk/high-friction: permission friction,
+            higher detectability, and more OEM/API-specific crash risk.
+        """
+        from apk_agent.tools.runtime_menu import configure_runtime_menu_manifest as _configure_runtime_menu_manifest
+
+        def _run():
+                result = _configure_runtime_menu_manifest(
+                        _project.apktool_dir,
+                        overlay_mode=overlay_mode,
+                        backup_dir=_project.patch_backup_dir,
+                        add_overlay_permission=add_overlay_permission,
+                        require_foreground_service=require_foreground_service,
+                )
+                if result.get("success") and result.get("permissions_added"):
+                        _patch_journal.append({
+                                "success": True,
+                                "target_file": result.get("manifest_file", "AndroidManifest.xml"),
+                                "description": (
+                                        f"Configured runtime menu manifest ({result.get('overlay_mode', overlay_mode)}) "
+                                        f"with permissions: {', '.join(result.get('permissions_added', []))}"
+                                ),
+                                "steps_applied": len(result.get("permissions_added", [])),
+                                "steps_total": len(result.get("permissions_added", [])),
+                                "errors": [],
+                                "tool": "configure_runtime_menu_manifest",
+                        })
+                return json.dumps(result, ensure_ascii=False, indent=2)[:20000]
+
+        return _safe_call(_run, "configure_runtime_menu_manifest")
+
+
+@tool
 def analyze_network_behavior(focus_hint: str = "", max_results: int = 20) -> str:
     """Analyze network-to-state behavior boundaries in the unified behavior graph."""
     from apk_agent.tools.behavior_engine import analyze_network_behavior as _analyze_network_behavior
@@ -11043,6 +11173,8 @@ ALL_TOOLS = [
     plan_runtime_hooks,
     analyze_network_behavior,
     recover_semantic_symbols,
+    inject_runtime_menu_scaffold,
+    configure_runtime_menu_manifest,
     patch_api_response_flow,
     inject_runtime_override_layer,
     semantic_method_slice,

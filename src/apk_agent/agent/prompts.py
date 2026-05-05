@@ -493,6 +493,13 @@ These are supplementary patches to cover data sources OUTSIDE the entity class:
    constructor-forced fields, patch the model boundary directly instead of patching UI symptoms.
 - `inject_runtime_override_layer(...)` — ONLY if static root-cause patches are still reverted at runtime.
    Use it to re-apply shared prefs/static fields from inside the APK after startup.
+- If the user explicitly wants a manual runtime mod menu / floating in-app control layer:
+  `inject_runtime_menu_scaffold(spec_json, overlay_mode="in_app")` to generate the first in-app
+  runtime menu scaffold, then `configure_runtime_menu_manifest(...)` only if later overlay or
+  foreground-service permissions are actually needed.
+   Treat `system_overlay` / Tier B as a high-friction escalation only when the user explicitly wants
+   a detached overlay and accepts `SYSTEM_ALERT_WINDOW`, `WindowManager`, `TYPE_APPLICATION_OVERLAY`,
+   higher detectability, and higher crash risk across devices.
 
 **STEP 5 — ROOT-CAUSE VERIFICATION (the final check):**
 At this point, you patched the SOURCE OF TRUTH (entity fields + gate methods). Now verify
@@ -522,10 +529,12 @@ Use `map_ui_gates` to find premium UI gates. Use `identify_server_checks` to map
 Use `patch_api_response_flow` when network/serialization logic overwrites your entity fields.
 Use `profile_guard_and_revalidation_surface` before resorting to runtime hooks.
 Use `inject_runtime_override_layer` only when late runtime checks still undo a correct static patch.
+Use `inject_runtime_menu_scaffold` when the task explicitly needs a user-driven runtime menu whose
+buttons re-apply state from inside the app at press time.
 Use `trace_data_pipeline` to see the full entity lifecycle and verify you've covered every path.
 
 **🚫 INJECTION SAFETY RULES — READ BEFORE USING ANY INJECTION TOOL:**
-Injection tools (`inject_smali_code`, `generate_constructor_override`, `inject_startup_hook`, `patch_api_response_flow`, `inject_runtime_override_layer`) are
+Injection tools (`inject_smali_code`, `generate_constructor_override`, `inject_startup_hook`, `patch_api_response_flow`, `inject_runtime_override_layer`, `inject_runtime_menu_scaffold`) are
 SURGICAL instruments. Misuse corrupts smali files and breaks the APK build.
 
 **STRICT RULES:**
@@ -551,13 +560,20 @@ SURGICAL instruments. Misuse corrupts smali files and breaks the APK build.
    logic overwrites entity values after deserialization. It is the correct model-boundary tool.
 7. **inject_runtime_override_layer** — use ONLY after a correct static patch still gets reverted by
    lifecycle revalidation, dynamic loading, or late state writes. It is NOT the first patching tool.
-8. **Always verify after injection:** run `validate_patch` + `diff_patched_file` on the modified
+8. **inject_runtime_menu_scaffold** — use when the user explicitly wants a manual runtime menu whose
+   buttons trigger in-app toggles/callbacks at press time. Prefer `overlay_mode="in_app"` first;
+   add `configure_runtime_menu_manifest(...)` only when true system overlay permissions are required.
+   Treat Tier B / `system_overlay` as high-risk: permission friction, detectability increase, and
+   OEM/API-specific crash potential are real tradeoffs, not optional footnotes.
+9. **Always verify after injection:** run `validate_patch` + `diff_patched_file` on the modified
    file. If the validation fails, restore from the auto-backup (.smali.bak) and retry.
 
 **Advanced root-cause helpers (conditional escalation):**
 ```
 patch_api_response_flow(...)        ← patch response/factory/model-boundary overwrites
 inject_runtime_override_layer(...) ← internal runtime re-apply layer after static patch still gets reverted
+inject_runtime_menu_scaffold(...)  ← generate a user-driven in-app runtime menu scaffold with button actions
+configure_runtime_menu_manifest(...) ← declare overlay / foreground-service permissions only when required
 ```
 
 **Preferred helpers (non-patch):**
