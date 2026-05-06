@@ -43,6 +43,8 @@ _TOGGLE_DESCRIPTOR = "Lapkagi/menu/MenuToggleCheckedChangeListener;"
 _SLIDER_DESCRIPTOR = "Lapkagi/menu/MenuSliderChangeListener;"
 _PANEL_DRAG_DESCRIPTOR = "Lapkagi/menu/MenuPanelDragTouchListener;"
 _OVERLAY_DRAG_DESCRIPTOR = "Lapkagi/menu/OverlayMenuDragTouchListener;"
+_COMPAT_DESCRIPTOR = "Lapkagi/menu/MenuCompat;"
+_ATTACH_RUNNABLE_DESCRIPTOR = "Lapkagi/menu/MenuAttachRunnable;"
 _LIFECYCLE_DESCRIPTOR = "Lapkagi/menu/MenuLifecycleCallbacks;"
 _OVERLAY_SERVICE_DESCRIPTOR = "Lapkagi/menu/OverlayMenuService;"
 _OVERLAY_SERVICE_FQCN = "apkagi.menu.OverlayMenuService"
@@ -54,6 +56,9 @@ _RESET_ACTION_LABEL = "Reset Runtime Actions"
 _SUPPORTED_OVERLAY_MODES = {"in_app", "system_overlay", "hybrid"}
 _SUPPORTED_UI_KINDS = {"button", "toggle", "slider"}
 _SUPPORTED_ACTION_KINDS = {"shared_pref", "static_field", "invoke_static", "dispatcher"}
+_DEFAULT_ATTACH_DELAY_MS = 150
+_DEFAULT_ATTACH_RETRY_COUNT = 2
+_DEFAULT_ATTACH_RETRY_DELAY_MS = 250
 _DIRECT_BINDING_UI_KIND = {
     tuple(): "button",
     ("Landroid/content/Context;",): "button",
@@ -161,6 +166,25 @@ def _backup_file(file_path: Path, apktool_dir: Path, backup_dir: Path | None, ba
         shutil.copy2(file_path, backup_path)
     backed_up[key] = str(backup_path)
     return str(backup_path)
+
+
+def _restore_backup_entry(file_path: Path, backup_path: str) -> None:
+    if backup_path and Path(backup_path).exists():
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(backup_path, file_path)
+        return
+    if file_path.exists():
+        file_path.unlink()
+
+
+def _rollback_runtime_menu_changes(touched_files: set[str], backed_up: dict[str, str]) -> list[str]:
+    restored_files: list[str] = []
+    for file_name in sorted(touched_files):
+        file_path = Path(file_name)
+        backup_path = backed_up.get(str(file_path.resolve()), "")
+        _restore_backup_entry(file_path, backup_path)
+        restored_files.append(str(file_path))
+    return restored_files
 
 
 def _method_has_bootstrap(smali_file: Path, method_name: str) -> bool:
@@ -436,6 +460,59 @@ def _normalize_action(raw_action: dict[str, Any], index: int, default_persist: b
     return normalized
 
 
+def _normalize_menu_runtime_settings(spec: dict[str, Any], overlay_mode: str) -> dict[str, Any]:
+    raw_settings = spec.get("menu_settings") or spec.get("runtime_settings") or {}
+    if raw_settings in (None, ""):
+        raw_settings = {}
+    if not isinstance(raw_settings, dict):
+        raise ValueError("menu_settings must be a JSON object when provided")
+
+    attach_delay_source = raw_settings.get("attach_delay_ms", spec.get("delayed_attach_ms", _DEFAULT_ATTACH_DELAY_MS))
+    attach_retry_count_source = raw_settings.get(
+        "attach_retry_count",
+        spec.get("attach_retry_count", _DEFAULT_ATTACH_RETRY_COUNT),
+    )
+    attach_retry_delay_source = raw_settings.get(
+        "attach_retry_delay_ms",
+        spec.get("attach_retry_delay_ms", _DEFAULT_ATTACH_RETRY_DELAY_MS),
+    )
+    attach_root_strategy = str(
+        raw_settings.get("attach_root_strategy", spec.get("attach_root_strategy", "auto")) or "auto"
+    ).strip().lower()
+    if attach_root_strategy not in {"auto", "content_first", "decor_first"}:
+        raise ValueError("attach_root_strategy must be one of ['auto', 'content_first', 'decor_first']")
+
+    overlay_fallback_default = overlay_mode == "hybrid"
+    overlay_permission_default = overlay_mode in {"system_overlay", "hybrid"}
+
+    attach_delay_ms = max(0, min(int(attach_delay_source or 0), 5000))
+    attach_retry_count = max(0, min(int(attach_retry_count_source or 0), 5))
+    attach_retry_delay_ms = max(0, min(int(attach_retry_delay_source or 0), 3000))
+    overlay_fallback_on_attach_failure = bool(
+        raw_settings.get(
+            "overlay_fallback_on_attach_failure",
+            spec.get("overlay_fallback_on_attach_failure", overlay_fallback_default),
+        )
+    )
+    request_overlay_permission_on_fallback = bool(
+        raw_settings.get(
+            "request_overlay_permission_on_fallback",
+            spec.get("request_overlay_permission_on_fallback", overlay_permission_default),
+        )
+    )
+    auto_start_overlay = bool(raw_settings.get("auto_start_overlay", spec.get("auto_start_overlay", False)))
+
+    return {
+        "attach_delay_ms": attach_delay_ms,
+        "attach_retry_count": attach_retry_count,
+        "attach_retry_delay_ms": attach_retry_delay_ms,
+        "attach_root_strategy": attach_root_strategy,
+        "overlay_fallback_on_attach_failure": overlay_fallback_on_attach_failure,
+        "request_overlay_permission_on_fallback": request_overlay_permission_on_fallback,
+        "auto_start_overlay": auto_start_overlay,
+    }
+
+
 def _normalize_menu_spec(spec: dict[str, Any], overlay_mode: str) -> dict[str, Any]:
     if not isinstance(spec, dict):
         raise ValueError("spec_json must decode to a JSON object")
@@ -466,6 +543,7 @@ def _normalize_menu_spec(spec: dict[str, Any], overlay_mode: str) -> dict[str, A
     start_collapsed = bool(spec.get("start_collapsed", True))
     auto_reapply_actions = bool(spec.get("auto_reapply_actions", False))
     restore_open_state = bool(spec.get("restore_open_state", False))
+    runtime_settings = _normalize_menu_runtime_settings(spec, chosen_mode)
     target_smali_root = normalize_smali_root_name(
         spec.get("target_smali_root") or spec.get("helper_smali_root") or spec.get("target_dex_root") or "auto"
     )
@@ -501,6 +579,14 @@ def _normalize_menu_spec(spec: dict[str, Any], overlay_mode: str) -> dict[str, A
         "start_collapsed": start_collapsed,
         "auto_reapply_actions": auto_reapply_actions,
         "restore_open_state": restore_open_state,
+        "delayed_attach_ms": runtime_settings["attach_delay_ms"],
+        "attach_retry_count": runtime_settings["attach_retry_count"],
+        "attach_retry_delay_ms": runtime_settings["attach_retry_delay_ms"],
+        "attach_root_strategy": runtime_settings["attach_root_strategy"],
+        "auto_start_overlay": runtime_settings["auto_start_overlay"],
+        "overlay_fallback_on_attach_failure": runtime_settings["overlay_fallback_on_attach_failure"],
+        "request_overlay_permission_on_fallback": runtime_settings["request_overlay_permission_on_fallback"],
+        "menu_settings": runtime_settings,
         "target_smali_root": target_smali_root,
         "buttons": normalized_buttons,
         "hook_bindings": hook_bindings,
@@ -1586,6 +1672,8 @@ def _shared_pref_action_lines(action: dict[str, Any], *, value_register: str | N
             "    move-result-object v2",
         ])
     elif value_type == "int":
+        if value is None:
+            raise ValueError("shared_pref int actions require a value")
         int_value = int(value)
         if -8 <= int_value <= 7:
             lines.append(f"    const/4 v4, {hex(int_value)}")
@@ -1598,6 +1686,8 @@ def _shared_pref_action_lines(action: dict[str, Any], *, value_register: str | N
             "    move-result-object v2",
         ])
     elif value_type == "long":
+        if value is None:
+            raise ValueError("shared_pref long actions require a value")
         lines.extend([
             f"    const-wide v4, {hex(int(value))}",
             "    invoke-interface {v2, v3, v4, v5}, Landroid/content/SharedPreferences$Editor;->putLong(Ljava/lang/String;J)Landroid/content/SharedPreferences$Editor;",
@@ -1636,6 +1726,8 @@ def _static_field_action_lines(action: dict[str, Any], *, value_register: str | 
         lines.append(f"    const/4 v2, {'0x1' if bool(value) else '0x0'}")
         lines.append(f"    sput-boolean v2, {class_descriptor}->{field_name}:{field_type}")
     elif field_type == "I":
+        if value is None:
+            raise ValueError("static_field int writes require a value")
         int_value = int(value)
         if -8 <= int_value <= 7:
             lines.append(f"    const/4 v2, {hex(int_value)}")
@@ -1645,6 +1737,8 @@ def _static_field_action_lines(action: dict[str, Any], *, value_register: str | 
             lines.append(f"    const v2, {hex(int_value)}")
         lines.append(f"    sput v2, {class_descriptor}->{field_name}:{field_type}")
     elif field_type == "J":
+        if value is None:
+            raise ValueError("static_field long writes require a value")
         lines.append(f"    const-wide v2, {hex(int(value))}")
         lines.append(f"    sput-wide v2, {class_descriptor}->{field_name}:{field_type}")
     elif field_type == "Ljava/lang/String;":
@@ -2596,6 +2690,147 @@ def _generate_lifecycle_callbacks_smali() -> str:
     ]) + "\n"
 
 
+def _generate_attach_runnable_smali() -> str:
+    return "\n".join([
+        ".class public final Lapkagi/menu/MenuAttachRunnable;",
+        ".super Ljava/lang/Object;",
+        ".implements Ljava/lang/Runnable;",
+        '.source "MenuAttachRunnable.java"',
+        "",
+        ".field private final activity:Landroid/app/Activity;",
+        ".field private final attempt:I",
+        "",
+        ".method public constructor <init>(Landroid/app/Activity;I)V",
+        "    .locals 0",
+        "    invoke-direct {p0}, Ljava/lang/Object;-><init>()V",
+        "    iput-object p1, p0, Lapkagi/menu/MenuAttachRunnable;->activity:Landroid/app/Activity;",
+        "    iput p2, p0, Lapkagi/menu/MenuAttachRunnable;->attempt:I",
+        "    return-void",
+        ".end method",
+        "",
+        ".method public run()V",
+        "    .locals 2",
+        "    iget-object v0, p0, Lapkagi/menu/MenuAttachRunnable;->activity:Landroid/app/Activity;",
+        "    iget v1, p0, Lapkagi/menu/MenuAttachRunnable;->attempt:I",
+        "    invoke-static {v0, v1}, Lapkagi/menu/InAppMenuBridge;->attachAttempt(Landroid/app/Activity;I)V",
+        "    return-void",
+        ".end method",
+        "",
+    ]) + "\n"
+
+
+def _generate_menu_compat_smali(spec: dict[str, Any]) -> str:
+    strategy = str(spec.get("attach_root_strategy") or "auto")
+    prefer_decor_first = strategy == "decor_first"
+
+    if prefer_decor_first:
+        resolve_lines = [
+            "    if-eqz p0, :apkagi_compat_root_null",
+            "    invoke-virtual {p0}, Landroid/app/Activity;->getWindow()Landroid/view/Window;",
+            "    move-result-object v0",
+            "    if-eqz v0, :apkagi_compat_check_content_root",
+            "    invoke-virtual {v0}, Landroid/view/Window;->getDecorView()Landroid/view/View;",
+            "    move-result-object v1",
+            "    if-eqz v1, :apkagi_compat_check_content_root",
+            "    instance-of v2, v1, Landroid/view/ViewGroup;",
+            "    if-eqz v2, :apkagi_compat_check_decor_content",
+            "    check-cast v1, Landroid/view/ViewGroup;",
+            "    return-object v1",
+            ":apkagi_compat_check_decor_content",
+            "    const v2, 0x1020002",
+            "    invoke-virtual {v1, v2}, Landroid/view/View;->findViewById(I)Landroid/view/View;",
+            "    move-result-object v1",
+            "    instance-of v2, v1, Landroid/view/ViewGroup;",
+            "    if-eqz v2, :apkagi_compat_check_content_root",
+            "    check-cast v1, Landroid/view/ViewGroup;",
+            "    return-object v1",
+            ":apkagi_compat_check_content_root",
+            "    const v0, 0x1020002",
+            "    invoke-virtual {p0, v0}, Landroid/app/Activity;->findViewById(I)Landroid/view/View;",
+            "    move-result-object v1",
+            "    instance-of v2, v1, Landroid/view/ViewGroup;",
+            "    if-eqz v2, :apkagi_compat_root_view",
+            "    check-cast v1, Landroid/view/ViewGroup;",
+            "    return-object v1",
+            ":apkagi_compat_root_view",
+            "    invoke-virtual {p0}, Landroid/app/Activity;->getWindow()Landroid/view/Window;",
+            "    move-result-object v0",
+            "    if-eqz v0, :apkagi_compat_root_null",
+            "    invoke-virtual {v0}, Landroid/view/Window;->getDecorView()Landroid/view/View;",
+            "    move-result-object v1",
+            "    if-eqz v1, :apkagi_compat_root_null",
+            "    invoke-virtual {v1}, Landroid/view/View;->getRootView()Landroid/view/View;",
+            "    move-result-object v1",
+            "    instance-of v2, v1, Landroid/view/ViewGroup;",
+            "    if-eqz v2, :apkagi_compat_root_null",
+            "    check-cast v1, Landroid/view/ViewGroup;",
+            "    return-object v1",
+        ]
+    else:
+        resolve_lines = [
+            "    if-eqz p0, :apkagi_compat_root_null",
+            "    const v0, 0x1020002",
+            "    invoke-virtual {p0, v0}, Landroid/app/Activity;->findViewById(I)Landroid/view/View;",
+            "    move-result-object v1",
+            "    instance-of v2, v1, Landroid/view/ViewGroup;",
+            "    if-eqz v2, :apkagi_compat_check_window_root",
+            "    check-cast v1, Landroid/view/ViewGroup;",
+            "    return-object v1",
+            ":apkagi_compat_check_window_root",
+            "    invoke-virtual {p0}, Landroid/app/Activity;->getWindow()Landroid/view/Window;",
+            "    move-result-object v1",
+            "    if-eqz v1, :apkagi_compat_root_view",
+            "    invoke-virtual {v1}, Landroid/view/Window;->getDecorView()Landroid/view/View;",
+            "    move-result-object v1",
+            "    if-eqz v1, :apkagi_compat_root_view",
+            "    invoke-virtual {v1, v0}, Landroid/view/View;->findViewById(I)Landroid/view/View;",
+            "    move-result-object v2",
+            "    instance-of v0, v2, Landroid/view/ViewGroup;",
+            "    if-eqz v0, :apkagi_compat_check_decor_group",
+            "    check-cast v2, Landroid/view/ViewGroup;",
+            "    return-object v2",
+            ":apkagi_compat_check_decor_group",
+            "    instance-of v0, v1, Landroid/view/ViewGroup;",
+            "    if-eqz v0, :apkagi_compat_root_view",
+            "    check-cast v1, Landroid/view/ViewGroup;",
+            "    return-object v1",
+            ":apkagi_compat_root_view",
+            "    invoke-virtual {p0}, Landroid/app/Activity;->getWindow()Landroid/view/Window;",
+            "    move-result-object v0",
+            "    if-eqz v0, :apkagi_compat_root_null",
+            "    invoke-virtual {v0}, Landroid/view/Window;->getDecorView()Landroid/view/View;",
+            "    move-result-object v1",
+            "    if-eqz v1, :apkagi_compat_root_null",
+            "    invoke-virtual {v1}, Landroid/view/View;->getRootView()Landroid/view/View;",
+            "    move-result-object v1",
+            "    instance-of v2, v1, Landroid/view/ViewGroup;",
+            "    if-eqz v2, :apkagi_compat_root_null",
+            "    check-cast v1, Landroid/view/ViewGroup;",
+            "    return-object v1",
+        ]
+
+    return "\n".join([
+        ".class public final Lapkagi/menu/MenuCompat;",
+        ".super Ljava/lang/Object;",
+        '.source "MenuCompat.java"',
+        "",
+        ".method public constructor <init>()V",
+        "    .locals 0",
+        "    invoke-direct {p0}, Ljava/lang/Object;-><init>()V",
+        "    return-void",
+        ".end method",
+        "",
+        ".method public static resolveAttachRoot(Landroid/app/Activity;)Landroid/view/ViewGroup;",
+        "    .locals 3",
+        *resolve_lines,
+        ":apkagi_compat_root_null",
+        "    const/4 v0, 0x0",
+        "    return-object v0",
+        ".end method",
+        "",
+    ]) + "\n"
+
+
 def _generate_widget_lines(spec: dict[str, Any], *, context_register: str, container_register: str) -> list[str]:
     widget_lines: list[str] = []
     current_section = ""
@@ -2687,6 +2922,12 @@ def _generate_bridge_smali(spec: dict[str, Any]) -> str:
     include_system_overlay = overlay_mode in {"system_overlay", "hybrid"}
     auto_reapply_actions = bool(spec.get("auto_reapply_actions", False))
     restore_open_state = bool(spec.get("restore_open_state", False))
+    delayed_attach_ms = max(0, min(int(spec.get("delayed_attach_ms", _DEFAULT_ATTACH_DELAY_MS) or 0), 5000))
+    attach_retry_count = max(0, min(int(spec.get("attach_retry_count", _DEFAULT_ATTACH_RETRY_COUNT) or 0), 5))
+    attach_retry_delay_ms = max(0, min(int(spec.get("attach_retry_delay_ms", _DEFAULT_ATTACH_RETRY_DELAY_MS) or 0), 3000))
+    auto_start_overlay = bool(spec.get("auto_start_overlay", False))
+    overlay_fallback_on_attach_failure = bool(spec.get("overlay_fallback_on_attach_failure", include_system_overlay and overlay_mode == "hybrid"))
+    request_overlay_permission_on_fallback = bool(spec.get("request_overlay_permission_on_fallback", include_system_overlay))
     widget_lines = _generate_widget_lines(spec, context_register="p0", container_register="v12")
     default_open = "0x0" if bool(spec.get("start_collapsed")) else "0x1"
 
@@ -2695,7 +2936,7 @@ def _generate_bridge_smali(spec: dict[str, Any]) -> str:
     ]
     if auto_reapply_actions and not include_in_app:
         install_lines.append("    invoke-static {p0}, Lapkagi/menu/MenuActions;->reapplyEnabled(Landroid/content/Context;)V")
-    if include_system_overlay:
+    if include_system_overlay and auto_start_overlay:
         install_lines.append("    invoke-static {p0}, Lapkagi/menu/InAppMenuBridge;->ensureSystemOverlay(Landroid/content/Context;)V")
     if include_in_app:
         install_lines.extend([
@@ -2735,6 +2976,7 @@ def _generate_bridge_smali(spec: dict[str, Any]) -> str:
         "    .catch Ljava/lang/Throwable; {:apkagi_install_try_start .. :apkagi_install_try_end} :apkagi_install_catch",
         ":apkagi_install_catch",
         "    move-exception v0",
+        "    invoke-static {p0}, Lapkagi/menu/InAppMenuBridge;->rollbackInstall(Landroid/content/Context;)V",
         ":apkagi_install_wrapper_done",
         "    return-void",
         ".end method",
@@ -2746,16 +2988,118 @@ def _generate_bridge_smali(spec: dict[str, Any]) -> str:
         "    return-void",
         ".end method",
         "",
+        ".method private static rollbackInstall(Landroid/content/Context;)V",
+        "    .locals 1",
+        "    instance-of v0, p0, Landroid/app/Activity;",
+        "    if-eqz v0, :apkagi_install_rollback_done",
+        "    move-object v0, p0",
+        "    check-cast v0, Landroid/app/Activity;",
+        "    invoke-static {v0}, Lapkagi/menu/InAppMenuBridge;->rollbackAttach(Landroid/app/Activity;)V",
+        ":apkagi_install_rollback_done",
+        "    return-void",
+        ".end method",
+        "",
         ".method public static attach(Landroid/app/Activity;)V",
         "    .locals 1",
         "    :apkagi_attach_try_start",
-        "    invoke-static {p0}, Lapkagi/menu/InAppMenuBridge;->attachUnsafe(Landroid/app/Activity;)V",
+        "    const/4 v0, 0x0",
+        "    invoke-static {p0, v0}, Lapkagi/menu/InAppMenuBridge;->scheduleAttachUnsafe(Landroid/app/Activity;I)V",
         "    :apkagi_attach_try_end",
         "    goto :apkagi_attach_wrapper_done",
         "    .catch Ljava/lang/Throwable; {:apkagi_attach_try_start .. :apkagi_attach_try_end} :apkagi_attach_catch",
         ":apkagi_attach_catch",
         "    move-exception v0",
+        "    invoke-static {p0}, Lapkagi/menu/InAppMenuBridge;->rollbackAttach(Landroid/app/Activity;)V",
         ":apkagi_attach_wrapper_done",
+        "    return-void",
+        ".end method",
+        "",
+        ".method private static scheduleAttachUnsafe(Landroid/app/Activity;I)V",
+        "    .locals 4",
+        "    if-eqz p0, :apkagi_schedule_attach_done",
+        "    invoke-virtual {p0}, Landroid/app/Activity;->getWindow()Landroid/view/Window;",
+        "    move-result-object v0",
+        "    if-eqz v0, :apkagi_schedule_attach_missing_root",
+        "    invoke-virtual {v0}, Landroid/view/Window;->getDecorView()Landroid/view/View;",
+        "    move-result-object v0",
+        "    if-eqz v0, :apkagi_schedule_attach_missing_root",
+        "    new-instance v1, Lapkagi/menu/MenuAttachRunnable;",
+        "    invoke-direct {v1, p0, p1}, Lapkagi/menu/MenuAttachRunnable;-><init>(Landroid/app/Activity;I)V",
+        "    if-eqz p1, :apkagi_schedule_attach_first_delay",
+        f"    const-wide/16 v2, {hex(attach_retry_delay_ms)}",
+        "    goto :apkagi_schedule_attach_delay_ready",
+        ":apkagi_schedule_attach_first_delay",
+        f"    const-wide/16 v2, {hex(delayed_attach_ms)}",
+        ":apkagi_schedule_attach_delay_ready",
+        "    invoke-virtual {v0, v1, v2, v3}, Landroid/view/View;->postDelayed(Ljava/lang/Runnable;J)Z",
+        "    goto :apkagi_schedule_attach_done",
+        ":apkagi_schedule_attach_missing_root",
+        "    invoke-static {p0, p1}, Lapkagi/menu/InAppMenuBridge;->handleAttachMiss(Landroid/app/Activity;I)V",
+        ":apkagi_schedule_attach_done",
+        "    return-void",
+        ".end method",
+        "",
+        ".method public static attachAttempt(Landroid/app/Activity;I)V",
+        "    .locals 1",
+        "    :apkagi_attach_attempt_try_start",
+        "    invoke-static {p0, p1}, Lapkagi/menu/InAppMenuBridge;->attachAttemptUnsafe(Landroid/app/Activity;I)V",
+        "    :apkagi_attach_attempt_try_end",
+        "    goto :apkagi_attach_attempt_done",
+        "    .catch Ljava/lang/Throwable; {:apkagi_attach_attempt_try_start .. :apkagi_attach_attempt_try_end} :apkagi_attach_attempt_catch",
+        ":apkagi_attach_attempt_catch",
+        "    move-exception v0",
+        "    invoke-static {p0}, Lapkagi/menu/InAppMenuBridge;->rollbackAttach(Landroid/app/Activity;)V",
+        ":apkagi_attach_attempt_done",
+        "    return-void",
+        ".end method",
+        "",
+        ".method private static attachAttemptUnsafe(Landroid/app/Activity;I)V",
+        "    .locals 1",
+        "    if-eqz p0, :apkagi_attach_attempt_return",
+        f"    invoke-static {{p0}}, {_COMPAT_DESCRIPTOR}->resolveAttachRoot(Landroid/app/Activity;)Landroid/view/ViewGroup;",
+        "    move-result-object v0",
+        "    if-nez v0, :apkagi_attach_attempt_now",
+        "    invoke-static {p0, p1}, Lapkagi/menu/InAppMenuBridge;->handleAttachMiss(Landroid/app/Activity;I)V",
+        "    return-void",
+        ":apkagi_attach_attempt_now",
+        "    invoke-static {p0}, Lapkagi/menu/InAppMenuBridge;->attachUnsafe(Landroid/app/Activity;)V",
+        ":apkagi_attach_attempt_return",
+        "    return-void",
+        ".end method",
+        "",
+        ".method private static handleAttachMiss(Landroid/app/Activity;I)V",
+        "    .locals 2",
+        "    if-eqz p0, :apkagi_attach_miss_done",
+        f"    const/16 v0, {hex(attach_retry_count)}",
+        "    if-ge p1, v0, :apkagi_attach_miss_fallback",
+        "    add-int/lit8 v0, p1, 0x1",
+        "    invoke-static {p0, v0}, Lapkagi/menu/InAppMenuBridge;->scheduleAttachUnsafe(Landroid/app/Activity;I)V",
+        "    return-void",
+        ":apkagi_attach_miss_fallback",
+        *([
+            "    invoke-static {p0}, Lapkagi/menu/InAppMenuBridge;->ensureSystemOverlay(Landroid/content/Context;)V",
+        ] if include_system_overlay and overlay_fallback_on_attach_failure and request_overlay_permission_on_fallback else [
+            "    invoke-static {p0}, Lapkagi/menu/InAppMenuBridge;->hasOverlayPermission(Landroid/content/Context;)Z",
+            "    move-result v0",
+            "    if-eqz v0, :apkagi_attach_miss_done",
+            "    invoke-static {p0}, Lapkagi/menu/InAppMenuBridge;->startOverlayService(Landroid/content/Context;)V",
+        ] if include_system_overlay and overlay_fallback_on_attach_failure else []),
+        ":apkagi_attach_miss_done",
+        "    return-void",
+        ".end method",
+        "",
+        ".method private static rollbackAttach(Landroid/app/Activity;)V",
+        "    .locals 3",
+        "    if-eqz p0, :apkagi_attach_rollback_done",
+        f"    invoke-static {{p0}}, {_COMPAT_DESCRIPTOR}->resolveAttachRoot(Landroid/app/Activity;)Landroid/view/ViewGroup;",
+        "    move-result-object v0",
+        "    if-eqz v0, :apkagi_attach_rollback_done",
+        '    const-string v1, "APKAGI_FLOATING_ROOT"',
+        "    invoke-virtual {v0, v1}, Landroid/view/View;->findViewWithTag(Ljava/lang/Object;)Landroid/view/View;",
+        "    move-result-object v2",
+        "    if-eqz v2, :apkagi_attach_rollback_done",
+        "    invoke-virtual {v0, v2}, Landroid/view/ViewGroup;->removeView(Landroid/view/View;)V",
+        ":apkagi_attach_rollback_done",
         "    return-void",
         ".end method",
         "",
@@ -2765,11 +3109,9 @@ def _generate_bridge_smali(spec: dict[str, Any]) -> str:
         *([
             "    invoke-static {p0}, Lapkagi/menu/MenuActions;->reapplyEnabled(Landroid/content/Context;)V",
         ] if auto_reapply_actions else []),
-        "    const v0, 0x1020002",
-        "    invoke-virtual {p0, v0}, Landroid/app/Activity;->findViewById(I)Landroid/view/View;",
+        f"    invoke-static {{p0}}, {_COMPAT_DESCRIPTOR}->resolveAttachRoot(Landroid/app/Activity;)Landroid/view/ViewGroup;",
         "    move-result-object v0",
         "    if-eqz v0, :apkagi_attach_done",
-        "    check-cast v0, Landroid/view/ViewGroup;",
         '    const-string v1, "APKAGI_FLOATING_ROOT"',
         "    invoke-virtual {v0, v1}, Landroid/view/View;->findViewWithTag(Ljava/lang/Object;)Landroid/view/View;",
         "    move-result-object v2",
@@ -2946,6 +3288,7 @@ def _generate_bridge_smali(spec: dict[str, Any]) -> str:
 def _generate_overlay_service_smali(spec: dict[str, Any]) -> str:
     widget_lines = _generate_widget_lines(spec, context_register="p1", container_register="v10")
     default_open = "0x0" if bool(spec.get("start_collapsed")) else "0x1"
+    restore_open_state = bool(spec.get("restore_open_state", False))
 
     return "\n".join([
         ".class public Lapkagi/menu/OverlayMenuService;",
@@ -3236,6 +3579,8 @@ def inject_runtime_menu_scaffold(
     if include_default_helpers:
         helper_files = {
             "InAppMenuBridge.smali": _generate_bridge_smali(normalized_spec),
+            "MenuCompat.smali": _generate_menu_compat_smali(normalized_spec),
+            "MenuAttachRunnable.smali": _generate_attach_runnable_smali(),
             "MenuLifecycleCallbacks.smali": _generate_lifecycle_callbacks_smali(),
             "MenuActionClickListener.smali": _generate_click_listener_smali(),
             "MenuVisibilityClickListener.smali": _generate_visibility_listener_smali(),
@@ -3296,6 +3641,7 @@ def inject_runtime_menu_scaffold(
             "start_collapsed": normalized_spec["start_collapsed"],
             "auto_reapply_actions": normalized_spec["auto_reapply_actions"],
             "restore_open_state": normalized_spec["restore_open_state"],
+            "menu_settings": normalized_spec["menu_settings"],
             "actions_generated": [button["id"] for button in normalized_spec["buttons"]],
             "control_types": normalized_spec["control_types"],
             "section_count": normalized_spec["section_count"],
@@ -3314,6 +3660,7 @@ def inject_runtime_menu_scaffold(
             "notes": [
                 "Dry run only: no smali files or bootstrap hooks were written.",
                 "The current implementation generates a floating launcher bubble, starts collapsed by default, and keeps runtime actions passive unless the spec explicitly enables auto-reapply or open-state restore.",
+                "menu_settings provides one place to tune attach delay, attach retries, root-view resolution strategy, overlay fallback, and overlay-permission prompting.",
                 "custom_helper_files can override generated helpers or replace the whole helper set when include_default_helpers=false.",
                 "When target_smali_root is omitted, helper placement stays dex-aware but startup-bootstrapped helpers are co-located with the resolved startup entry root to avoid early launch class-loading crashes.",
                 "Overlay-based modes expect manifest/service wiring as part of a successful deployment path.",
@@ -3326,6 +3673,7 @@ def inject_runtime_menu_scaffold(
     validations: list[dict[str, Any]] = []
     errors: list[str] = []
     bootstrap_targets: list[dict[str, Any]] = []
+    rolled_back_files: list[str] = []
 
     try:
         for relative_name, content in helper_files.items():
@@ -3400,6 +3748,9 @@ def inject_runtime_menu_scaffold(
     except Exception as exc:
         errors.append(str(exc))
 
+    if errors and touched_files:
+        rolled_back_files = _rollback_runtime_menu_changes(touched_files, backed_up)
+
     return {
         "success": len(errors) == 0 and bool(touched_files),
         "requested_overlay_mode": requested_mode,
@@ -3411,6 +3762,7 @@ def inject_runtime_menu_scaffold(
         "start_collapsed": normalized_spec["start_collapsed"],
         "auto_reapply_actions": normalized_spec["auto_reapply_actions"],
         "restore_open_state": normalized_spec["restore_open_state"],
+        "menu_settings": normalized_spec["menu_settings"],
         "actions_generated": [button["id"] for button in normalized_spec["buttons"]],
         "user_buttons": normalized_spec["user_buttons"],
         "persistent_buttons": normalized_spec["persistent_buttons"],
@@ -3423,6 +3775,8 @@ def inject_runtime_menu_scaffold(
         "manifest_config": manifest_result,
         "helper_classes": [
             _BRIDGE_DESCRIPTOR,
+            _COMPAT_DESCRIPTOR,
+            _ATTACH_RUNNABLE_DESCRIPTOR,
             _CLICK_DESCRIPTOR,
             _VISIBILITY_DESCRIPTOR,
             _ACTIONS_DESCRIPTOR,
@@ -3437,6 +3791,7 @@ def inject_runtime_menu_scaffold(
         "bootstrap_targets": bootstrap_targets,
         "files_modified": sorted(touched_files),
         "rollback_files": list(backed_up.values()),
+        "rolled_back_files": rolled_back_files,
         "validation": validations,
         "recommended_next_tool": (
             "configure_runtime_menu_manifest"
@@ -3457,6 +3812,8 @@ def inject_runtime_menu_scaffold(
             "Launcher visibility and floating position are remembered across later attaches/service restarts.",
             "Buttons can be grouped with section headers using the action-level section field.",
             "Persistent button/toggle/slider state is re-applied on later attaches/resumes until the generated reset button is pressed.",
+            "menu_settings now unifies attach timing, retry behavior, root-view compatibility strategy, and overlay fallback/permission helpers.",
+            "The generated helper package now includes MenuCompat and MenuAttachRunnable so the menu can retry delayed in-app attach before falling back to overlay permission/settings flows.",
             "kind=dispatcher binds controls directly to static runtime-hook methods without extra app-side glue.",
             "Helper classes can still be written into a secondary dex root when target_smali_root is set explicitly.",
             "When target_smali_root is omitted, startup-bootstrapped menu helpers are co-located with the startup entry dex root so launch-time bootstrap calls do not crash before multidex/class loading is ready.",
