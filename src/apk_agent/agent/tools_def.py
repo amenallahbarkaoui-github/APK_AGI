@@ -210,10 +210,6 @@ def _default_execution_plan(mode: str = "adaptive") -> dict[str, Any]:
         "last_replan_reason": "",
     }
 
-
-            # New tool definitions
-    
-
 def _ensure_execution_plan(mode: str = "adaptive") -> dict[str, Any]:
     context = get_active_execution_context()
     if context.execution_plan:
@@ -2496,6 +2492,317 @@ def sign_apk() -> str:
         + "\n\n--- certificate analysis ---\n"
         + json.dumps(cert_info, ensure_ascii=False, indent=2)[:5000]
         + xapk_note
+    )
+
+
+@tool
+def analyze_dex_method_pressure() -> str:
+    """Estimate per-dex method-reference pressure and 64K overflow risk."""
+    from apk_agent.tools.dex_engine import analyze_dex_method_pressure as _analyze
+
+    def _run():
+        result = _analyze(_project.apktool_dir)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
+
+    return _safe_call(_run, "analyze_dex_method_pressure")
+
+
+@tool
+def map_dex_topology() -> str:
+    """Map smali roots, package distribution, and cross-dex dependencies."""
+    from apk_agent.tools.dex_engine import map_dex_topology as _map
+
+    def _run():
+        result = _map(_project.apktool_dir)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
+
+    return _safe_call(_run, "map_dex_topology")
+
+
+@tool
+def extract_dependency_graph(focus_hint: str = "", max_nodes: int = 80) -> str:
+    """Extract a class-level dependency graph with bootstrap, reflection, JNI, and manifest/resource flags."""
+    from apk_agent.tools.dex_engine import extract_dependency_graph as _extract
+
+    def _run():
+        result = _extract(_project.apktool_dir, focus_hint=focus_hint, max_nodes=max_nodes)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:30000]
+
+    return _safe_call(_run, "extract_dependency_graph", _cache_hint=f"{focus_hint}:{max_nodes}")
+
+
+@tool
+def resolve_dex_target(
+    target_package: str = "",
+    preferred_root: str = "",
+    purpose: str = "helper_injection",
+    estimated_new_method_refs: int = 0,
+    avoid_roots_json: str = "",
+) -> str:
+    """Recommend the best dex root for new helpers or relocations."""
+    from apk_agent.tools.dex_engine import resolve_dex_target as _resolve
+
+    def _run():
+        avoid_roots: list[str] = []
+        if str(avoid_roots_json or "").strip():
+            payload = json.loads(avoid_roots_json)
+            if isinstance(payload, list):
+                avoid_roots = [str(item) for item in payload if str(item).strip()]
+        result = _resolve(
+            _project.apktool_dir,
+            target_package=target_package,
+            preferred_root=preferred_root,
+            purpose=purpose,
+            estimated_new_method_refs=estimated_new_method_refs,
+            avoid_roots=avoid_roots,
+        )
+        return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
+
+    return _safe_call(
+        _run,
+        "resolve_dex_target",
+        _cache_hint=f"{target_package}:{preferred_root}:{purpose}:{estimated_new_method_refs}:{avoid_roots_json}",
+    )
+
+
+@tool
+def plan_dex_injection(
+    helper_files_json: str = "",
+    target_package: str = "",
+    preferred_root: str = "",
+    purpose: str = "helper_injection",
+    estimated_new_methods: int = 0,
+) -> str:
+    """Plan dex-aware helper emission before writing new helper classes."""
+    from apk_agent.tools.dex_engine import plan_dex_injection as _plan
+
+    def _run():
+        helper_files: dict[str, str] = {}
+        if str(helper_files_json or "").strip():
+            payload = json.loads(helper_files_json)
+            if isinstance(payload, dict):
+                helper_files = {str(key): str(value) for key, value in payload.items()}
+        result = _plan(
+            _project.apktool_dir,
+            helper_files=helper_files,
+            target_package=target_package,
+            preferred_root=preferred_root,
+            purpose=purpose,
+            estimated_new_methods=estimated_new_methods,
+        )
+        return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
+
+    return _safe_call(
+        _run,
+        "plan_dex_injection",
+        _cache_hint=f"{target_package}:{preferred_root}:{purpose}:{estimated_new_methods}:{helper_files_json[:400]}",
+    )
+
+
+@tool
+def emit_smali_helper_bundle(
+    helper_files_json: str,
+    target_smali_root: str = "smali",
+    dry_run: bool = False,
+) -> str:
+    """Write project-local custom helper smali files into a chosen dex root."""
+    from apk_agent.tools.dex_engine import emit_smali_helper_bundle as _emit
+
+    def _run():
+        payload = json.loads(helper_files_json)
+        if not isinstance(payload, dict):
+            return json.dumps({"success": False, "error": "helper_files_json must decode to a JSON object."})
+        result = _emit(
+            _project.apktool_dir,
+            payload,
+            target_smali_root=target_smali_root,
+            backup_dir=_project.patch_backup_dir,
+            dry_run=dry_run,
+        )
+        if result.get("success") and not dry_run:
+            files_modified = result.get("files_modified", [])
+            _patch_journal.append({
+                "success": True,
+                "target_file": files_modified[0] if files_modified else f"{target_smali_root} helper bundle",
+                "description": f"Emitted custom helper bundle into {result.get('target_smali_root', target_smali_root)}",
+                "steps_applied": len(files_modified),
+                "steps_total": len(files_modified),
+                "errors": result.get("errors", [])[:5],
+                "tool": "emit_smali_helper_bundle",
+            })
+        return json.dumps(result, ensure_ascii=False, indent=2)[:30000]
+
+    return _safe_call(_run, "emit_smali_helper_bundle")
+
+
+@tool
+def relocate_smali_tree(
+    source_path: str,
+    target_smali_root: str,
+    dry_run: bool = False,
+    allow_bootstrap_move: bool = False,
+    overwrite: bool = False,
+) -> str:
+    """Move a smali class or package tree between dex roots without changing descriptors."""
+    from apk_agent.tools.dex_engine import relocate_smali_tree as _relocate
+
+    def _run():
+        result = _relocate(
+            _project.apktool_dir,
+            source_path,
+            target_smali_root=target_smali_root,
+            backup_dir=_project.patch_backup_dir,
+            dry_run=dry_run,
+            allow_bootstrap_move=allow_bootstrap_move,
+            overwrite=overwrite,
+        )
+        if result.get("success") and not dry_run:
+            moved_files = result.get("moved_files", [])
+            errors = result.get("errors", [])
+            _patch_journal.append({
+                "success": True,
+                "target_file": result.get("target_path", source_path),
+                "description": f"Relocated smali tree from {result.get('source_root', '')} to {result.get('target_root', target_smali_root)}",
+                "steps_applied": len(moved_files),
+                "steps_total": len(moved_files),
+                "errors": errors[:5] if isinstance(errors, list) else [],
+                "tool": "relocate_smali_tree",
+            })
+        return json.dumps(result, ensure_ascii=False, indent=2)[:30000]
+
+    return _safe_call(_run, "relocate_smali_tree")
+
+
+@tool
+def rewrite_smali_references(
+    mapping_json: str,
+    include_manifest: bool = True,
+    include_resources: bool = True,
+    dry_run: bool = False,
+) -> str:
+    """Rewrite class descriptors across smali and optionally manifest/resource XML."""
+    from apk_agent.tools.dex_engine import rewrite_smali_references as _rewrite
+
+    def _run():
+        payload = json.loads(mapping_json)
+        result = _rewrite(
+            _project.apktool_dir,
+            payload,
+            backup_dir=_project.patch_backup_dir,
+            include_manifest=include_manifest,
+            include_resources=include_resources,
+            dry_run=dry_run,
+        )
+        if result.get("success") and not dry_run:
+            files_modified = result.get("files_modified", [])
+            planned_changes = result.get("planned_changes", [])
+            mapping = result.get("mapping", {})
+            _patch_journal.append({
+                "success": True,
+                "target_file": files_modified[0] if files_modified else "descriptor rewrite",
+                "description": f"Rewrote {len(mapping) if isinstance(mapping, dict) else 0} descriptor mappings across the project",
+                "steps_applied": len(files_modified),
+                "steps_total": len(planned_changes) if isinstance(planned_changes, list) else len(files_modified),
+                "errors": result.get("errors", [])[:5],
+                "tool": "rewrite_smali_references",
+            })
+        return json.dumps(result, ensure_ascii=False, indent=2)[:30000]
+
+    return _safe_call(_run, "rewrite_smali_references")
+
+
+@tool
+def validate_dex_integrity(expected_descriptors_json: str = "", touched_paths_json: str = "") -> str:
+    """Validate descriptor integrity after dex relocation or helper emission."""
+    from apk_agent.tools.dex_engine import validate_dex_integrity as _validate
+
+    def _run():
+        expected: list[str] = []
+        touched: list[str] = []
+        if str(expected_descriptors_json or "").strip():
+            payload = json.loads(expected_descriptors_json)
+            if isinstance(payload, list):
+                expected = [str(item) for item in payload if str(item).strip()]
+        if str(touched_paths_json or "").strip():
+            payload = json.loads(touched_paths_json)
+            if isinstance(payload, list):
+                touched = [str(item) for item in payload if str(item).strip()]
+        result = _validate(_project.apktool_dir, expected_descriptors=expected, touched_paths=touched)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:30000]
+
+    return _safe_call(
+        _run,
+        "validate_dex_integrity",
+        _cache_hint=f"{expected_descriptors_json}:{touched_paths_json}",
+    )
+
+
+@tool
+def plan_dex_auto_remediation(
+    build_error: str = "",
+    helper_files_json: str = "",
+    target_package: str = "",
+    focus_hint: str = "",
+) -> str:
+    """Plan dex-aware remediation steps after build pressure or topology failures."""
+    from apk_agent.tools.dex_engine import plan_dex_auto_remediation as _plan
+
+    def _run():
+        helper_files: dict[str, str] = {}
+        if str(helper_files_json or "").strip():
+            payload = json.loads(helper_files_json)
+            if isinstance(payload, dict):
+                helper_files = {str(key): str(value) for key, value in payload.items()}
+        result = _plan(
+            _project.apktool_dir,
+            build_error=build_error,
+            helper_files=helper_files,
+            target_package=target_package,
+            focus_hint=focus_hint,
+        )
+        return json.dumps(result, ensure_ascii=False, indent=2)[:30000]
+
+    return _safe_call(
+        _run,
+        "plan_dex_auto_remediation",
+        _cache_hint=f"{build_error}:{target_package}:{focus_hint}:{helper_files_json[:400]}",
+    )
+
+
+@tool
+def plan_injection_fallback_strategies(objective: str = "", helper_scope: str = "", build_error: str = "") -> str:
+    """Generate fallback strategies when helper-heavy injection is risky or failing."""
+    from apk_agent.tools.dex_engine import plan_injection_fallback_strategies as _plan
+
+    def _run():
+        result = _plan(_project.apktool_dir, objective=objective, helper_scope=helper_scope, build_error=build_error)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
+
+    return _safe_call(
+        _run,
+        "plan_injection_fallback_strategies",
+        _cache_hint=f"{objective}:{helper_scope}:{build_error}",
+    )
+
+
+@tool
+def plan_self_healing_build_loop(build_error: str = "", objective: str = "", helper_files_json: str = "") -> str:
+    """Generate the self-healing dex/build recovery loop the agent should follow."""
+    from apk_agent.tools.dex_engine import plan_self_healing_build_loop as _plan
+
+    def _run():
+        helper_files: dict[str, str] = {}
+        if str(helper_files_json or "").strip():
+            payload = json.loads(helper_files_json)
+            if isinstance(payload, dict):
+                helper_files = {str(key): str(value) for key, value in payload.items()}
+        result = _plan(_project.apktool_dir, build_error=build_error, objective=objective, helper_files=helper_files)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
+
+    return _safe_call(
+        _run,
+        "plan_self_healing_build_loop",
+        _cache_hint=f"{build_error}:{objective}:{helper_files_json[:400]}",
     )
 
 
