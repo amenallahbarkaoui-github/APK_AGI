@@ -11,6 +11,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from apk_agent.tools.smali_ir import SmaliMethod, parse_smali_file
+
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -92,6 +94,99 @@ def _find_all_methods(lines: list[str], method_name: str) -> list[tuple[int, int
     return results
 
 
+def _method_query_matches_ir(method: SmaliMethod, query: str) -> bool:
+    """Return True when a SmaliMethod matches a name-or-signature query."""
+    query = str(query or "").strip()
+    if not query:
+        return False
+    if "(" in query:
+        return method.signature == query or method.full_signature.endswith(f"->{query}")
+    return method.name == query
+
+
+def _load_method_ir(file_path: Path, method_name: str) -> SmaliMethod | None:
+    """Best-effort parse of the target file and method into Smali IR."""
+    parsed = parse_smali_file(file_path, file_path.parent)
+    if parsed is None:
+        return None
+    for method in parsed.methods:
+        if _method_query_matches_ir(method, method_name):
+            return method
+    return None
+
+
+def _default_method_insert_at(lines: list[str], method_start: int, method_end: int) -> int:
+    """Return the default insertion line near the start of a method body."""
+    for i in range(method_start + 1, method_end):
+        s = lines[i].strip()
+        if s.startswith((
+            ".locals",
+            ".registers",
+            ".param",
+            ".annotation",
+            ".end annotation",
+            ".prologue",
+            ".line",
+        )):
+            continue
+        if not s or s.startswith("#"):
+            continue
+        return i
+    return method_end
+
+
+def _advance_past_inline_metadata(lines: list[str], insert_at: int, method_end: int) -> int:
+    """Skip metadata lines immediately after an anchor instruction.
+
+    Labels are intentionally not skipped so they continue to bind the original
+    following instruction rather than the injected code.
+    """
+    while insert_at < method_end:
+        s = lines[insert_at].strip()
+        if s.startswith((".line", ".local", ".restart local", ".end local", ".prologue")):
+            insert_at += 1
+            continue
+        if not s or s.startswith("#"):
+            insert_at += 1
+            continue
+        break
+    return insert_at
+
+
+def _after_super_insert_at(lines: list[str], method: SmaliMethod, method_start: int, method_end: int) -> int:
+    """Return the insertion point immediately after the method's super/init call."""
+    if method.name == "<init>":
+        for instr in method.instructions:
+            if not instr.is_invoke:
+                continue
+            if instr.target_method != "<init>" or "p0" not in instr.registers:
+                continue
+            if not instr.opcode.startswith(("invoke-direct", "invoke-super")):
+                continue
+            return _advance_past_inline_metadata(lines, instr.line, method_end)
+
+    for instr in method.instructions:
+        if not instr.is_invoke:
+            continue
+        if "p0" not in instr.registers:
+            continue
+        if not instr.opcode.startswith("invoke-super"):
+            continue
+        if instr.target_method == method.name:
+            return _advance_past_inline_metadata(lines, instr.line, method_end)
+
+    for instr in method.instructions:
+        if instr.is_invoke and "p0" in instr.registers and instr.opcode.startswith("invoke-super"):
+            return _advance_past_inline_metadata(lines, instr.line, method_end)
+
+    return _default_method_insert_at(lines, method_start, method_end)
+
+
+def _return_insert_points(method: SmaliMethod) -> list[int]:
+    """Return zero-based source line indexes for each return in a method."""
+    return [instr.line - 1 for instr in method.instructions if instr.is_return]
+
+
 def _ensure_registers(lines: list[str], method_start: int, method_end: int,
                       method_header: str, needed_extra: int) -> tuple[int, str]:
     """Bump .locals (or .registers) by *needed_extra* and return (first_new_v, directive_used).
@@ -136,6 +231,7 @@ def inject_code_in_method(
     lines = text.splitlines()
 
     start, end, header = _find_method(lines, method_name)
+    method_ir = _load_method_ir(path, method_name)
     if start < 0:
         return {"success": False,
                 "error": f"Method '{method_name}' not found in {path.name}"}
@@ -222,62 +318,60 @@ def inject_code_in_method(
             end = i
             break
 
-    insert_at = -1
+    insert_points: list[int] = []
 
     if position == "start":
-        # After .locals/.prologue/.param directives
-        for i in range(start + 1, end):
-            s = lines[i].strip()
-            if s.startswith(('.locals', '.registers', '.param', '.annotation',
-                             '.end annotation', '.prologue', '.line')):
-                continue
-            if not s or s.startswith('#'):
-                continue
-            insert_at = i
-            break
-        if insert_at < 0:
-            insert_at = end
+        insert_points = [_default_method_insert_at(lines, start, end)]
 
     elif position == "after_super":
-        # After the first invoke-direct {p0}, ...;-><init>
-        for i in range(start + 1, end):
-            s = lines[i].strip()
-            if 'invoke-direct' in s and '-><init>' in s and 'p0' in s:
-                # Skip to the next real instruction (might be .line directives)
-                insert_at = i + 1
-                break
-        if insert_at < 0:
-            # Fallback: before last return
+        if method_ir is not None:
+            insert_points = [_after_super_insert_at(lines, method_ir, start, end)]
+        else:
+            insert_points = [_default_method_insert_at(lines, start, end)]
+
+    elif position == "before_return":
+        if method_ir is not None:
+            insert_points = _return_insert_points(method_ir)
+        else:
             for i in range(end - 1, start, -1):
-                if lines[i].strip().startswith('return'):
-                    insert_at = i
+                if lines[i].strip().startswith(("return", "return-void", "return-object", "return-wide")):
+                    insert_points.append(i)
+            insert_points.reverse()
+
+    elif position == "end":
+        if method_ir is not None:
+            returns = _return_insert_points(method_ir)
+            insert_points = [returns[-1]] if returns else [end]
+        else:
+            for i in range(end - 1, start, -1):
+                if lines[i].strip().startswith(("return", "return-void", "return-object", "return-wide")):
+                    insert_points = [i]
                     break
+            if not insert_points:
+                insert_points = [end]
 
-    elif position in ("end", "before_return"):
-        # Before the LAST return instruction
-        for i in range(end - 1, start, -1):
-            if lines[i].strip().startswith(('return', 'return-void',
-                                             'return-object', 'return-wide')):
-                insert_at = i
-                break
-
-    if insert_at < 0:
+    if not insert_points:
         return {"success": False,
                 "error": f"Could not find insertion point for position '{position}'"}
 
     # --- insert ----------------------------------------------------------
-    for j, il in enumerate(inject_lines):
-        lines.insert(insert_at + j, il)
+    applied_lines: list[int] = []
+    for insert_at in sorted(set(insert_points), reverse=True):
+        applied_lines.append(insert_at + 1)
+        for j, il in enumerate(inject_lines):
+            lines.insert(insert_at + j, il)
 
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    applied_lines.reverse()
 
     return {
         "success": True,
         "file": str(path),
         "method": header,
         "position": position,
-        "injected_at_line": insert_at + 1,
-        "lines_injected": len(inject_lines),
+        "injected_at_line": applied_lines[0],
+        "injected_at_lines": applied_lines,
+        "lines_injected": len(inject_lines) * len(applied_lines),
     }
 
 

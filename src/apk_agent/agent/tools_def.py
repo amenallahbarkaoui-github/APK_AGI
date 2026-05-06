@@ -8501,15 +8501,17 @@ def patch_binary_strings(file_path: str, replacements_json: str) -> str:
 @tool
 def analyze_native_libs() -> str:
     """Analyze native .so libraries in the APK's lib/ directory.
-    Detects: architectures, JNI methods, embedded strings (URLs, keys, crypto),
-    and library sizes. Requires apktool_decompile to have been run first.
+    Detects: architectures, ELF/JNI summaries, embedded strings, native method
+    declarations, loadLibrary bridges, JNI trace links, and per-library
+    disassembly previews. Requires apktool_decompile to have been run first.
 
     When to use: When the APK contains native libraries. Check for JNI bridges,
-    hardcoded strings, and determine if security checks are in native code.
+    hardcoded strings, ARM/ARM64 native entry points, and determine if security
+    checks are in native code.
 
     Returns: JSON with keys: success, has_native_libs (bool), architectures (list),
-    libraries (array of {name, arch, size_kb}), total_size_mb, jni_methods
-    (array of detected JNI method names), interesting_strings (URLs, keys found in .so files).
+    libraries, total_size_mb, jni_methods, jni_traces,
+    native_method_declarations, load_library_calls, and interesting_strings.
     """
     from apk_agent.tools.native_analyzer import analyze_native_libs as _analyze
 
@@ -8524,8 +8526,9 @@ def analyze_native_re_core(file_path: str) -> str:
     """Deep ELF/JNI analysis for one native library.
 
     This native reverse-engineering core parses ELF sections, symbol tables,
-    imported/exported functions, DT_NEEDED dependencies, JNI exports,
-    heuristic function boundaries, and ranked patch targets.
+    imported/exported functions, DT_NEEDED dependencies, JNI exports and trace
+    entries, ARM/ARM64 disassembly previews, heuristic function boundaries, and
+    ranked patch targets.
     """
     from apk_agent.tools.native_re_core import analyze_native_binary as _analyze
 

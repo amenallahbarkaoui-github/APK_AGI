@@ -99,6 +99,13 @@ _PROLOGUE_PATTERNS: dict[str, list[tuple[str, bytes]]] = {
     "arm": [("arm_push_lr", bytes.fromhex("2de9f041"))],
 }
 
+_SMALI_CLASS_RE = re.compile(r"^\.class\b.*?\s(?P<descriptor>L[^;]+;)")
+_SMALI_METHOD_RE = re.compile(
+    r"^\.method\b(?P<qualifiers>.*?)\s(?P<name>[A-Za-z0-9_$<>-]+)\((?P<params>[^)]*)\)(?P<ret>\S+)"
+)
+_SMALI_CONST_STRING_RE = re.compile(r'const-string(?:/jumbo)?\s+\S+,\s+"(?P<value>[^"]+)"')
+_SMALI_LOAD_LIBRARY_RE = re.compile(r"Ljava/lang/(?:System|Runtime);->(?:loadLibrary|load)\(")
+
 
 def analyze_native_binary(
     file_path: str | Path,
@@ -135,6 +142,8 @@ def analyze_native_binary(
     strings = _extract_printable_strings(data, min_length=4, limit=max(max_strings * 4, 120))
     string_findings = _classify_strings(strings)[:max_strings]
     function_candidates = _recover_function_candidates(parsed, data)
+    disassembly_previews = _build_disassembly_previews(parsed, data, function_candidates)
+    jni_trace = _build_binary_jni_trace(parsed, function_candidates, disassembly_previews, string_findings)
     patch_targets = _rank_patch_targets(
         parsed,
         function_candidates,
@@ -166,9 +175,13 @@ def analyze_native_binary(
         "exported_functions": _limit_named_entries(exports, max_symbols),
         "jni_export_count": len(jni_exports),
         "jni_exports": _limit_named_entries(jni_exports, 40),
+        "jni_trace_count": len(jni_trace),
+        "jni_trace": jni_trace,
         "suspicious_symbols": _limit_named_entries(suspicious_symbols, 60),
         "function_candidates_count": len(function_candidates),
         "function_candidates": function_candidates[:max_symbols],
+        "disassembly_preview_count": len(disassembly_previews),
+        "disassembly_previews": disassembly_previews,
         "string_findings_count": len(string_findings),
         "string_findings": string_findings,
         "patch_targets": patch_targets,
@@ -176,7 +189,9 @@ def analyze_native_binary(
             "imports": len(imports),
             "exports": len(exports),
             "jni_exports": len(jni_exports),
+            "jni_trace_entries": len(jni_trace),
             "function_candidates": len(function_candidates),
+            "disassembly_previews": len(disassembly_previews),
             "interesting_strings": len(string_findings),
             "needed_libraries": len(parsed["needed_libraries"]),
         },
@@ -233,6 +248,8 @@ def analyze_native_project(
     all_jni_names: set[str] = set()
     interesting_strings: list[dict[str, Any]] = []
     framework_hints: set[str] = set()
+    binary_jni_entries: list[dict[str, Any]] = []
+    per_library_binary_traces: dict[str, list[dict[str, Any]]] = {}
 
     for arch_dir in sorted(lib_dir.iterdir()):
         if not arch_dir.is_dir():
@@ -255,6 +272,18 @@ def analyze_native_project(
                 if name:
                     all_jni_names.add(name)
             interesting_strings.extend(analysis.get("string_findings", [])[:6])
+            binary_trace_items = [
+                {
+                    **entry,
+                    "library_path": str(so_file.relative_to(apktool_dir)),
+                    "library_name": so_file.name,
+                    "library_basename": _library_basename(so_file.name),
+                    "architecture": arch_dir.name,
+                }
+                for entry in analysis.get("jni_trace", [])
+            ]
+            binary_jni_entries.extend(binary_trace_items)
+            per_library_binary_traces[str(so_file.relative_to(apktool_dir))] = binary_trace_items
 
             library_kind = str(analysis.get("library_type", "generic_native"))
             if library_kind != "generic_native":
@@ -272,10 +301,14 @@ def analyze_native_project(
                 "jni_export_count": analysis.get("jni_export_count", 0),
                 "function_candidates_count": analysis.get("function_candidates_count", 0),
                 "jni_methods": [item.get("name", "") for item in analysis.get("jni_exports", [])[:20]],
+                "jni_trace": analysis.get("jni_trace", [])[:8],
+                "disassembly_previews": analysis.get("disassembly_previews", [])[:4],
                 "interesting_strings": analysis.get("string_findings", [])[:10],
                 "suspicious_symbols": analysis.get("suspicious_symbols", [])[:10],
                 "top_patch_targets": analysis.get("patch_targets", [])[:max_targets_per_library],
             })
+
+    project_jni = _scan_project_jni_surfaces(apktool_dir, binary_jni_entries)
 
     return {
         "success": True,
@@ -284,14 +317,591 @@ def analyze_native_project(
         "libraries": libraries,
         "total_size_mb": round(total_size / (1024 * 1024), 2),
         "jni_methods": sorted(all_jni_names),
+        "jni_traces": project_jni["jni_traces"],
+        "native_method_declarations": project_jni["native_method_declarations"],
+        "load_library_calls": project_jni["load_library_calls"],
         "interesting_strings": interesting_strings[:40],
         "framework_hints": sorted(framework_hints),
         "summary": {
             "library_count": len(libraries),
             "jni_method_count": len(all_jni_names),
+            "jni_trace_count": len(project_jni["jni_traces"]),
+            "native_method_declaration_count": len(project_jni["native_method_declarations"]),
+            "load_library_call_count": len(project_jni["load_library_calls"]),
             "framework_hints": sorted(framework_hints),
         },
     }
+
+
+def _build_disassembly_previews(
+    parsed: dict[str, Any],
+    data: bytes,
+    function_candidates: list[dict[str, Any]],
+    *,
+    max_windows: int = 12,
+    max_instructions: int = 8,
+) -> list[dict[str, Any]]:
+    arch = str(parsed.get("arch") or "")
+    if arch not in {"arm64", "arm"}:
+        return []
+
+    prioritized = sorted(
+        function_candidates,
+        key=lambda item: (
+            0 if item.get("category") not in {"generic", ""} else 1,
+            0 if item.get("source") == "symbol" else 1,
+            int(item.get("offset", 0)),
+        ),
+    )
+    previews: list[dict[str, Any]] = []
+    seen_offsets: set[int] = set()
+
+    for candidate in prioritized:
+        offset = int(candidate.get("offset", -1) or -1)
+        if offset < 0 or offset in seen_offsets or offset >= len(data):
+            continue
+        virtual_address = int(candidate.get("virtual_address", 0) or 0)
+        size = int(candidate.get("size", 0) or 0)
+        window_size = _preview_window_size(arch, size=size, max_instructions=max_instructions)
+        code_blob = _slice_bytes(data, offset, window_size)
+        instructions = _disassemble_preview(
+            arch,
+            code_blob,
+            start_address=virtual_address,
+            max_instructions=max_instructions,
+        )
+        if not instructions:
+            continue
+        previews.append({
+            "function_name": str(candidate.get("name", "")),
+            "source": str(candidate.get("source", "")),
+            "category": str(candidate.get("category", "generic")),
+            "offset": offset,
+            "offset_hex": str(candidate.get("offset_hex", f"0x{offset:x}")),
+            "virtual_address": virtual_address,
+            "virtual_address_hex": str(candidate.get("virtual_address_hex", f"0x{virtual_address:x}")),
+            "instruction_count": len(instructions),
+            "instructions": instructions,
+        })
+        seen_offsets.add(offset)
+        if len(previews) >= max_windows:
+            break
+
+    return previews
+
+
+def _preview_window_size(arch: str, *, size: int, max_instructions: int) -> int:
+    if arch == "arm64":
+        default_size = max_instructions * 4
+    elif arch == "arm":
+        default_size = max_instructions * 4
+    else:
+        default_size = max_instructions * 4
+    if size > 0:
+        return min(size, default_size)
+    return default_size
+
+
+def _disassemble_preview(
+    arch: str,
+    code_blob: bytes,
+    *,
+    start_address: int,
+    max_instructions: int,
+) -> list[dict[str, Any]]:
+    if arch == "arm64":
+        return _disassemble_arm64_preview(code_blob, start_address=start_address, max_instructions=max_instructions)
+    if arch == "arm":
+        return _disassemble_arm_preview(code_blob, start_address=start_address, max_instructions=max_instructions)
+    return []
+
+
+def _disassemble_arm64_preview(
+    code_blob: bytes,
+    *,
+    start_address: int,
+    max_instructions: int,
+) -> list[dict[str, Any]]:
+    instructions: list[dict[str, Any]] = []
+    limit = min(len(code_blob) // 4, max_instructions)
+    for index in range(limit):
+        offset = index * 4
+        raw = code_blob[offset:offset + 4]
+        word = int.from_bytes(raw, "little")
+        address = start_address + offset
+        mnemonic, op_str = _decode_arm64_instruction(word, address)
+        instructions.append({
+            "address": address,
+            "address_hex": f"0x{address:x}",
+            "raw_hex": raw.hex(),
+            "mnemonic": mnemonic,
+            "op_str": op_str,
+        })
+        if mnemonic == "ret":
+            break
+    return instructions
+
+
+def _decode_arm64_instruction(word: int, address: int) -> tuple[str, str]:
+    if word == 0xD503201F:
+        return "nop", ""
+
+    if word & 0xFFFFFC1F == 0xD65F0000:
+        reg = (word >> 5) & 0x1F
+        return "ret", _aarch64_reg_name(reg)
+
+    if word & 0xFC000000 == 0x94000000:
+        imm26 = _sign_extend(word & 0x03FFFFFF, 26) << 2
+        return "bl", f"0x{address + imm26:x}"
+
+    if word & 0xFC000000 == 0x14000000:
+        imm26 = _sign_extend(word & 0x03FFFFFF, 26) << 2
+        return "b", f"0x{address + imm26:x}"
+
+    if word & 0x7F000000 in {0x34000000, 0x35000000}:
+        imm19 = _sign_extend((word >> 5) & 0x7FFFF, 19) << 2
+        register = word & 0x1F
+        mnemonic = "cbz" if (word & 0x7F000000) == 0x34000000 else "cbnz"
+        reg_prefix = "x" if ((word >> 31) & 0x1) else "w"
+        return mnemonic, f"{reg_prefix}{register}, 0x{address + imm19:x}"
+
+    if word & 0xFFC00000 == 0xA9800000:
+        rt = word & 0x1F
+        rn = (word >> 5) & 0x1F
+        rt2 = (word >> 10) & 0x1F
+        imm7 = _sign_extend((word >> 15) & 0x7F, 7) * 8
+        return "stp", (
+            f"{_aarch64_reg_name(rt)}, {_aarch64_reg_name(rt2)}, "
+            f"[{_aarch64_reg_name(rn, allow_sp=True)}, #{imm7}]!"
+        )
+
+    if word & 0xFFC00000 == 0xA8C00000:
+        rt = word & 0x1F
+        rn = (word >> 5) & 0x1F
+        rt2 = (word >> 10) & 0x1F
+        imm7 = _sign_extend((word >> 15) & 0x7F, 7) * 8
+        return "ldp", (
+            f"{_aarch64_reg_name(rt)}, {_aarch64_reg_name(rt2)}, "
+            f"[{_aarch64_reg_name(rn, allow_sp=True)}], #{imm7}"
+        )
+
+    if word & 0xFF0003E0 == 0x910003E0:
+        rd = word & 0x1F
+        imm12 = (word >> 10) & 0xFFF
+        if imm12 == 0:
+            return "mov", f"{_aarch64_reg_name(rd)}, sp"
+        return "add", f"{_aarch64_reg_name(rd)}, sp, #{imm12}"
+
+    return ".word", f"0x{word:08x}"
+
+
+def _aarch64_reg_name(register: int, *, allow_sp: bool = False) -> str:
+    if register == 31:
+        return "sp" if allow_sp else "xzr"
+    return f"x{register}"
+
+
+def _disassemble_arm_preview(
+    code_blob: bytes,
+    *,
+    start_address: int,
+    max_instructions: int,
+) -> list[dict[str, Any]]:
+    instructions: list[dict[str, Any]] = []
+    offset = 0
+    while offset < len(code_blob) and len(instructions) < max_instructions:
+        address = start_address + offset
+
+        if offset + 4 <= len(code_blob):
+            window = code_blob[offset:offset + 4]
+            if window == bytes.fromhex("2de9f041"):
+                instructions.append({
+                    "address": address,
+                    "address_hex": f"0x{address:x}",
+                    "raw_hex": window.hex(),
+                    "mnemonic": "push.w",
+                    "op_str": "{r4-r8, lr}",
+                })
+                offset += 4
+                continue
+
+        if offset + 2 > len(code_blob):
+            break
+
+        halfword_blob = code_blob[offset:offset + 2]
+        halfword = int.from_bytes(halfword_blob, "little")
+        mnemonic = ".hword"
+        op_str = f"0x{halfword:04x}"
+        step = 2
+
+        if halfword == 0x4770:
+            mnemonic = "bx"
+            op_str = "lr"
+        elif halfword == 0xBF00:
+            mnemonic = "nop"
+            op_str = ""
+        elif halfword & 0xFE00 == 0xB400:
+            mnemonic = "push"
+            op_str = _format_thumb_reg_list(halfword & 0x01FF, include_lr=bool(halfword & 0x0100))
+        elif halfword & 0xFE00 == 0xBC00:
+            mnemonic = "pop"
+            op_str = _format_thumb_reg_list(halfword & 0x01FF, include_pc=bool(halfword & 0x0100))
+        elif halfword & 0xF800 == 0xE000:
+            imm11 = _sign_extend(halfword & 0x07FF, 11) << 1
+            mnemonic = "b"
+            op_str = f"0x{address + 4 + imm11:x}"
+
+        instructions.append({
+            "address": address,
+            "address_hex": f"0x{address:x}",
+            "raw_hex": code_blob[offset:offset + step].hex(),
+            "mnemonic": mnemonic,
+            "op_str": op_str,
+        })
+        offset += step
+        if mnemonic == "bx" and op_str == "lr":
+            break
+
+    return instructions
+
+
+def _format_thumb_reg_list(mask: int, *, include_lr: bool = False, include_pc: bool = False) -> str:
+    registers = [f"r{index}" for index in range(8) if mask & (1 << index)]
+    if include_lr and "lr" not in registers:
+        registers.append("lr")
+    if include_pc and "pc" not in registers:
+        registers.append("pc")
+    return "{" + ", ".join(registers) + "}"
+
+
+def _sign_extend(value: int, bits: int) -> int:
+    sign_bit = 1 << (bits - 1)
+    return (value ^ sign_bit) - sign_bit
+
+
+def _build_binary_jni_trace(
+    parsed: dict[str, Any],
+    function_candidates: list[dict[str, Any]],
+    disassembly_previews: list[dict[str, Any]],
+    string_findings: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    candidate_by_name = {
+        str(candidate.get("name", "")): candidate
+        for candidate in function_candidates
+        if candidate.get("name")
+    }
+    preview_by_name = {
+        str(preview.get("function_name", "")): preview
+        for preview in disassembly_previews
+        if preview.get("function_name")
+    }
+
+    trace: list[dict[str, Any]] = []
+    for symbol in parsed.get("symbols", []):
+        name = str(symbol.get("name", ""))
+        if not name:
+            continue
+        if name.startswith("Java_"):
+            decoded = _decode_jni_export_name(name)
+            candidate = candidate_by_name.get(name, {})
+            preview = preview_by_name.get(name, {})
+            trace.append({
+                "kind": "static_jni_export",
+                "symbol": name,
+                "java_class": decoded.get("java_class", ""),
+                "class_descriptor": decoded.get("class_descriptor", ""),
+                "java_method": decoded.get("java_method", ""),
+                "registration": "static_export",
+                "virtual_address_hex": str(symbol.get("value_hex", "")),
+                "offset_hex": str(candidate.get("offset_hex", "")),
+                "evidence": [
+                    "exported Java_* symbol",
+                    f"section={symbol.get('section', '')}" if symbol.get("section") else "symbol table hit",
+                ],
+                "disassembly_preview": preview.get("instructions", [])[:4],
+            })
+            continue
+
+        if name == "JNI_OnLoad":
+            candidate = candidate_by_name.get(name, {})
+            preview = preview_by_name.get(name, {})
+            trace.append({
+                "kind": "jni_onload",
+                "symbol": name,
+                "registration": "dynamic_bootstrap",
+                "virtual_address_hex": str(symbol.get("value_hex", "")),
+                "offset_hex": str(candidate.get("offset_hex", "")),
+                "evidence": ["JNI_OnLoad export found"],
+                "disassembly_preview": preview.get("instructions", [])[:4],
+            })
+            continue
+
+        if name == "RegisterNatives":
+            trace.append({
+                "kind": "register_natives_symbol",
+                "symbol": name,
+                "registration": "dynamic_registration",
+                "virtual_address_hex": str(symbol.get("value_hex", "")),
+                "offset_hex": "",
+                "evidence": [f"symbol kind={symbol.get('kind', '')}"],
+                "disassembly_preview": [],
+            })
+
+    if any(item.get("category") == "jni_export" and item.get("value") == "JNI_OnLoad" for item in string_findings):
+        trace.append({
+            "kind": "jni_onload_string",
+            "symbol": "JNI_OnLoad",
+            "registration": "dynamic_bootstrap",
+            "virtual_address_hex": "",
+            "offset_hex": next((item.get("offset_hex", "") for item in string_findings if item.get("value") == "JNI_OnLoad"), ""),
+            "evidence": ["JNI_OnLoad string anchor"],
+            "disassembly_preview": [],
+        })
+
+    if any(
+        str(symbol.get("name", "")).lower() == "registernatives"
+        or str(symbol.get("category", "")) == "jni_boundary"
+        for symbol in parsed.get("symbols", [])
+    ):
+        trace.append({
+            "kind": "dynamic_registration_signal",
+            "symbol": "RegisterNatives",
+            "registration": "dynamic_registration",
+            "virtual_address_hex": "",
+            "offset_hex": "",
+            "evidence": ["RegisterNatives or JNI boundary signal found in symbols"],
+            "disassembly_preview": [],
+        })
+
+    trace.sort(key=lambda item: (item.get("kind", ""), item.get("symbol", "")))
+    return trace
+
+
+def _decode_jni_export_name(symbol_name: str) -> dict[str, str]:
+    if not symbol_name.startswith("Java_"):
+        return {
+            "java_class": "",
+            "class_descriptor": "",
+            "java_method": "",
+        }
+
+    payload = symbol_name[len("Java_"):]
+    if "__" in payload:
+        payload, _ = payload.split("__", 1)
+    segments = _split_jni_export_segments(payload)
+    if len(segments) < 2:
+        return {
+            "java_class": "",
+            "class_descriptor": "",
+            "java_method": payload,
+        }
+    class_parts = segments[:-1]
+    method_name = segments[-1]
+    return {
+        "java_class": ".".join(class_parts),
+        "class_descriptor": "L" + "/".join(class_parts) + ";",
+        "java_method": method_name,
+    }
+
+
+def _split_jni_export_segments(payload: str) -> list[str]:
+    segments: list[str] = []
+    current: list[str] = []
+    index = 0
+    while index < len(payload):
+        char = payload[index]
+        if char == "_":
+            if index + 1 < len(payload):
+                marker = payload[index + 1]
+                if marker == "1":
+                    current.append("_")
+                    index += 2
+                    continue
+                if marker == "2":
+                    current.append(";")
+                    index += 2
+                    continue
+                if marker == "3":
+                    current.append("[")
+                    index += 2
+                    continue
+                if marker == "0" and index + 5 < len(payload):
+                    hex_chunk = payload[index + 2:index + 6]
+                    try:
+                        current.append(chr(int(hex_chunk, 16)))
+                        index += 6
+                        continue
+                    except ValueError:
+                        pass
+            segments.append("".join(current))
+            current = []
+            index += 1
+            continue
+        current.append(char)
+        index += 1
+    if current or not segments:
+        segments.append("".join(current))
+    return [segment for segment in segments if segment]
+
+
+def _scan_project_jni_surfaces(
+    apktool_dir: Path,
+    binary_jni_entries: list[dict[str, Any]],
+    *,
+    max_results: int = 120,
+) -> dict[str, list[dict[str, Any]]]:
+    declarations: list[dict[str, Any]] = []
+    load_calls: list[dict[str, Any]] = []
+
+    smali_files: list[Path] = []
+    for smali_root in sorted(apktool_dir.glob("smali*")):
+        if smali_root.is_dir():
+            smali_files.extend(sorted(smali_root.rglob("*.smali")))
+
+    for smali_file in smali_files:
+        relative_path = str(smali_file.relative_to(apktool_dir))
+        try:
+            lines = smali_file.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+
+        class_descriptor = ""
+        recent_strings: list[str] = []
+        for line_number, raw_line in enumerate(lines, start=1):
+            line = raw_line.strip()
+            if not class_descriptor:
+                class_match = _SMALI_CLASS_RE.match(line)
+                if class_match:
+                    class_descriptor = str(class_match.group("descriptor") or "")
+
+            const_match = _SMALI_CONST_STRING_RE.search(line)
+            if const_match:
+                recent_strings.append(str(const_match.group("value") or ""))
+                recent_strings = recent_strings[-4:]
+
+            method_match = _SMALI_METHOD_RE.match(line)
+            if method_match:
+                qualifiers = str(method_match.group("qualifiers") or "")
+                if re.search(r"\bnative\b", qualifiers):
+                    declarations.append({
+                        "kind": "smali_native_declaration",
+                        "file": relative_path,
+                        "class_descriptor": class_descriptor,
+                        "method_name": str(method_match.group("name") or ""),
+                        "method_descriptor": (
+                            f"{class_descriptor}->{method_match.group('name')}"
+                            f"({method_match.group('params')}){method_match.group('ret')}"
+                        ),
+                        "line": line_number,
+                    })
+
+            if _SMALI_LOAD_LIBRARY_RE.search(line):
+                load_calls.append({
+                    "kind": "load_library_call",
+                    "file": relative_path,
+                    "class_descriptor": class_descriptor,
+                    "library_name": recent_strings[-1] if recent_strings else "",
+                    "line": line_number,
+                    "invoke": line[:200],
+                })
+
+    traces = _link_jni_project_traces(declarations, load_calls, binary_jni_entries, max_results=max_results)
+    return {
+        "jni_traces": traces,
+        "native_method_declarations": declarations[:max_results],
+        "load_library_calls": load_calls[:max_results],
+    }
+
+
+def _link_jni_project_traces(
+    declarations: list[dict[str, Any]],
+    load_calls: list[dict[str, Any]],
+    binary_jni_entries: list[dict[str, Any]],
+    *,
+    max_results: int,
+) -> list[dict[str, Any]]:
+    export_map: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for entry in binary_jni_entries:
+        if entry.get("kind") != "static_jni_export":
+            continue
+        key = (str(entry.get("class_descriptor", "")), str(entry.get("java_method", "")))
+        export_map.setdefault(key, []).append(entry)
+
+    load_map: dict[str, list[str]] = {}
+    for item in load_calls:
+        class_descriptor = str(item.get("class_descriptor", ""))
+        if not class_descriptor:
+            continue
+        library_name = str(item.get("library_name", ""))
+        if not library_name:
+            continue
+        load_map.setdefault(class_descriptor, []).append(library_name)
+
+    traces: list[dict[str, Any]] = []
+    for declaration in declarations:
+        class_descriptor = str(declaration.get("class_descriptor", ""))
+        method_name = str(declaration.get("method_name", ""))
+        matching_exports = export_map.get((class_descriptor, method_name), [])
+        library_hints = load_map.get(class_descriptor, [])
+        if matching_exports:
+            for export in matching_exports[:2]:
+                library_basename = str(export.get("library_basename", ""))
+                confidence = "high" if library_basename in library_hints else "medium"
+                traces.append({
+                    "kind": "jni_export_link",
+                    "class_descriptor": class_descriptor,
+                    "method_name": method_name,
+                    "method_descriptor": declaration.get("method_descriptor", ""),
+                    "declaring_file": declaration.get("file", ""),
+                    "line": declaration.get("line", 0),
+                    "library_path": export.get("library_path", ""),
+                    "library_name": export.get("library_name", ""),
+                    "library_hint": library_hints[0] if library_hints else "",
+                    "export_symbol": export.get("symbol", ""),
+                    "registration": export.get("registration", ""),
+                    "confidence": confidence,
+                })
+        else:
+            traces.append({
+                "kind": "jni_native_declaration",
+                "class_descriptor": class_descriptor,
+                "method_name": method_name,
+                "method_descriptor": declaration.get("method_descriptor", ""),
+                "declaring_file": declaration.get("file", ""),
+                "line": declaration.get("line", 0),
+                "library_hint": library_hints[0] if library_hints else "",
+                "export_symbol": "",
+                "registration": "unresolved",
+                "confidence": "low",
+            })
+
+    for load_call in load_calls:
+        traces.append({
+            "kind": "load_library_call",
+            "class_descriptor": load_call.get("class_descriptor", ""),
+            "method_name": "",
+            "method_descriptor": "",
+            "declaring_file": load_call.get("file", ""),
+            "line": load_call.get("line", 0),
+            "library_path": "",
+            "library_name": load_call.get("library_name", ""),
+            "library_hint": load_call.get("library_name", ""),
+            "export_symbol": "",
+            "registration": "load_library",
+            "confidence": "context",
+        })
+
+    traces.sort(key=lambda item: (str(item.get("kind", "")), str(item.get("class_descriptor", "")), str(item.get("method_name", ""))))
+    return traces[:max_results]
+
+
+def _library_basename(file_name: str) -> str:
+    name = str(file_name or "")
+    if name.startswith("lib"):
+        name = name[3:]
+    if name.endswith(".so"):
+        name = name[:-3]
+    return name
 
 
 def _parse_elf(data: bytes) -> dict[str, Any]:
