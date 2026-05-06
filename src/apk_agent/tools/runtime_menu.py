@@ -53,6 +53,52 @@ _RESET_ACTION_LABEL = "Reset Runtime Actions"
 _SUPPORTED_OVERLAY_MODES = {"in_app", "system_overlay", "hybrid"}
 _SUPPORTED_UI_KINDS = {"button", "toggle", "slider"}
 _SUPPORTED_ACTION_KINDS = {"shared_pref", "static_field", "invoke_static", "dispatcher"}
+_DIRECT_BINDING_UI_KIND = {
+    tuple(): "button",
+    ("Landroid/content/Context;",): "button",
+    ("Z",): "toggle",
+    ("Landroid/content/Context;", "Z"): "toggle",
+    ("I",): "slider",
+    ("Landroid/content/Context;", "I"): "slider",
+}
+_REFLECTIVE_BINDING_UI_KIND = {
+    **_DIRECT_BINDING_UI_KIND,
+    ("Ljava/lang/Boolean;",): "toggle",
+    ("Landroid/content/Context;", "Ljava/lang/Boolean;"): "toggle",
+    ("Ljava/lang/Integer;",): "slider",
+    ("Landroid/content/Context;", "Ljava/lang/Integer;"): "slider",
+    ("J",): "slider",
+    ("Landroid/content/Context;", "J"): "slider",
+    ("Ljava/lang/Long;",): "slider",
+    ("Landroid/content/Context;", "Ljava/lang/Long;"): "slider",
+}
+_WRAPPER_PARAMS_BY_UI_KIND = {
+    "button": "Landroid/content/Context;",
+    "toggle": "Landroid/content/Context;Z",
+    "slider": "Landroid/content/Context;I",
+}
+_ADAPTIVE_MODE_BY_SIGNATURE = {
+    "button": {
+        tuple(): 0,
+        ("Landroid/content/Context;",): 1,
+    },
+    "toggle": {
+        ("Z",): 0,
+        ("Landroid/content/Context;", "Z"): 1,
+        ("Ljava/lang/Boolean;",): 2,
+        ("Landroid/content/Context;", "Ljava/lang/Boolean;"): 3,
+    },
+    "slider": {
+        ("I",): 0,
+        ("Landroid/content/Context;", "I"): 1,
+        ("Ljava/lang/Integer;",): 2,
+        ("Landroid/content/Context;", "Ljava/lang/Integer;"): 3,
+        ("J",): 4,
+        ("Landroid/content/Context;", "J"): 5,
+        ("Ljava/lang/Long;",): 6,
+        ("Landroid/content/Context;", "Ljava/lang/Long;"): 7,
+    },
+}
 _TIER_B_WARNINGS = [
     "Tier B system overlays require android.permission.SYSTEM_ALERT_WINDOW and a runtime approval flow; this creates real permission friction.",
     "Tier B overlays typically depend on WindowManager + TYPE_APPLICATION_OVERLAY, which increases detectability compared with the in-app panel.",
@@ -71,6 +117,26 @@ def _slugify(value: str, *, fallback: str) -> str:
 
 def _helper_file_path(apktool_dir: Path, relative_name: str) -> Path:
     return apktool_dir / "smali" / "apkagi" / "menu" / relative_name
+
+
+def _normalize_custom_helper_files(raw_files: Any) -> dict[str, str]:
+    if raw_files in (None, ""):
+        return {}
+    if not isinstance(raw_files, dict):
+        raise ValueError("custom_helper_files must be a JSON object mapping relative .smali paths to file contents")
+
+    normalized: dict[str, str] = {}
+    for raw_name, raw_content in raw_files.items():
+        relative_name = str(raw_name or "").strip().replace("\\", "/")
+        if not relative_name:
+            raise ValueError("custom_helper_files keys must be non-empty relative .smali paths")
+        path_obj = Path(relative_name)
+        if path_obj.is_absolute() or ".." in path_obj.parts:
+            raise ValueError(f"custom_helper_files path must stay under apkagi/menu: {relative_name}")
+        if path_obj.suffix.lower() != ".smali":
+            raise ValueError(f"custom_helper_files path must end with .smali: {relative_name}")
+        normalized[path_obj.as_posix()] = str(raw_content)
+    return normalized
 
 
 def _backup_file(file_path: Path, apktool_dir: Path, backup_dir: Path | None, backed_up: dict[str, str]) -> str:
@@ -273,9 +339,21 @@ def _normalize_menu_spec(spec: dict[str, Any], overlay_mode: str) -> dict[str, A
     if chosen_mode not in _SUPPORTED_OVERLAY_MODES:
         raise ValueError(f"overlay_mode must be one of {sorted(_SUPPORTED_OVERLAY_MODES)}")
 
+    include_default_helpers = bool(spec.get("include_default_helpers", True))
+    custom_helper_files = _normalize_custom_helper_files(
+        spec.get("custom_helper_files") or spec.get("custom_smali_files")
+    )
     buttons_raw = spec.get("buttons") or spec.get("actions") or spec.get("items")
-    if not isinstance(buttons_raw, list) or not buttons_raw:
+    if buttons_raw in (None, ""):
+        buttons_raw = []
+    if not isinstance(buttons_raw, list):
+        raise ValueError("spec must contain a buttons array when provided")
+    if not buttons_raw and not custom_helper_files:
         raise ValueError("spec must contain a non-empty buttons array")
+    if not include_default_helpers and "InAppMenuBridge.smali" not in custom_helper_files:
+        raise ValueError(
+            "custom runtime-menu injection without generated helpers must provide custom_helper_files['InAppMenuBridge.smali']"
+        )
 
     default_persist = bool(spec.get("persist_on_resume", True))
     title = str(spec.get("title") or spec.get("menu_title") or "APK AGI MOD MENU").strip() or "APK AGI MOD MENU"
@@ -308,6 +386,8 @@ def _normalize_menu_spec(spec: dict[str, Any], overlay_mode: str) -> dict[str, A
         "start_collapsed": start_collapsed,
         "buttons": normalized_buttons,
         "hook_bindings": list(spec.get("hook_bindings") or []),
+        "custom_helper_files": custom_helper_files,
+        "include_default_helpers": include_default_helpers,
         "user_buttons": len(buttons_raw),
         "persistent_buttons": sum(1 for button in normalized_buttons if button.get("persist_on_resume")),
         "section_count": len({button.get("section", "") for button in normalized_buttons if button.get("section")}),
@@ -393,6 +473,148 @@ def _class_descriptor_from_smali(smali_file: Path) -> str:
     return ""
 
 
+def _java_class_name(class_descriptor: str) -> str:
+    cleaned = str(class_descriptor or "").strip()
+    if cleaned.startswith("L") and cleaned.endswith(";"):
+        cleaned = cleaned[1:-1]
+    return cleaned.replace("/", ".")
+
+
+def _wrapper_params_for_ui_kind(ui_kind: str) -> str:
+    return _WRAPPER_PARAMS_BY_UI_KIND.get(ui_kind, "Landroid/content/Context;")
+
+
+def _ui_kind_for_params(param_types: list[str], *, allow_reflective: bool) -> str:
+    lookup = _REFLECTIVE_BINDING_UI_KIND if allow_reflective else _DIRECT_BINDING_UI_KIND
+    return lookup.get(tuple(param_types), "")
+
+
+def _adaptive_mode_for_signature(ui_kind: str, param_types: list[str]) -> int:
+    return int(_ADAPTIVE_MODE_BY_SIGNATURE.get(ui_kind, {}).get(tuple(param_types), -1))
+
+
+def _has_default_constructor(smali_file: Path) -> bool:
+    for line in smali_file.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = line.strip()
+        if not stripped.startswith(".method"):
+            continue
+        if " constructor " not in f" {stripped} ":
+            continue
+        if "<init>()V" in stripped:
+            return True
+    return False
+
+
+def _scan_hook_method_candidates(smali_file: Path, method_query: str) -> list[dict[str, Any]]:
+    has_default_ctor = _has_default_constructor(smali_file)
+    candidates: list[dict[str, Any]] = []
+    for line in smali_file.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = line.strip()
+        if not _method_header_matches(stripped, method_query):
+            continue
+        signature_match = re.search(r"([\w$<>-]+)\((.*?)\)(\S+)$", stripped)
+        if not signature_match:
+            continue
+        params_blob = signature_match.group(2)
+        param_types = _smali_param_descriptors(params_blob)
+        candidates.append({
+            "header": stripped,
+            "method_name": signature_match.group(1),
+            "params_blob": params_blob,
+            "param_types": param_types,
+            "return_type": signature_match.group(3),
+            "is_static": " static " in f" {stripped} ",
+            "default_constructible": has_default_ctor,
+            "direct_ui_kind": _ui_kind_for_params(param_types, allow_reflective=False),
+            "reflective_ui_kind": _ui_kind_for_params(param_types, allow_reflective=True),
+        })
+    return candidates
+
+
+def _binding_candidate_score(candidate: dict[str, Any]) -> tuple[int, int, int, int]:
+    params = list(candidate.get("param_types") or [])
+    has_context = int(bool(params and params[0] == "Landroid/content/Context;"))
+    prefers_primitive = int(not any(param in {"Ljava/lang/Boolean;", "Ljava/lang/Integer;", "Ljava/lang/Long;"} for param in params))
+    prefers_narrow = int(not any(param in {"J", "Ljava/lang/Long;"} for param in params))
+    return (
+        int(bool(candidate.get("is_static"))),
+        has_context,
+        prefers_primitive,
+        prefers_narrow,
+    )
+
+
+def _pick_binding_candidate(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not candidates:
+        return None
+    ranked = sorted(candidates, key=_binding_candidate_score, reverse=True)
+    if len(ranked) == 1:
+        return ranked[0]
+    if _binding_candidate_score(ranked[0]) == _binding_candidate_score(ranked[1]):
+        return None
+    return ranked[0]
+
+
+def _build_binding_from_candidate(
+    class_descriptor: str,
+    smali_file: Path,
+    candidate: dict[str, Any],
+    *,
+    index: int,
+    binding_status: str,
+) -> dict[str, Any]:
+    ui_kind = str(candidate.get("direct_ui_kind") or candidate.get("reflective_ui_kind") or "button")
+    wrapper_params = _wrapper_params_for_ui_kind(ui_kind)
+    target_param_types = list(candidate.get("param_types") or [])
+    binding: dict[str, Any] = {
+        "success": True,
+        "binding_status": binding_status,
+        "binding_mode": ("direct_static" if binding_status == "resolved_static_target" else "reflect_exact"),
+        "ui_kind": ui_kind,
+        "wrapper_method_descriptor": f"{_HOOK_BINDINGS_DESCRIPTOR}->hook_{index}({wrapper_params})V",
+        "target_method_descriptor": f"{class_descriptor}->{candidate['method_name']}({candidate['params_blob']})V",
+        "target_param_types": target_param_types,
+        "target_is_static": bool(candidate.get("is_static")),
+        "target_java_class": _java_class_name(class_descriptor),
+        "hook_smali_file": str(smali_file),
+        "hook_target_class": class_descriptor,
+        "hook_target_method": str(candidate.get("method_name") or ""),
+        "persist_on_resume": ui_kind in {"toggle", "slider"},
+    }
+    if binding_status == "reflection_target":
+        binding["adaptive_mode"] = _adaptive_mode_for_signature(ui_kind, target_param_types)
+    if ui_kind == "slider":
+        binding.update({"min_value": 0, "max_value": 10, "initial_value": 1})
+    return binding
+
+
+def _infer_deferred_ui_kind(method_query: str) -> str:
+    query = str(method_query or "").strip()
+    if "(" not in query:
+        return "button"
+    params_blob = query.split("(", 1)[1].split(")", 1)[0]
+    return _ui_kind_for_params(_smali_param_descriptors(params_blob), allow_reflective=True) or "button"
+
+
+def _build_deferred_binding(class_descriptor: str, method_query: str, *, index: int) -> dict[str, Any]:
+    ui_kind = _infer_deferred_ui_kind(method_query)
+    wrapper_params = _wrapper_params_for_ui_kind(ui_kind)
+    binding: dict[str, Any] = {
+        "success": True,
+        "binding_status": "deferred_lookup_target",
+        "binding_mode": "reflect_search",
+        "ui_kind": ui_kind,
+        "wrapper_method_descriptor": f"{_HOOK_BINDINGS_DESCRIPTOR}->hook_{index}({wrapper_params})V",
+        "target_java_class": _java_class_name(class_descriptor),
+        "hook_target_class": class_descriptor,
+        "hook_target_method": _extract_method_name(method_query),
+        "persist_on_resume": ui_kind in {"toggle", "slider"},
+    }
+    if ui_kind == "slider":
+        binding.update({"min_value": 0, "max_value": 10, "initial_value": 1})
+    return binding
+
+
 def _resolve_hook_smali_file(apktool_dir: Path, hook: dict[str, Any]) -> Path | None:
     hook_file = str(hook.get("file") or "").strip()
     candidate_paths: list[Path] = []
@@ -424,78 +646,73 @@ def _resolve_static_hook_binding(apktool_dir: Path, hook: dict[str, Any], *, ind
         return {"success": False, "binding_status": "missing_method_name", "error": "Hook candidate had no method name"}
 
     smali_file = _resolve_hook_smali_file(apktool_dir, hook)
+    class_descriptor = str(hook.get("class") or "").strip()
     if smali_file is None:
+        if class_descriptor:
+            binding = _build_deferred_binding(class_descriptor, method_query, index=index)
+            binding["error"] = f"Using deferred reflection lookup for unresolved hook: {class_descriptor}->{method_query}"
+            return binding
         return {"success": False, "binding_status": "smali_file_not_found", "error": f"Could not locate smali file for hook: {method_query}"}
 
-    class_descriptor = str(hook.get("class") or "").strip() or _class_descriptor_from_smali(smali_file)
+    class_descriptor = class_descriptor or _class_descriptor_from_smali(smali_file)
     if not class_descriptor:
         return {"success": False, "binding_status": "class_descriptor_missing", "error": f"Could not determine class descriptor for {smali_file.name}"}
 
-    supported_candidates: list[dict[str, Any]] = []
-    for line in smali_file.read_text(encoding="utf-8", errors="replace").splitlines():
-        stripped = line.strip()
-        if not _method_header_matches(stripped, method_query):
-            continue
-        signature_match = re.search(r"([\w$<>-]+)\((.*?)\)(\S+)$", stripped)
-        if not signature_match:
-            continue
-        method_name = signature_match.group(1)
-        params_blob = signature_match.group(2)
-        return_type = signature_match.group(3)
-        if return_type != "V" or " static " not in f" {stripped} ":
-            continue
-        params = _smali_param_descriptors(params_blob)
-        ui_kind = ""
-        if params in ([], ["Landroid/content/Context;"]):
-            ui_kind = "button"
-        elif params in (["Z"], ["Landroid/content/Context;", "Z"]):
-            ui_kind = "toggle"
-        elif params in (["I"], ["Landroid/content/Context;", "I"]):
-            ui_kind = "slider"
-        if not ui_kind:
-            continue
-        supported_candidates.append({
-            "header": stripped,
-            "method_name": method_name,
-            "params_blob": params_blob,
-            "ui_kind": ui_kind,
-            "target_method_descriptor": f"{class_descriptor}->{method_name}({params_blob})V",
-        })
+    candidates = _scan_hook_method_candidates(smali_file, method_query)
+    direct_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.get("return_type") == "V" and candidate.get("is_static") and candidate.get("direct_ui_kind")
+    ]
+    chosen_direct = _pick_binding_candidate(direct_candidates)
+    if chosen_direct is not None:
+        return _build_binding_from_candidate(
+            class_descriptor,
+            smali_file,
+            chosen_direct,
+            index=index,
+            binding_status="resolved_static_target",
+        )
 
-    if not supported_candidates:
-        return {
-            "success": False,
-            "binding_status": "no_supported_static_signature",
-            "error": f"No supported static void signature found for hook: {class_descriptor}->{method_query}",
-            "hook_smali_file": str(smali_file),
-        }
+    adaptive_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.get("return_type") == "V"
+        and candidate.get("reflective_ui_kind")
+        and (candidate.get("is_static") or candidate.get("default_constructible"))
+    ]
+    chosen_adaptive = _pick_binding_candidate(adaptive_candidates)
+    if chosen_adaptive is not None:
+        binding = _build_binding_from_candidate(
+            class_descriptor,
+            smali_file,
+            chosen_adaptive,
+            index=index,
+            binding_status="reflection_target",
+        )
+        if int(binding.get("adaptive_mode", -1)) >= 0:
+            return binding
 
-    if len(supported_candidates) > 1:
+    if class_descriptor:
+        binding = _build_deferred_binding(class_descriptor, method_query, index=index)
+        binding["hook_smali_file"] = str(smali_file)
+        binding["error"] = f"Falling back to deferred runtime lookup for hook: {class_descriptor}->{method_query}"
+        return binding
+
+    if direct_candidates:
         return {
             "success": False,
             "binding_status": "ambiguous_supported_overloads",
             "error": f"Multiple supported static overloads found for hook: {class_descriptor}->{method_query}",
             "hook_smali_file": str(smali_file),
-            "candidates": [candidate["target_method_descriptor"] for candidate in supported_candidates],
+            "candidates": [f"{class_descriptor}->{candidate['method_name']}({candidate['params_blob']})V" for candidate in direct_candidates],
         }
-
-    chosen = supported_candidates[0]
-    wrapper_method_descriptor = f"{_HOOK_BINDINGS_DESCRIPTOR}->hook_{index}({chosen['params_blob']})V"
-    persist_on_resume = chosen["ui_kind"] in {"toggle", "slider"}
-    binding: dict[str, Any] = {
-        "success": True,
-        "binding_status": "resolved_static_target",
-        "ui_kind": chosen["ui_kind"],
-        "wrapper_method_descriptor": wrapper_method_descriptor,
-        "target_method_descriptor": chosen["target_method_descriptor"],
+    return {
+        "success": False,
+        "binding_status": "no_supported_static_signature",
+        "error": f"No supported or adaptable signature found for hook: {class_descriptor}->{method_query}",
         "hook_smali_file": str(smali_file),
-        "hook_target_class": class_descriptor,
-        "hook_target_method": chosen["method_name"],
-        "persist_on_resume": persist_on_resume,
     }
-    if chosen["ui_kind"] == "slider":
-        binding.update({"min_value": 0, "max_value": 10, "initial_value": 1})
-    return binding
 
 
 def build_runtime_menu_spec_from_hook_plan(
@@ -554,6 +771,7 @@ def build_runtime_menu_spec_from_hook_plan(
             **button_entry,
         })
         binding_hint = {
+            "success": bool((resolved_binding or {}).get("success", False)),
             "id": action_id,
             "placeholder_method_descriptor": f"{_HOOK_BINDINGS_DESCRIPTOR}->hook_{index}(Landroid/content/Context;)V",
             "hook_target_class": str(hook.get("class", "")),
@@ -572,11 +790,7 @@ def build_runtime_menu_spec_from_hook_plan(
                 "ui_kind": resolved_binding.get("ui_kind", "button"),
             })
             if resolved_binding.get("success"):
-                hook_bindings.append({
-                    "wrapper_method_descriptor": resolved_binding["wrapper_method_descriptor"],
-                    "target_method_descriptor": resolved_binding["target_method_descriptor"],
-                    "ui_kind": resolved_binding["ui_kind"],
-                })
+                hook_bindings.append(dict(resolved_binding))
             elif resolved_binding.get("error"):
                 binding_hint["error"] = resolved_binding["error"]
         binding_hints.append(binding_hint)
@@ -589,21 +803,21 @@ def build_runtime_menu_spec_from_hook_plan(
         "buttons": buttons,
         "hook_bindings": hook_bindings,
     }
-    real_bindings = sum(1 for hint in binding_hints if hint.get("binding_status") == "resolved_static_target")
+    real_bindings = sum(1 for hint in binding_hints if hint.get("success"))
     return {
         "success": True,
         "focus_hint": hook_plan.get("focus_hint", ""),
         "class_name": hook_plan.get("class_name", ""),
         "draft_mode": "real_dispatcher_bindings" if real_bindings else "placeholder_dispatchers",
         "resolved_bindings": real_bindings,
-        "unsupported_bindings": [hint for hint in binding_hints if hint.get("binding_status") != "resolved_static_target"],
+        "unsupported_bindings": [hint for hint in binding_hints if not hint.get("success")],
         "spec": spec,
         "spec_json": json.dumps(spec, ensure_ascii=False, indent=2),
         "binding_hints": binding_hints,
         "notes": [
             "This draft auto-groups runtime-hook candidates into a floating-menu spec.",
-            "Supported static hook candidates are rebound to real generated RuntimeHookBindings methods automatically.",
-            "Unsupported or ambiguous hook candidates remain listed in binding_hints/unsupported_bindings for manual follow-up.",
+            "Supported static, reflective, and deferred runtime-hook candidates are rebound to real generated RuntimeHookBindings methods automatically.",
+            "Only hook candidates that still fail binding remain listed in binding_hints/unsupported_bindings for manual follow-up.",
         ],
     }
 
@@ -675,6 +889,515 @@ def _menu_top_key() -> str:
     return "ui:menu_top"
 
 
+def _generate_direct_hook_binding_method(binding: dict[str, Any]) -> list[str]:
+    wrapper = str(binding.get("wrapper_method_descriptor") or "").strip()
+    target = str(binding.get("target_method_descriptor") or "").strip()
+    ui_kind = str(binding.get("ui_kind") or "button")
+    if not wrapper or not target or "->" not in wrapper or "->" not in target:
+        return []
+
+    wrapper_sig = wrapper.split("->", 1)[1]
+    wrapper_name = _extract_method_name(wrapper_sig)
+    wrapper_params = wrapper_sig.split("(", 1)[1].rsplit(")", 1)[0]
+    target_params = list(binding.get("target_param_types") or [])
+    invoke_blob = "{}"
+    if ui_kind == "button":
+        invoke_blob = "{p0}" if target_params == ["Landroid/content/Context;"] else "{}"
+    elif ui_kind == "toggle":
+        invoke_blob = "{p0, p1}" if target_params == ["Landroid/content/Context;", "Z"] else "{p1}"
+    elif ui_kind == "slider":
+        invoke_blob = "{p0, p1}" if target_params == ["Landroid/content/Context;", "I"] else "{p1}"
+
+    return [
+        f".method public static {wrapper_name}({wrapper_params})V",
+        "    .locals 0",
+        f"    invoke-static {invoke_blob}, {target}",
+        "    return-void",
+        ".end method",
+        "",
+    ]
+
+
+def _generate_reflective_hook_binding_method(binding: dict[str, Any]) -> list[str]:
+    wrapper = str(binding.get("wrapper_method_descriptor") or "").strip()
+    ui_kind = str(binding.get("ui_kind") or "button")
+    if not wrapper or "->" not in wrapper:
+        return []
+
+    wrapper_sig = wrapper.split("->", 1)[1]
+    wrapper_name = _extract_method_name(wrapper_sig)
+    wrapper_params = wrapper_sig.split("(", 1)[1].rsplit(")", 1)[0]
+    class_name = _escape_smali_string(str(binding.get("target_java_class") or ""))
+    method_name = _escape_smali_string(str(binding.get("hook_target_method") or ""))
+    binding_status = str(binding.get("binding_status") or "reflection_target")
+    is_static = "0x1" if bool(binding.get("target_is_static")) else "0x0"
+    adaptive_mode = int(binding.get("adaptive_mode", 0))
+
+    lines = [
+        f".method public static {wrapper_name}({wrapper_params})V",
+        "    .locals 4",
+        f'    const-string v0, "{class_name}"',
+        f'    const-string v1, "{method_name}"',
+    ]
+    if binding_status == "deferred_lookup_target":
+        if ui_kind == "button":
+            lines.extend([
+                f"    invoke-static {{p0, v0, v1}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeDeferredButton(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;)V",
+            ])
+        elif ui_kind == "toggle":
+            lines.extend([
+                f"    invoke-static {{p0, v0, v1, p1}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeDeferredToggle(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;Z)V",
+            ])
+        else:
+            lines.extend([
+                f"    invoke-static {{p0, v0, v1, p1}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeDeferredSlider(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;I)V",
+            ])
+    else:
+        lines.extend([
+            f"    const/4 v2, {is_static}",
+            f"    const/4 v3, {hex(adaptive_mode)}",
+        ])
+        if ui_kind == "button":
+            lines.extend([
+                f"    invoke-static {{p0, v0, v1, v2, v3}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeResolvedButton(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;ZI)Z",
+            ])
+        elif ui_kind == "toggle":
+            lines.extend([
+                f"    invoke-static {{p0, v0, v1, p1, v2, v3}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeResolvedToggle(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;ZZI)Z",
+            ])
+        else:
+            lines.extend([
+                f"    invoke-static {{p0, v0, v1, p1, v2, v3}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeResolvedSlider(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;IZI)Z",
+            ])
+        lines.append("    move-result v0")
+
+    lines.extend([
+        "    return-void",
+        ".end method",
+        "",
+    ])
+    return lines
+
+
+def _generate_runtime_hook_reflection_helpers() -> list[str]:
+    return [
+        ".method private static newInstanceOrNull(Ljava/lang/Class;)Ljava/lang/Object;",
+        "    .locals 4",
+        "    :try_start_0",
+        "    const/4 v0, 0x0",
+        "    new-array v1, v0, [Ljava/lang/Class;",
+        "    invoke-virtual {p0, v1}, Ljava/lang/Class;->getDeclaredConstructor([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;",
+        "    move-result-object v1",
+        "    const/4 v2, 0x1",
+        "    invoke-virtual {v1, v2}, Ljava/lang/reflect/AccessibleObject;->setAccessible(Z)V",
+        "    new-array v2, v0, [Ljava/lang/Object;",
+        "    invoke-virtual {v1, v2}, Ljava/lang/reflect/Constructor;->newInstance([Ljava/lang/Object;)Ljava/lang/Object;",
+        "    move-result-object v3",
+        "    return-object v3",
+        "    :try_end_0",
+        "    .catch Ljava/lang/Throwable; {:try_start_0 .. :try_end_0} :catch_0",
+        "    :catch_0",
+        "    const/4 v0, 0x0",
+        "    return-object v0",
+        ".end method",
+        "",
+        ".method private static invokeExact(Ljava/lang/String;Ljava/lang/String;Z[Ljava/lang/Class;[Ljava/lang/Object;)Z",
+        "    .locals 5",
+        "    :try_start_0",
+        "    invoke-static {p0}, Ljava/lang/Class;->forName(Ljava/lang/String;)Ljava/lang/Class;",
+        "    move-result-object v0",
+        "    invoke-virtual {v0, p1, p3}, Ljava/lang/Class;->getDeclaredMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
+        "    move-result-object v1",
+        "    const/4 v2, 0x1",
+        "    invoke-virtual {v1, v2}, Ljava/lang/reflect/AccessibleObject;->setAccessible(Z)V",
+        "    if-eqz p2, :apkagi_invoke_exact_instance",
+        "    const/4 v2, 0x0",
+        "    goto :apkagi_invoke_exact_ready",
+        "    :apkagi_invoke_exact_instance",
+        f"    invoke-static {{v0}}, {_HOOK_BINDINGS_DESCRIPTOR}->newInstanceOrNull(Ljava/lang/Class;)Ljava/lang/Object;",
+        "    move-result-object v2",
+        "    if-nez v2, :apkagi_invoke_exact_ready",
+        "    const/4 v3, 0x0",
+        "    return v3",
+        "    :apkagi_invoke_exact_ready",
+        "    invoke-virtual {v1, v2, p4}, Ljava/lang/reflect/Method;->invoke(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
+        "    const/4 v3, 0x1",
+        "    return v3",
+        "    :try_end_0",
+        "    .catch Ljava/lang/Throwable; {:try_start_0 .. :try_end_0} :catch_0",
+        "    :catch_0",
+        "    const/4 v3, 0x0",
+        "    return v3",
+        ".end method",
+        "",
+        ".method private static invokeResolvedButton(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;ZI)Z",
+        "    .locals 6",
+        "    const/4 v0, 0x1",
+        "    if-ne p4, v0, :apkagi_button_no_context",
+        "    new-array v1, v0, [Ljava/lang/Class;",
+        "    const-class v2, Landroid/content/Context;",
+        "    const/4 v3, 0x0",
+        "    aput-object v2, v1, v3",
+        "    new-array v2, v0, [Ljava/lang/Object;",
+        "    aput-object p0, v2, v3",
+        f"    invoke-static {{p1, p2, p3, v1, v2}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeExact(Ljava/lang/String;Ljava/lang/String;Z[Ljava/lang/Class;[Ljava/lang/Object;)Z",
+        "    move-result v4",
+        "    return v4",
+        "    :apkagi_button_no_context",
+        "    const/4 v0, 0x0",
+        "    new-array v1, v0, [Ljava/lang/Class;",
+        "    new-array v2, v0, [Ljava/lang/Object;",
+        f"    invoke-static {{p1, p2, p3, v1, v2}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeExact(Ljava/lang/String;Ljava/lang/String;Z[Ljava/lang/Class;[Ljava/lang/Object;)Z",
+        "    move-result v4",
+        "    return v4",
+        ".end method",
+        "",
+        ".method private static invokeResolvedToggle(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;ZZI)Z",
+        "    .locals 8",
+        "    invoke-static {p3}, Ljava/lang/Boolean;->valueOf(Z)Ljava/lang/Boolean;",
+        "    move-result-object v0",
+        "    const/4 v1, 0x3",
+        "    if-ne p5, v1, :apkagi_toggle_mode2",
+        "    const/4 v1, 0x2",
+        "    new-array v2, v1, [Ljava/lang/Class;",
+        "    const-class v3, Landroid/content/Context;",
+        "    const/4 v4, 0x0",
+        "    aput-object v3, v2, v4",
+        "    const-class v3, Ljava/lang/Boolean;",
+        "    const/4 v5, 0x1",
+        "    aput-object v3, v2, v5",
+        "    new-array v3, v1, [Ljava/lang/Object;",
+        "    aput-object p0, v3, v4",
+        "    aput-object v0, v3, v5",
+        f"    invoke-static {{p1, p2, p4, v2, v3}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeExact(Ljava/lang/String;Ljava/lang/String;Z[Ljava/lang/Class;[Ljava/lang/Object;)Z",
+        "    move-result v6",
+        "    return v6",
+        "    :apkagi_toggle_mode2",
+        "    const/4 v1, 0x2",
+        "    if-ne p5, v1, :apkagi_toggle_mode1",
+        "    const/4 v1, 0x1",
+        "    new-array v2, v1, [Ljava/lang/Class;",
+        "    const-class v3, Ljava/lang/Boolean;",
+        "    const/4 v4, 0x0",
+        "    aput-object v3, v2, v4",
+        "    new-array v3, v1, [Ljava/lang/Object;",
+        "    aput-object v0, v3, v4",
+        f"    invoke-static {{p1, p2, p4, v2, v3}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeExact(Ljava/lang/String;Ljava/lang/String;Z[Ljava/lang/Class;[Ljava/lang/Object;)Z",
+        "    move-result v6",
+        "    return v6",
+        "    :apkagi_toggle_mode1",
+        "    const/4 v1, 0x1",
+        "    if-ne p5, v1, :apkagi_toggle_mode0",
+        "    const/4 v1, 0x2",
+        "    new-array v2, v1, [Ljava/lang/Class;",
+        "    const-class v3, Landroid/content/Context;",
+        "    const/4 v4, 0x0",
+        "    aput-object v3, v2, v4",
+        "    sget-object v3, Ljava/lang/Boolean;->TYPE:Ljava/lang/Class;",
+        "    const/4 v5, 0x1",
+        "    aput-object v3, v2, v5",
+        "    new-array v3, v1, [Ljava/lang/Object;",
+        "    aput-object p0, v3, v4",
+        "    aput-object v0, v3, v5",
+        f"    invoke-static {{p1, p2, p4, v2, v3}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeExact(Ljava/lang/String;Ljava/lang/String;Z[Ljava/lang/Class;[Ljava/lang/Object;)Z",
+        "    move-result v6",
+        "    return v6",
+        "    :apkagi_toggle_mode0",
+        "    const/4 v1, 0x1",
+        "    new-array v2, v1, [Ljava/lang/Class;",
+        "    sget-object v3, Ljava/lang/Boolean;->TYPE:Ljava/lang/Class;",
+        "    const/4 v4, 0x0",
+        "    aput-object v3, v2, v4",
+        "    new-array v3, v1, [Ljava/lang/Object;",
+        "    aput-object v0, v3, v4",
+        f"    invoke-static {{p1, p2, p4, v2, v3}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeExact(Ljava/lang/String;Ljava/lang/String;Z[Ljava/lang/Class;[Ljava/lang/Object;)Z",
+        "    move-result v6",
+        "    return v6",
+        ".end method",
+        "",
+        ".method private static invokeResolvedSlider(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;IZI)Z",
+        "    .locals 9",
+        "    invoke-static {p3}, Ljava/lang/Integer;->valueOf(I)Ljava/lang/Integer;",
+        "    move-result-object v0",
+        "    int-to-long v1, p3",
+        "    invoke-static {v1, v2}, Ljava/lang/Long;->valueOf(J)Ljava/lang/Long;",
+        "    move-result-object v3",
+        "    const/4 v4, 0x7",
+        "    if-ne p5, v4, :apkagi_slider_mode6",
+        "    const/4 v4, 0x2",
+        "    new-array v5, v4, [Ljava/lang/Class;",
+        "    const-class v6, Landroid/content/Context;",
+        "    const/4 v7, 0x0",
+        "    aput-object v6, v5, v7",
+        "    const-class v6, Ljava/lang/Long;",
+        "    const/4 v8, 0x1",
+        "    aput-object v6, v5, v8",
+        "    new-array v6, v4, [Ljava/lang/Object;",
+        "    aput-object p0, v6, v7",
+        "    aput-object v3, v6, v8",
+        f"    invoke-static {{p1, p2, p4, v5, v6}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeExact(Ljava/lang/String;Ljava/lang/String;Z[Ljava/lang/Class;[Ljava/lang/Object;)Z",
+        "    move-result v8",
+        "    return v8",
+        "    :apkagi_slider_mode6",
+        "    const/4 v4, 0x6",
+        "    if-ne p5, v4, :apkagi_slider_mode5",
+        "    const/4 v4, 0x1",
+        "    new-array v5, v4, [Ljava/lang/Class;",
+        "    const-class v6, Ljava/lang/Long;",
+        "    const/4 v7, 0x0",
+        "    aput-object v6, v5, v7",
+        "    new-array v6, v4, [Ljava/lang/Object;",
+        "    aput-object v3, v6, v7",
+        f"    invoke-static {{p1, p2, p4, v5, v6}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeExact(Ljava/lang/String;Ljava/lang/String;Z[Ljava/lang/Class;[Ljava/lang/Object;)Z",
+        "    move-result v8",
+        "    return v8",
+        "    :apkagi_slider_mode5",
+        "    const/4 v4, 0x5",
+        "    if-ne p5, v4, :apkagi_slider_mode4",
+        "    const/4 v4, 0x2",
+        "    new-array v5, v4, [Ljava/lang/Class;",
+        "    const-class v6, Landroid/content/Context;",
+        "    const/4 v7, 0x0",
+        "    aput-object v6, v5, v7",
+        "    sget-object v6, Ljava/lang/Long;->TYPE:Ljava/lang/Class;",
+        "    const/4 v8, 0x1",
+        "    aput-object v6, v5, v8",
+        "    new-array v6, v4, [Ljava/lang/Object;",
+        "    aput-object p0, v6, v7",
+        "    aput-object v3, v6, v8",
+        f"    invoke-static {{p1, p2, p4, v5, v6}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeExact(Ljava/lang/String;Ljava/lang/String;Z[Ljava/lang/Class;[Ljava/lang/Object;)Z",
+        "    move-result v8",
+        "    return v8",
+        "    :apkagi_slider_mode4",
+        "    const/4 v4, 0x4",
+        "    if-ne p5, v4, :apkagi_slider_mode3",
+        "    const/4 v4, 0x1",
+        "    new-array v5, v4, [Ljava/lang/Class;",
+        "    sget-object v6, Ljava/lang/Long;->TYPE:Ljava/lang/Class;",
+        "    const/4 v7, 0x0",
+        "    aput-object v6, v5, v7",
+        "    new-array v6, v4, [Ljava/lang/Object;",
+        "    aput-object v3, v6, v7",
+        f"    invoke-static {{p1, p2, p4, v5, v6}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeExact(Ljava/lang/String;Ljava/lang/String;Z[Ljava/lang/Class;[Ljava/lang/Object;)Z",
+        "    move-result v8",
+        "    return v8",
+        "    :apkagi_slider_mode3",
+        "    const/4 v4, 0x3",
+        "    if-ne p5, v4, :apkagi_slider_mode2",
+        "    const/4 v4, 0x2",
+        "    new-array v5, v4, [Ljava/lang/Class;",
+        "    const-class v6, Landroid/content/Context;",
+        "    const/4 v7, 0x0",
+        "    aput-object v6, v5, v7",
+        "    const-class v6, Ljava/lang/Integer;",
+        "    const/4 v8, 0x1",
+        "    aput-object v6, v5, v8",
+        "    new-array v6, v4, [Ljava/lang/Object;",
+        "    aput-object p0, v6, v7",
+        "    aput-object v0, v6, v8",
+        f"    invoke-static {{p1, p2, p4, v5, v6}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeExact(Ljava/lang/String;Ljava/lang/String;Z[Ljava/lang/Class;[Ljava/lang/Object;)Z",
+        "    move-result v8",
+        "    return v8",
+        "    :apkagi_slider_mode2",
+        "    const/4 v4, 0x2",
+        "    if-ne p5, v4, :apkagi_slider_mode1",
+        "    const/4 v4, 0x1",
+        "    new-array v5, v4, [Ljava/lang/Class;",
+        "    const-class v6, Ljava/lang/Integer;",
+        "    const/4 v7, 0x0",
+        "    aput-object v6, v5, v7",
+        "    new-array v6, v4, [Ljava/lang/Object;",
+        "    aput-object v0, v6, v7",
+        f"    invoke-static {{p1, p2, p4, v5, v6}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeExact(Ljava/lang/String;Ljava/lang/String;Z[Ljava/lang/Class;[Ljava/lang/Object;)Z",
+        "    move-result v8",
+        "    return v8",
+        "    :apkagi_slider_mode1",
+        "    const/4 v4, 0x1",
+        "    if-ne p5, v4, :apkagi_slider_mode0",
+        "    const/4 v4, 0x2",
+        "    new-array v5, v4, [Ljava/lang/Class;",
+        "    const-class v6, Landroid/content/Context;",
+        "    const/4 v7, 0x0",
+        "    aput-object v6, v5, v7",
+        "    sget-object v6, Ljava/lang/Integer;->TYPE:Ljava/lang/Class;",
+        "    const/4 v8, 0x1",
+        "    aput-object v6, v5, v8",
+        "    new-array v6, v4, [Ljava/lang/Object;",
+        "    aput-object p0, v6, v7",
+        "    aput-object v0, v6, v8",
+        f"    invoke-static {{p1, p2, p4, v5, v6}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeExact(Ljava/lang/String;Ljava/lang/String;Z[Ljava/lang/Class;[Ljava/lang/Object;)Z",
+        "    move-result v8",
+        "    return v8",
+        "    :apkagi_slider_mode0",
+        "    const/4 v4, 0x1",
+        "    new-array v5, v4, [Ljava/lang/Class;",
+        "    sget-object v6, Ljava/lang/Integer;->TYPE:Ljava/lang/Class;",
+        "    const/4 v7, 0x0",
+        "    aput-object v6, v5, v7",
+        "    new-array v6, v4, [Ljava/lang/Object;",
+        "    aput-object v0, v6, v7",
+        f"    invoke-static {{p1, p2, p4, v5, v6}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeExact(Ljava/lang/String;Ljava/lang/String;Z[Ljava/lang/Class;[Ljava/lang/Object;)Z",
+        "    move-result v8",
+        "    return v8",
+        ".end method",
+        "",
+        ".method private static invokeDeferredButton(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;)V",
+        "    .locals 2",
+        "    const/4 v0, 0x1",
+        f"    invoke-static {{p0, p1, p2, v0, v0}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeResolvedButton(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;ZI)Z",
+        "    move-result v1",
+        "    if-nez v1, :apkagi_deferred_button_done",
+        "    const/4 v0, 0x0",
+        "    const/4 v1, 0x1",
+        f"    invoke-static {{p0, p1, p2, v0, v1}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeResolvedButton(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;ZI)Z",
+        "    move-result v1",
+        "    if-nez v1, :apkagi_deferred_button_done",
+        "    const/4 v0, 0x1",
+        "    const/4 v1, 0x0",
+        f"    invoke-static {{p0, p1, p2, v0, v1}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeResolvedButton(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;ZI)Z",
+        "    move-result v1",
+        "    if-nez v1, :apkagi_deferred_button_done",
+        "    const/4 v0, 0x0",
+        "    const/4 v1, 0x0",
+        f"    invoke-static {{p0, p1, p2, v0, v1}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeResolvedButton(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;ZI)Z",
+        "    move-result v1",
+        "    :apkagi_deferred_button_done",
+        "    return-void",
+        ".end method",
+        "",
+        ".method private static invokeDeferredToggle(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;Z)V",
+        "    .locals 3",
+        "    const/4 v0, 0x1",
+        "    const/4 v1, 0x1",
+        f"    invoke-static {{p0, p1, p2, p3, v0, v1}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeResolvedToggle(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;ZZI)Z",
+        "    move-result v2",
+        "    if-nez v2, :apkagi_deferred_toggle_done",
+        "    const/4 v0, 0x0",
+        "    const/4 v1, 0x1",
+        f"    invoke-static {{p0, p1, p2, p3, v0, v1}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeResolvedToggle(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;ZZI)Z",
+        "    move-result v2",
+        "    if-nez v2, :apkagi_deferred_toggle_done",
+        "    const/4 v0, 0x1",
+        "    const/4 v1, 0x0",
+        f"    invoke-static {{p0, p1, p2, p3, v0, v1}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeResolvedToggle(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;ZZI)Z",
+        "    move-result v2",
+        "    if-nez v2, :apkagi_deferred_toggle_done",
+        "    const/4 v0, 0x0",
+        "    const/4 v1, 0x0",
+        f"    invoke-static {{p0, p1, p2, p3, v0, v1}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeResolvedToggle(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;ZZI)Z",
+        "    move-result v2",
+        "    if-nez v2, :apkagi_deferred_toggle_done",
+        "    const/4 v0, 0x1",
+        "    const/4 v1, 0x3",
+        f"    invoke-static {{p0, p1, p2, p3, v0, v1}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeResolvedToggle(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;ZZI)Z",
+        "    move-result v2",
+        "    if-nez v2, :apkagi_deferred_toggle_done",
+        "    const/4 v0, 0x0",
+        "    const/4 v1, 0x3",
+        f"    invoke-static {{p0, p1, p2, p3, v0, v1}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeResolvedToggle(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;ZZI)Z",
+        "    move-result v2",
+        "    if-nez v2, :apkagi_deferred_toggle_done",
+        "    const/4 v0, 0x1",
+        "    const/4 v1, 0x2",
+        f"    invoke-static {{p0, p1, p2, p3, v0, v1}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeResolvedToggle(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;ZZI)Z",
+        "    move-result v2",
+        "    if-nez v2, :apkagi_deferred_toggle_done",
+        "    const/4 v0, 0x0",
+        "    const/4 v1, 0x2",
+        f"    invoke-static {{p0, p1, p2, p3, v0, v1}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeResolvedToggle(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;ZZI)Z",
+        "    move-result v2",
+        "    :apkagi_deferred_toggle_done",
+        "    return-void",
+        ".end method",
+        "",
+        ".method private static invokeDeferredSlider(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;I)V",
+        "    .locals 3",
+        "    const/4 v0, 0x1",
+        "    const/4 v1, 0x1",
+        f"    invoke-static {{p0, p1, p2, p3, v0, v1}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeResolvedSlider(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;IZI)Z",
+        "    move-result v2",
+        "    if-nez v2, :apkagi_deferred_slider_done",
+        "    const/4 v0, 0x0",
+        "    const/4 v1, 0x1",
+        f"    invoke-static {{p0, p1, p2, p3, v0, v1}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeResolvedSlider(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;IZI)Z",
+        "    move-result v2",
+        "    if-nez v2, :apkagi_deferred_slider_done",
+        "    const/4 v0, 0x1",
+        "    const/4 v1, 0x0",
+        f"    invoke-static {{p0, p1, p2, p3, v0, v1}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeResolvedSlider(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;IZI)Z",
+        "    move-result v2",
+        "    if-nez v2, :apkagi_deferred_slider_done",
+        "    const/4 v0, 0x0",
+        "    const/4 v1, 0x0",
+        f"    invoke-static {{p0, p1, p2, p3, v0, v1}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeResolvedSlider(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;IZI)Z",
+        "    move-result v2",
+        "    if-nez v2, :apkagi_deferred_slider_done",
+        "    const/4 v0, 0x1",
+        "    const/4 v1, 0x3",
+        f"    invoke-static {{p0, p1, p2, p3, v0, v1}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeResolvedSlider(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;IZI)Z",
+        "    move-result v2",
+        "    if-nez v2, :apkagi_deferred_slider_done",
+        "    const/4 v0, 0x0",
+        "    const/4 v1, 0x3",
+        f"    invoke-static {{p0, p1, p2, p3, v0, v1}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeResolvedSlider(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;IZI)Z",
+        "    move-result v2",
+        "    if-nez v2, :apkagi_deferred_slider_done",
+        "    const/4 v0, 0x1",
+        "    const/4 v1, 0x2",
+        f"    invoke-static {{p0, p1, p2, p3, v0, v1}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeResolvedSlider(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;IZI)Z",
+        "    move-result v2",
+        "    if-nez v2, :apkagi_deferred_slider_done",
+        "    const/4 v0, 0x0",
+        "    const/4 v1, 0x2",
+        f"    invoke-static {{p0, p1, p2, p3, v0, v1}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeResolvedSlider(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;IZI)Z",
+        "    move-result v2",
+        "    if-nez v2, :apkagi_deferred_slider_done",
+        "    const/4 v0, 0x1",
+        "    const/4 v1, 0x5",
+        f"    invoke-static {{p0, p1, p2, p3, v0, v1}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeResolvedSlider(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;IZI)Z",
+        "    move-result v2",
+        "    if-nez v2, :apkagi_deferred_slider_done",
+        "    const/4 v0, 0x0",
+        "    const/4 v1, 0x5",
+        f"    invoke-static {{p0, p1, p2, p3, v0, v1}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeResolvedSlider(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;IZI)Z",
+        "    move-result v2",
+        "    if-nez v2, :apkagi_deferred_slider_done",
+        "    const/4 v0, 0x1",
+        "    const/4 v1, 0x4",
+        f"    invoke-static {{p0, p1, p2, p3, v0, v1}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeResolvedSlider(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;IZI)Z",
+        "    move-result v2",
+        "    if-nez v2, :apkagi_deferred_slider_done",
+        "    const/4 v0, 0x0",
+        "    const/4 v1, 0x4",
+        f"    invoke-static {{p0, p1, p2, p3, v0, v1}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeResolvedSlider(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;IZI)Z",
+        "    move-result v2",
+        "    if-nez v2, :apkagi_deferred_slider_done",
+        "    const/4 v0, 0x1",
+        "    const/4 v1, 0x7",
+        f"    invoke-static {{p0, p1, p2, p3, v0, v1}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeResolvedSlider(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;IZI)Z",
+        "    move-result v2",
+        "    if-nez v2, :apkagi_deferred_slider_done",
+        "    const/4 v0, 0x0",
+        "    const/4 v1, 0x7",
+        f"    invoke-static {{p0, p1, p2, p3, v0, v1}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeResolvedSlider(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;IZI)Z",
+        "    move-result v2",
+        "    if-nez v2, :apkagi_deferred_slider_done",
+        "    const/4 v0, 0x1",
+        "    const/4 v1, 0x6",
+        f"    invoke-static {{p0, p1, p2, p3, v0, v1}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeResolvedSlider(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;IZI)Z",
+        "    move-result v2",
+        "    if-nez v2, :apkagi_deferred_slider_done",
+        "    const/4 v0, 0x0",
+        "    const/4 v1, 0x6",
+        f"    invoke-static {{p0, p1, p2, p3, v0, v1}}, {_HOOK_BINDINGS_DESCRIPTOR}->invokeResolvedSlider(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;IZI)Z",
+        "    move-result v2",
+        "    :apkagi_deferred_slider_done",
+        "    return-void",
+        ".end method",
+        "",
+    ]
+
+
 def _generate_runtime_hook_bindings_smali(bindings: list[dict[str, Any]]) -> str:
     helper_lines: list[str] = [
         ".class public final Lapkagi/menu/RuntimeHookBindings;",
@@ -689,25 +1412,20 @@ def _generate_runtime_hook_bindings_smali(bindings: list[dict[str, Any]]) -> str
         "",
     ]
 
+    adaptive_bindings = [
+        binding
+        for binding in bindings
+        if str(binding.get("binding_mode") or "") in {"reflect_exact", "reflect_search"}
+    ]
+    if adaptive_bindings:
+        helper_lines.extend(_generate_runtime_hook_reflection_helpers())
+
     for binding in bindings:
-        wrapper = str(binding.get("wrapper_method_descriptor") or "").strip()
-        target = str(binding.get("target_method_descriptor") or "").strip()
-        if not wrapper or not target or "->" not in wrapper or "->" not in target:
-            continue
-        wrapper_sig = wrapper.split("->", 1)[1]
-        wrapper_name = _extract_method_name(wrapper_sig)
-        wrapper_params = wrapper_sig.split("(", 1)[1].rsplit(")", 1)[0]
-        params = _smali_param_descriptors(wrapper_params)
-        invoke_registers = [f"p{index}" for index in range(len(params))]
-        invoke_blob = "{" + ", ".join(invoke_registers) + "}" if invoke_registers else "{}"
-        helper_lines.extend([
-            f".method public static {wrapper_name}({wrapper_params})V",
-            "    .locals 0",
-            f"    invoke-static {invoke_blob}, {target}",
-            "    return-void",
-            ".end method",
-            "",
-        ])
+        binding_mode = str(binding.get("binding_mode") or "direct_static")
+        if binding_mode == "direct_static":
+            helper_lines.extend(_generate_direct_hook_binding_method(binding))
+        else:
+            helper_lines.extend(_generate_reflective_hook_binding_method(binding))
 
     return "\n".join(helper_lines) + "\n"
 
@@ -2288,25 +3006,30 @@ def inject_runtime_menu_scaffold(
     has_toggle = "toggle" in normalized_spec["control_types"]
     has_slider = "slider" in normalized_spec["control_types"]
     hook_bindings = [binding for binding in normalized_spec.get("hook_bindings", []) if isinstance(binding, dict)]
+    include_default_helpers = bool(normalized_spec.get("include_default_helpers", True))
+    custom_helper_files = dict(normalized_spec.get("custom_helper_files") or {})
 
-    helper_files = {
-        "InAppMenuBridge.smali": _generate_bridge_smali(normalized_spec),
-        "MenuLifecycleCallbacks.smali": _generate_lifecycle_callbacks_smali(),
-        "MenuActionClickListener.smali": _generate_click_listener_smali(),
-        "MenuVisibilityClickListener.smali": _generate_visibility_listener_smali(),
-        "MenuActions.smali": _generate_actions_smali(normalized_spec),
-    }
-    if hook_bindings:
-        helper_files["RuntimeHookBindings.smali"] = _generate_runtime_hook_bindings_smali(hook_bindings)
-    if requested_mode in {"in_app", "hybrid"}:
-        helper_files["MenuPanelDragTouchListener.smali"] = _generate_panel_drag_listener_smali()
-    if has_toggle:
-        helper_files["MenuToggleCheckedChangeListener.smali"] = _generate_toggle_listener_smali()
-    if has_slider:
-        helper_files["MenuSliderChangeListener.smali"] = _generate_slider_listener_smali()
-    if requested_mode in {"system_overlay", "hybrid"}:
-        helper_files["OverlayMenuService.smali"] = _generate_overlay_service_smali(normalized_spec)
-        helper_files["OverlayMenuDragTouchListener.smali"] = _generate_overlay_drag_listener_smali()
+    helper_files: dict[str, str] = {}
+    if include_default_helpers:
+        helper_files = {
+            "InAppMenuBridge.smali": _generate_bridge_smali(normalized_spec),
+            "MenuLifecycleCallbacks.smali": _generate_lifecycle_callbacks_smali(),
+            "MenuActionClickListener.smali": _generate_click_listener_smali(),
+            "MenuVisibilityClickListener.smali": _generate_visibility_listener_smali(),
+            "MenuActions.smali": _generate_actions_smali(normalized_spec),
+        }
+        if hook_bindings:
+            helper_files["RuntimeHookBindings.smali"] = _generate_runtime_hook_bindings_smali(hook_bindings)
+        if requested_mode in {"in_app", "hybrid"}:
+            helper_files["MenuPanelDragTouchListener.smali"] = _generate_panel_drag_listener_smali()
+        if has_toggle:
+            helper_files["MenuToggleCheckedChangeListener.smali"] = _generate_toggle_listener_smali()
+        if has_slider:
+            helper_files["MenuSliderChangeListener.smali"] = _generate_slider_listener_smali()
+        if requested_mode in {"system_overlay", "hybrid"}:
+            helper_files["OverlayMenuService.smali"] = _generate_overlay_service_smali(normalized_spec)
+            helper_files["OverlayMenuDragTouchListener.smali"] = _generate_overlay_drag_listener_smali()
+    helper_files.update(custom_helper_files)
 
     if dry_run:
         return {
@@ -2326,6 +3049,7 @@ def inject_runtime_menu_scaffold(
             "notes": [
                 "Dry run only: no smali files or bootstrap hooks were written.",
                 "The current implementation generates a floating launcher bubble, remembered open/close state, section headers, and direct dispatcher bindings for runtime hooks.",
+                "custom_helper_files can override generated helpers or replace the whole helper set when include_default_helpers=false.",
             ],
         }
 
@@ -2428,6 +3152,7 @@ def inject_runtime_menu_scaffold(
             "Persistent button/toggle/slider state is re-applied on later attaches/resumes until the generated reset button is pressed.",
             "kind=dispatcher binds controls directly to static runtime-hook methods without extra app-side glue.",
             "When system_overlay or hybrid is requested, the scaffold generates a real WindowManager overlay service and overlay-permission request flow.",
+            "custom_helper_files may override generated menu helpers so the agent can inject fully authored smali menu implementations through this tool.",
         ],
         "errors": errors[:20],
     }
