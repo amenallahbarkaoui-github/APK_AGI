@@ -257,6 +257,7 @@ def agent_node(state: AgentState) -> dict:
                     "- Architecture recovery: map_semantic_architecture, recover_hidden_state_model, profile_guard_and_revalidation_surface, find_enforcement_surfaces, semantic_method_slice\n"
                     "- Flutter/Dart AOT: analyze_dart_aot, build_dart_aot_index, locate_dart_aot_candidates for libapp.so anchor recovery before bounded native patching\n"
                     "- Routing: route_reverse_engineering_workflow to classify the current app into java/native/flutter/unity/react-native/dynamic-loader workflows before diving in\n"
+                    "- Task planning: update_task_plan, edit_task_plan, mark_task_done to keep a concrete multi-step plan and update it as work progresses\n"
                     "- Runtime/response control: patch_api_response_flow, inject_runtime_override_layer, plan_runtime_menu_workflow, draft_runtime_menu_from_hooks, inject_runtime_menu_scaffold, configure_runtime_menu_manifest\n"
                     "- Runtime menu workflow: plan_runtime_menu_workflow -> draft_runtime_menu_from_hooks -> inject_runtime_menu_scaffold -> configure_runtime_menu_manifest (overlay only)\n"
                     "- Working memory: update_scratchpad (save any free-form hypothesis, suspicious class, state field, or server-overwrite note for later turns)\n"
@@ -639,9 +640,30 @@ def agent_node(state: AgentState) -> dict:
 
 # Track consecutive text-only (no tool calls) responses for nudge logic
 _MAX_NUDGES = 2  # max times we'll nudge the agent to call tools before allowing __end__
+_TASK_PLAN_TOOL_NAMES = frozenset({"update_task_plan", "edit_task_plan", "mark_task_done"})
+_PLAN_REQUIRED_PATCH_TOOLS = frozenset({
+    "apply_smali_patch",
+    "apply_text_patch",
+    "patch_binary_hex",
+    "smart_entity_patch",
+    "patch_api_response_flow",
+    "patch_shared_prefs_reads",
+    "inject_smali_code",
+    "generate_constructor_override",
+    "inject_startup_hook",
+    "inject_runtime_override_layer",
+    "inject_runtime_menu_scaffold",
+    "configure_runtime_menu_manifest",
+    "auto_patch_bypass",
+    "patch_flutter_ssl",
+    "inject_network_security_config",
+    "patch_manifest_security",
+    "remove_ads",
+    "apply_dart_aot_patch",
+})
 
 
-def should_continue(state: AgentState) -> Literal["tools", "human_review", "nudge", "__end__"]:
+def should_continue(state: AgentState) -> Literal["tools", "human_review", "planning_guard", "nudge", "__end__"]:
     """Route after agent node: tool call → tools, text-only → nudge or end."""
 
     if not state["messages"]:
@@ -657,6 +679,11 @@ def should_continue(state: AgentState) -> Literal["tools", "human_review", "nudg
     # If the LLM wants to call tools
     if last_msg.tool_calls:
         _set_nudge_count(0)
+        task_plan = state.get("task_plan") or []
+        requested_tools = {str(tc.get("name", "")) for tc in last_msg.tool_calls}
+        if not task_plan and any(name in _PLAN_REQUIRED_PATCH_TOOLS for name in requested_tools):
+            if not requested_tools.issubset(_TASK_PLAN_TOOL_NAMES):
+                return "planning_guard"
         # Check if any tool call is a high-risk patch (apply_smali_patch)
         for tc in last_msg.tool_calls:
             if tc["name"] == "apply_smali_patch":
@@ -730,6 +757,47 @@ def nudge_node(state: AgentState) -> dict:
             )
         ]
     }
+
+
+def planning_guard_node(state: AgentState) -> dict:
+    """Reject patch tool calls until the agent records a concrete task plan."""
+    last_msg = state["messages"][-1]
+    if not isinstance(last_msg, AIMessage):
+        return {"messages": []}
+
+    blocked_calls = [
+        tc for tc in last_msg.tool_calls
+        if str(tc.get("name", "")) in _PLAN_REQUIRED_PATCH_TOOLS
+    ]
+    if not blocked_calls:
+        return {"messages": []}
+
+    last_msg.tool_calls = []
+    if "tool_calls" in last_msg.additional_kwargs:
+        last_msg.additional_kwargs["tool_calls"] = []
+
+    rejection_messages = [
+        ToolMessage(
+            content=json.dumps({
+                "success": False,
+                "error": "task_plan_required_before_patching",
+                "recovery_hint": "First call update_task_plan with a concrete multi-step plan, then continue with patch tools.",
+            }),
+            tool_call_id=tc["id"],
+            name=str(tc.get("name", "tool")),
+        )
+        for tc in blocked_calls
+    ]
+    rejection_messages.append(
+        HumanMessage(
+            content=(
+                "[SYSTEM] Planning is mandatory before patching. "
+                "First call update_task_plan with a concrete multi-step plan. "
+                "Then use edit_task_plan and mark_task_done to keep it current as you execute patches."
+            )
+        )
+    )
+    return {"messages": rejection_messages}
 
 
 def human_review_node(state: AgentState) -> dict:
@@ -1499,6 +1567,7 @@ def build_graph(config: AppConfig, project: Project, checkpointer=None):
     graph.add_node("tools_post", tools_postprocess)
     graph.add_node("human_review", human_review_node)
     graph.add_node("human_step", human_step_node)
+    graph.add_node("planning_guard", planning_guard_node)
     graph.add_node("nudge", nudge_node)
 
     graph.set_entry_point("agent")
@@ -1509,6 +1578,7 @@ def build_graph(config: AppConfig, project: Project, checkpointer=None):
         {
             "tools": "tools",
             "human_review": "human_review",
+            "planning_guard": "planning_guard",
             "nudge": "nudge",
             "__end__": END,
         },
@@ -1532,6 +1602,9 @@ def build_graph(config: AppConfig, project: Project, checkpointer=None):
 
     # After nudge → back to agent to retry with tool calls
     graph.add_edge("nudge", "agent")
+
+    # After planning guard → back to agent with an explicit planning requirement
+    graph.add_edge("planning_guard", "agent")
 
     # After human review → route based on feedback
     graph.add_conditional_edges(

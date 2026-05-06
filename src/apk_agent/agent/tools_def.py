@@ -134,6 +134,117 @@ def _get_task_plan() -> list[dict]:
     return list(get_active_execution_context().task_plan)
 
 
+_TASK_PLAN_STATUS_ALIASES = {
+    "pending": "pending",
+    "todo": "pending",
+    "not-started": "pending",
+    "not_started": "pending",
+    "planned": "pending",
+    "open": "pending",
+    "in_progress": "in_progress",
+    "in-progress": "in_progress",
+    "progress": "in_progress",
+    "doing": "in_progress",
+    "active": "in_progress",
+    "started": "in_progress",
+    "working": "in_progress",
+    "done": "done",
+    "completed": "done",
+    "complete": "done",
+    "finished": "done",
+    "closed": "done",
+}
+
+
+def _normalize_task_plan_status(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return "pending"
+    return _TASK_PLAN_STATUS_ALIASES.get(normalized, "pending")
+
+
+def _normalize_task_plan_items(raw_items: list[Any], *, existing: list[dict] | None = None) -> list[dict]:
+    used_ids: set[int] = set()
+    for item in list(existing or []):
+        if not isinstance(item, dict):
+            continue
+        existing_id = item.get("id")
+        if isinstance(existing_id, int) and existing_id > 0:
+            used_ids.add(existing_id)
+        elif isinstance(existing_id, str) and existing_id.isdigit() and int(existing_id) > 0:
+            used_ids.add(int(existing_id))
+    next_id = max(used_ids, default=0) + 1
+    normalized_items: list[dict] = []
+
+    for raw in raw_items:
+        if isinstance(raw, dict):
+            text = str(
+                raw.get("desc")
+                or raw.get("label")
+                or raw.get("task")
+                or raw.get("title")
+                or ""
+            ).strip()
+            raw_id = raw.get("id")
+            status = _normalize_task_plan_status(str(raw.get("status", "pending")))
+        else:
+            text = str(raw or "").strip()
+            raw_id = None
+            status = "pending"
+
+        if not text:
+            continue
+
+        task_id: int | None = None
+        if isinstance(raw_id, int) and raw_id > 0 and raw_id not in used_ids:
+            task_id = raw_id
+        elif isinstance(raw_id, str) and raw_id.isdigit() and int(raw_id) > 0 and int(raw_id) not in used_ids:
+            task_id = int(raw_id)
+
+        if task_id is None:
+            while next_id in used_ids:
+                next_id += 1
+            task_id = next_id
+
+        used_ids.add(task_id)
+        next_id = max(next_id, task_id + 1)
+        normalized_items.append({
+            "id": task_id,
+            "desc": text,
+            "label": text,
+            "task": text,
+            "status": status,
+        })
+
+    return normalized_items
+
+
+def _task_plan_summary(plan: list[dict]) -> dict[str, int]:
+    return {
+        "total": len(plan),
+        "pending": sum(1 for item in plan if item.get("status") == "pending"),
+        "in_progress": sum(1 for item in plan if item.get("status") == "in_progress"),
+        "done": sum(1 for item in plan if item.get("status") == "done"),
+    }
+
+
+def _find_task_plan_index(plan: list[dict], *, task_id: int = 0, task_text: str = "") -> int:
+    if task_id > 0:
+        for idx, item in enumerate(plan):
+            if int(item.get("id", 0) or 0) == task_id:
+                return idx
+    needle = str(task_text or "").strip().lower()
+    if needle:
+        for idx, item in enumerate(plan):
+            haystack = " ".join(
+                str(item.get(field, ""))
+                for field in ("desc", "label", "task")
+            ).lower()
+            if needle in haystack:
+                return idx
+    return -1
+
+
 @tool
 def update_scratchpad(key: str, value: str = "", mode: str = "set") -> str:
     """Persist free-form working notes, hypotheses, and runtime discoveries.
@@ -185,6 +296,145 @@ def update_scratchpad(key: str, value: str = "", mode: str = "set") -> str:
         }, ensure_ascii=False, indent=2)[:12000]
 
     return _safe_call(_run, "update_scratchpad")
+
+
+@tool
+def update_task_plan(plan_json: str, mode: str = "replace") -> str:
+    """Create or update the durable multi-step task plan.
+
+    Args:
+        plan_json: JSON array of task items, or an object containing
+            `task_plan`, `items`, or `tasks`.
+        mode: `replace`, `append`, or `clear`.
+
+    Returns: JSON with the normalized plan and status counts.
+    """
+    mode = str(mode or "replace").strip().lower()
+
+    def _run():
+        task_plan = get_active_execution_context().task_plan
+
+        if mode == "clear":
+            task_plan.clear()
+            return json.dumps({
+                "success": True,
+                "mode": mode,
+                "task_plan": [],
+                "summary": _task_plan_summary(task_plan),
+            }, ensure_ascii=False, indent=2)
+
+        try:
+            payload = json.loads(plan_json)
+        except json.JSONDecodeError as exc:
+            return json.dumps({"success": False, "error": f"Invalid JSON: {exc}"}, ensure_ascii=False, indent=2)
+
+        if isinstance(payload, list):
+            raw_items = payload
+        elif isinstance(payload, dict):
+            raw_items = payload.get("task_plan") or payload.get("items") or payload.get("tasks") or []
+        else:
+            raw_items = []
+
+        if mode not in {"replace", "append"}:
+            return json.dumps({
+                "success": False,
+                "error": f"Unsupported mode: {mode}",
+                "supported_modes": ["replace", "append", "clear"],
+            }, ensure_ascii=False, indent=2)
+
+        normalized = _normalize_task_plan_items(raw_items, existing=task_plan if mode == "append" else None)
+        if not normalized and raw_items:
+            return json.dumps({
+                "success": False,
+                "error": "No valid task items were found in plan_json.",
+            }, ensure_ascii=False, indent=2)
+
+        if mode == "replace":
+            task_plan.clear()
+        task_plan.extend(normalized)
+
+        return json.dumps({
+            "success": True,
+            "mode": mode,
+            "task_plan": list(task_plan),
+            "summary": _task_plan_summary(task_plan),
+        }, ensure_ascii=False, indent=2)[:16000]
+
+    return _safe_call(_run, "update_task_plan")
+
+
+@tool
+def edit_task_plan(task_id: int = 0, task_text: str = "", new_text: str = "", new_status: str = "", delete: bool = False) -> str:
+    """Edit or delete one task-plan item by id or matching text."""
+
+    def _run():
+        task_plan = get_active_execution_context().task_plan
+        index = _find_task_plan_index(task_plan, task_id=task_id, task_text=task_text)
+        if index < 0:
+            return json.dumps({
+                "success": False,
+                "error": "Task-plan item not found.",
+                "task_id": task_id,
+                "task_text": task_text,
+            }, ensure_ascii=False, indent=2)
+
+        item = dict(task_plan[index])
+        if delete:
+            removed = task_plan.pop(index)
+            return json.dumps({
+                "success": True,
+                "mode": "delete",
+                "removed": removed,
+                "task_plan": list(task_plan),
+                "summary": _task_plan_summary(task_plan),
+            }, ensure_ascii=False, indent=2)[:16000]
+
+        if str(new_text or "").strip():
+            text = str(new_text).strip()
+            item["desc"] = text
+            item["label"] = text
+            item["task"] = text
+        if str(new_status or "").strip():
+            item["status"] = _normalize_task_plan_status(new_status)
+
+        task_plan[index] = item
+        return json.dumps({
+            "success": True,
+            "mode": "edit",
+            "updated": item,
+            "task_plan": list(task_plan),
+            "summary": _task_plan_summary(task_plan),
+        }, ensure_ascii=False, indent=2)[:16000]
+
+    return _safe_call(_run, "edit_task_plan")
+
+
+@tool
+def mark_task_done(task_id: int = 0, task_text: str = "") -> str:
+    """Mark one task-plan item as done by id or matching text."""
+
+    def _run():
+        task_plan = get_active_execution_context().task_plan
+        index = _find_task_plan_index(task_plan, task_id=task_id, task_text=task_text)
+        if index < 0:
+            return json.dumps({
+                "success": False,
+                "error": "Task-plan item not found.",
+                "task_id": task_id,
+                "task_text": task_text,
+            }, ensure_ascii=False, indent=2)
+
+        item = dict(task_plan[index])
+        item["status"] = "done"
+        task_plan[index] = item
+        return json.dumps({
+            "success": True,
+            "updated": item,
+            "task_plan": list(task_plan),
+            "summary": _task_plan_summary(task_plan),
+        }, ensure_ascii=False, indent=2)[:16000]
+
+    return _safe_call(_run, "mark_task_done")
 
 
 def _log_file() -> Path:
@@ -11691,6 +11941,11 @@ ALL_TOOLS = [
     load_evidence,
     search_evidence,
     get_evidence_summary,
+    # Working memory and planning
+    update_task_plan,
+    edit_task_plan,
+    mark_task_done,
+    update_scratchpad,
     # Feature-check mapping
     map_feature_checks,
     analyze_subscription_model,
