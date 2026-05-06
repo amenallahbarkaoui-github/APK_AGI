@@ -15,7 +15,7 @@ import time
 import concurrent.futures
 from contextvars import copy_context
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from langchain_core.tools import tool
 
@@ -12637,6 +12637,7 @@ def plan_runtime_menu_workflow(
 
     def _chain_for_strategy(strategy_name: str, spec_json: str, override_rules_json: str, class_descriptor: str) -> list[dict[str, Any]]:
         overlay_requires_manifest = overlay_mode in {"system_overlay", "hybrid"}
+        default_menu_target_root = "auto"
         menu_chain = [
             _step(
                 1,
@@ -12669,7 +12670,8 @@ def plan_runtime_menu_workflow(
                     "overlay_mode": overlay_mode,
                     "reapply_on_resume": True,
                     "auto_configure_manifest": overlay_requires_manifest,
-                    "require_foreground_service": overlay_mode == "hybrid",
+                    "require_foreground_service": False,
+                    "target_smali_root": default_menu_target_root,
                 },
             ),
             _step(
@@ -12679,7 +12681,7 @@ def plan_runtime_menu_workflow(
                 {
                     "overlay_mode": overlay_mode,
                     "add_overlay_permission": overlay_requires_manifest,
-                    "require_foreground_service": overlay_mode == "hybrid",
+                    "require_foreground_service": False,
                 },
                 when="Only when overlay_mode is system_overlay or hybrid and automatic manifest configuration was disabled or needs manual verification.",
             ),
@@ -12751,7 +12753,8 @@ def plan_runtime_menu_workflow(
                         "overlay_mode": overlay_mode,
                         "reapply_on_resume": True,
                         "auto_configure_manifest": overlay_requires_manifest,
-                        "require_foreground_service": overlay_mode == "hybrid",
+                        "require_foreground_service": False,
+                        "target_smali_root": default_menu_target_root,
                     },
                 ),
                 _step(
@@ -12761,7 +12764,7 @@ def plan_runtime_menu_workflow(
                     {
                         "overlay_mode": overlay_mode,
                         "add_overlay_permission": overlay_requires_manifest,
-                        "require_foreground_service": overlay_mode == "hybrid",
+                        "require_foreground_service": False,
                     },
                     when="Only when overlay_mode is system_overlay or hybrid and automatic manifest configuration was disabled or needs manual verification.",
                 ),
@@ -12834,7 +12837,8 @@ def plan_runtime_menu_workflow(
                     "overlay_mode": overlay_mode,
                     "reapply_on_resume": True,
                     "auto_configure_manifest": overlay_mode in {"system_overlay", "hybrid"},
-                    "require_foreground_service": overlay_mode == "hybrid",
+                    "require_foreground_service": False,
+                    "target_smali_root": "auto",
                 }
             return "draft_runtime_menu_from_hooks", {
                 "focus_hint": focus_hint,
@@ -12857,6 +12861,22 @@ def plan_runtime_menu_workflow(
         return "frida_script_generator", {
             "class_descriptor": class_descriptor or "<choose dynamic/native boundary class>",
         }
+
+    def _draft_binding_counts(draft: Mapping[str, Any]) -> tuple[int, int]:
+        resolved_count = int(draft.get("resolved_bindings", 0) or 0)
+        binding_items = list(draft.get("binding_hints") or []) or list(draft.get("unsupported_bindings") or [])
+        provisional_statuses = {
+            "unknown_without_index",
+            "deferred_lookup_target",
+            "reflection_target",
+            "unsupported_target",
+        }
+        provisional_count = sum(
+            1
+            for item in binding_items
+            if str(item.get("binding_status") or "") in provisional_statuses
+        )
+        return resolved_count, provisional_count
 
     def _run():
         default_tool_chain = _chain_for_strategy(PatchStrategy.RUNTIME_MENU_GOOD_FIT.value, "", "", class_name)
@@ -12941,6 +12961,15 @@ def plan_runtime_menu_workflow(
         buttons = list(spec.get("buttons") or [])
         unsupported = list(draft.get("unsupported_bindings") or [])
         class_descriptor = _first_hook_class(hook_plan)
+        resolved_binding_count, provisional_binding_count = _draft_binding_counts(draft)
+        routing_summary["runtime_menu_binding_ready_candidate_count"] = max(
+            int(routing_summary.get("runtime_menu_binding_ready_candidate_count", 0) or 0),
+            resolved_binding_count,
+        )
+        routing_summary["runtime_menu_provisional_candidate_count"] = max(
+            int(routing_summary.get("runtime_menu_provisional_candidate_count", 0) or 0),
+            provisional_binding_count,
+        )
         recommended_next_strategy = finalize_runtime_hook_strategy_recommendation(
             routing_summary,
             resolved_menu_bindings=int(draft.get("resolved_bindings", 0) or 0),
@@ -12987,11 +13016,11 @@ def plan_runtime_menu_workflow(
                 "runtime_menu_candidate_count": routing_summary.get("runtime_menu_candidate_count", len(menu_hooks)),
                 "runtime_menu_binding_ready_candidate_count": routing_summary.get(
                     "runtime_menu_binding_ready_candidate_count",
-                    int(draft.get("resolved_bindings", 0) or 0),
+                    resolved_binding_count,
                 ),
                 "runtime_menu_provisional_candidate_count": routing_summary.get(
                     "runtime_menu_provisional_candidate_count",
-                    0,
+                    provisional_binding_count,
                 ),
                 "runtime_override_candidate_count": routing_summary.get("runtime_override_candidate_count", len(runtime_override_hooks)),
                 "static_patch_candidate_count": routing_summary.get("static_patch_candidate_count", len(static_patch_hooks)),
@@ -13022,6 +13051,7 @@ def plan_runtime_menu_workflow(
                 "The floating menu draft now filters to hooks routed as runtime_menu_good_fit or hybrid_required instead of assuming every runtime hook belongs in the menu.",
                 "Menu is recommended only after routing or the generated draft proves a real binding path; provisional menu hooks otherwise fall back to override or static lanes.",
                 "When the draft contains persistent menu actions, override_rules_json now contains executable runtime override rules instead of placeholder text.",
+                "Runtime-menu helper placement now defaults to dex-aware auto selection; set target_smali_root explicitly only when you intentionally want a specific smali_classesN root.",
                 "Edit or extend spec_json before injection if you want extra manual buttons, sections, or shared_pref/static_field actions.",
                 "Run configure_runtime_menu_manifest only when the final mode actually needs overlay/service permissions.",
             ],
@@ -13187,6 +13217,22 @@ def draft_runtime_menu_from_hooks(
     from apk_agent.tools.runtime_menu import build_runtime_menu_spec_from_hook_plan as _build_runtime_menu_spec_from_hook_plan
     from apk_agent.tools.runtime_override import build_runtime_override_rules_from_menu_spec as _build_runtime_override_rules_from_menu_spec
 
+    def _draft_binding_counts(draft: Mapping[str, Any]) -> tuple[int, int]:
+        resolved_count = int(draft.get("resolved_bindings", 0) or 0)
+        binding_items = list(draft.get("binding_hints") or []) or list(draft.get("unsupported_bindings") or [])
+        provisional_statuses = {
+            "unknown_without_index",
+            "deferred_lookup_target",
+            "reflection_target",
+            "unsupported_target",
+        }
+        provisional_count = sum(
+            1
+            for item in binding_items
+            if str(item.get("binding_status") or "") in provisional_statuses
+        )
+        return resolved_count, provisional_count
+
     def _run():
         pack = _ensure_behavior_graph_pack(auto_build=False, focus_hint=focus_hint or class_name)
         if pack is None:
@@ -13245,7 +13291,17 @@ def draft_runtime_menu_from_hooks(
         override_rules = _build_runtime_override_rules_from_menu_spec(draft.get("spec") or {})
         draft["override_rule_count"] = len(override_rules)
         draft["override_rules_json"] = json.dumps(override_rules, ensure_ascii=False, indent=2) if override_rules else ""
-        draft["routing_summary"] = plan.get("routing_summary", {})
+        routing_summary = dict(plan.get("routing_summary") or {})
+        resolved_binding_count, provisional_binding_count = _draft_binding_counts(draft)
+        routing_summary["runtime_menu_binding_ready_candidate_count"] = max(
+            int(routing_summary.get("runtime_menu_binding_ready_candidate_count", 0) or 0),
+            resolved_binding_count,
+        )
+        routing_summary["runtime_menu_provisional_candidate_count"] = max(
+            int(routing_summary.get("runtime_menu_provisional_candidate_count", 0) or 0),
+            provisional_binding_count,
+        )
+        draft["routing_summary"] = routing_summary
         draft["recommended_next_strategy"] = finalize_runtime_hook_strategy_recommendation(
             draft["routing_summary"],
             resolved_menu_bindings=int(draft.get("resolved_bindings", 0) or 0),
@@ -13257,7 +13313,8 @@ def draft_runtime_menu_from_hooks(
                 "overlay_mode": overlay_mode,
                 "reapply_on_resume": True,
                 "auto_configure_manifest": overlay_mode in {"system_overlay", "hybrid"},
-                "require_foreground_service": overlay_mode == "hybrid",
+                "require_foreground_service": False,
+                "target_smali_root": "auto",
             }
         elif draft["recommended_next_strategy"] in {
             PatchStrategy.RUNTIME_OVERRIDE_GOOD_FIT.value,

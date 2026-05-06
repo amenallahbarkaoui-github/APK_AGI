@@ -120,6 +120,11 @@ def _helper_file_path(apktool_dir: Path, relative_name: str, *, target_smali_roo
     return apktool_dir / target_smali_root / "apkagi" / "menu" / relative_name
 
 
+def _owning_smali_root_name(apktool_dir: Path, path: Path) -> str:
+    rel = path.resolve().relative_to(apktool_dir.resolve())
+    return normalize_smali_root_name(str(rel.parts[0]))
+
+
 def _normalize_custom_helper_files(raw_files: Any) -> dict[str, str]:
     if raw_files in (None, ""):
         return {}
@@ -197,18 +202,31 @@ def _validate_method_descriptor(descriptor: str) -> tuple[bool, str]:
     return True, ""
 
 
-def _validate_dispatcher_method_descriptor(descriptor: str, ui_kind: str) -> tuple[bool, str]:
-    patterns = {
-        "button": re.compile(r"^L[^;]+;->[\w$<>-]+\((?:|Landroid/content/Context;)\)V$"),
-        "toggle": re.compile(r"^L[^;]+;->[\w$<>-]+\((?:Z|Landroid/content/Context;Z)\)V$"),
-        "slider": re.compile(r"^L[^;]+;->[\w$<>-]+\((?:I|Landroid/content/Context;I)\)V$"),
+def _parse_method_descriptor(descriptor: str) -> dict[str, Any] | None:
+    match = re.match(r"^(L[^;]+;)->([\w$<>-]+)\((.*?)\)(\S+)$", str(descriptor or "").strip())
+    if not match:
+        return None
+    return {
+        "class_descriptor": match.group(1),
+        "method_name": match.group(2),
+        "params_blob": match.group(3),
+        "param_types": _smali_param_descriptors(match.group(3)),
+        "return_type": match.group(4),
     }
-    if patterns[ui_kind].match(descriptor):
-        return True, ""
+
+
+def _validate_dispatcher_method_descriptor(descriptor: str, ui_kind: str) -> tuple[bool, str]:
+    parsed = _parse_method_descriptor(descriptor)
+    if parsed is not None and str(parsed.get("return_type") or "") == "V":
+        param_types = list(parsed.get("param_types") or [])
+        direct_ui_kind = _ui_kind_for_params(param_types, allow_reflective=False)
+        reflective_ui_kind = _ui_kind_for_params(param_types, allow_reflective=True)
+        if direct_ui_kind == ui_kind or reflective_ui_kind == ui_kind:
+            return True, ""
     expected = {
         "button": "()V or (Landroid/content/Context;)V",
-        "toggle": "(Z)V or (Landroid/content/Context;Z)V",
-        "slider": "(I)V or (Landroid/content/Context;I)V",
+        "toggle": "(Z)V, (Landroid/content/Context;Z)V, (Ljava/lang/Boolean;)V, or (Landroid/content/Context;Ljava/lang/Boolean;)V",
+        "slider": "(I)V, (Landroid/content/Context;I)V, (Ljava/lang/Integer;)V, (Landroid/content/Context;Ljava/lang/Integer;)V, (J)V, (Landroid/content/Context;J)V, (Ljava/lang/Long;)V, or (Landroid/content/Context;Ljava/lang/Long;)V",
     }
     return False, (
         f"dispatcher method_descriptor for {ui_kind} controls must be a static void descriptor with "
@@ -216,11 +234,92 @@ def _validate_dispatcher_method_descriptor(descriptor: str, ui_kind: str) -> tup
     )
 
 
+def _build_manual_dispatcher_binding(descriptor: str, ui_kind: str, *, binding_name: str) -> dict[str, Any] | None:
+    parsed = _parse_method_descriptor(descriptor)
+    if parsed is None or str(parsed.get("return_type") or "") != "V":
+        return None
+
+    param_types = list(parsed.get("param_types") or [])
+    direct_ui_kind = _ui_kind_for_params(param_types, allow_reflective=False)
+    reflective_ui_kind = _ui_kind_for_params(param_types, allow_reflective=True)
+    if direct_ui_kind != ui_kind and reflective_ui_kind != ui_kind:
+        return None
+
+    binding_mode = "direct_static" if direct_ui_kind == ui_kind else "reflect_exact"
+    binding_status = "resolved_static_target" if binding_mode == "direct_static" else "reflection_target"
+    wrapper_params = _wrapper_params_for_ui_kind(ui_kind)
+    class_descriptor = str(parsed.get("class_descriptor") or "")
+    binding: dict[str, Any] = {
+        "success": True,
+        "binding_status": binding_status,
+        "binding_mode": binding_mode,
+        "ui_kind": ui_kind,
+        "wrapper_method_descriptor": f"{_HOOK_BINDINGS_DESCRIPTOR}->{binding_name}({wrapper_params})V",
+        "target_method_descriptor": descriptor,
+        "target_param_types": param_types,
+        "target_is_static": True,
+        "target_java_class": _java_class_name(class_descriptor),
+        "hook_target_class": class_descriptor,
+        "hook_target_method": str(parsed.get("method_name") or ""),
+        "persist_on_resume": False,
+    }
+    if binding_mode == "reflect_exact":
+        binding["adaptive_mode"] = _adaptive_mode_for_signature(ui_kind, param_types)
+    return binding
+
+
+def _attach_manual_dispatcher_bindings(
+    buttons: list[dict[str, Any]],
+    existing_bindings: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    bindings = list(existing_bindings)
+    known_wrappers = {
+        str(binding.get("wrapper_method_descriptor") or "").strip()
+        for binding in bindings
+        if isinstance(binding, dict)
+    }
+    manual_index = 1
+
+    for button in buttons:
+        if str(button.get("kind") or "") != "dispatcher":
+            continue
+        descriptor = str(button.get("method_descriptor") or "").strip()
+        parsed = _parse_method_descriptor(descriptor)
+        if parsed is None:
+            continue
+        if str(parsed.get("class_descriptor") or "") == _HOOK_BINDINGS_DESCRIPTOR:
+            continue
+        param_types = list(parsed.get("param_types") or [])
+        if _ui_kind_for_params(param_types, allow_reflective=False) == str(button.get("ui_kind") or "button"):
+            continue
+
+        while True:
+            binding_name = f"manual_hook_{manual_index}"
+            wrapper_descriptor = f"{_HOOK_BINDINGS_DESCRIPTOR}->{binding_name}({_wrapper_params_for_ui_kind(str(button.get('ui_kind') or 'button'))})V"
+            if wrapper_descriptor not in known_wrappers:
+                break
+            manual_index += 1
+
+        binding = _build_manual_dispatcher_binding(descriptor, str(button.get("ui_kind") or "button"), binding_name=binding_name)
+        if binding is None:
+            continue
+        button["method_descriptor"] = str(binding["wrapper_method_descriptor"])
+        bindings.append(binding)
+        known_wrappers.add(str(binding["wrapper_method_descriptor"]))
+        manual_index += 1
+
+    return bindings
+
+
 def _coerce_int(raw_value: Any, *, field_name: str, index: int) -> int:
     try:
         return int(raw_value)
     except Exception as exc:  # pragma: no cover - defensive normalization path
         raise ValueError(f"buttons[{index}] {field_name} must be an integer") from exc
+
+
+def _default_persist_for_action(kind: str, *, spec_default: bool) -> bool:
+    return spec_default if kind == "shared_pref" else False
 
 
 def _normalize_action(raw_action: dict[str, Any], index: int, default_persist: bool) -> dict[str, Any]:
@@ -245,13 +344,18 @@ def _normalize_action(raw_action: dict[str, Any], index: int, default_persist: b
     if not action_id:
         action_id = _slugify(label, fallback=f"action_{index + 1}")
 
+    persist_on_resume = raw_action.get(
+        "persist_on_resume",
+        _default_persist_for_action(kind, spec_default=default_persist),
+    )
+
     normalized: dict[str, Any] = {
         "id": action_id,
         "label": label,
         "ui_kind": ui_kind,
         "kind": kind,
         "section": str(raw_action.get("section") or raw_action.get("group") or "").strip(),
-        "persist_on_resume": bool(raw_action.get("persist_on_resume", default_persist)),
+        "persist_on_resume": bool(persist_on_resume),
         "success_message": str(raw_action.get("success_message") or f"Applied: {label}").strip(),
     }
 
@@ -361,7 +465,7 @@ def _normalize_menu_spec(spec: dict[str, Any], overlay_mode: str) -> dict[str, A
     launcher_label = str(spec.get("launcher_label") or spec.get("floating_icon_label") or spec.get("bubble_label") or "MOD").strip() or "MOD"
     start_collapsed = bool(spec.get("start_collapsed", False))
     target_smali_root = normalize_smali_root_name(
-        spec.get("target_smali_root") or spec.get("helper_smali_root") or spec.get("target_dex_root") or "smali"
+        spec.get("target_smali_root") or spec.get("helper_smali_root") or spec.get("target_dex_root") or "auto"
     )
     normalized_buttons = [
         _normalize_action(raw_action, idx, default_persist)
@@ -371,6 +475,11 @@ def _normalize_menu_spec(spec: dict[str, Any], overlay_mode: str) -> dict[str, A
     ids = [button["id"] for button in normalized_buttons]
     if len(set(ids)) != len(ids):
         raise ValueError("button ids must be unique within the runtime menu spec")
+
+    hook_bindings = _attach_manual_dispatcher_bindings(
+        normalized_buttons,
+        [binding for binding in list(spec.get("hook_bindings") or []) if isinstance(binding, dict)],
+    )
 
     has_persistent = any(button.get("persist_on_resume") for button in normalized_buttons)
     if has_persistent:
@@ -390,7 +499,7 @@ def _normalize_menu_spec(spec: dict[str, Any], overlay_mode: str) -> dict[str, A
         "start_collapsed": start_collapsed,
         "target_smali_root": target_smali_root,
         "buttons": normalized_buttons,
-        "hook_bindings": list(spec.get("hook_bindings") or []),
+        "hook_bindings": hook_bindings,
         "custom_helper_files": custom_helper_files,
         "include_default_helpers": include_default_helpers,
         "user_buttons": len(buttons_raw),
@@ -584,7 +693,7 @@ def _build_binding_from_candidate(
         "hook_smali_file": str(smali_file),
         "hook_target_class": class_descriptor,
         "hook_target_method": str(candidate.get("method_name") or ""),
-        "persist_on_resume": ui_kind in {"toggle", "slider"},
+        "persist_on_resume": False,
     }
     if binding_status == "reflection_target":
         binding["adaptive_mode"] = _adaptive_mode_for_signature(ui_kind, target_param_types)
@@ -613,7 +722,7 @@ def _build_deferred_binding(class_descriptor: str, method_query: str, *, index: 
         "target_java_class": _java_class_name(class_descriptor),
         "hook_target_class": class_descriptor,
         "hook_target_method": _extract_method_name(method_query),
-        "persist_on_resume": ui_kind in {"toggle", "slider"},
+        "persist_on_resume": False,
     }
     if ui_kind == "slider":
         binding.update({"min_value": 0, "max_value": 10, "initial_value": 1})
@@ -1657,12 +1766,12 @@ def _generate_actions_smali(spec: dict[str, Any]) -> str:
                 "    move-result v1",
                 f"    if-eqz v1, {next_label}",
             ])
+            click_lines.extend(_button_action_lines(action))
             if action.get("persist_on_resume"):
                 click_lines.extend([
                     "    const/4 v2, 0x1",
                     "    invoke-static {p0, v0, v2}, Lapkagi/menu/MenuActions;->setEnabled(Landroid/content/Context;Ljava/lang/String;Z)V",
                 ])
-            click_lines.extend(_button_action_lines(action))
             click_lines.extend([
                 f'    const-string v0, "{_escape_smali_string(action.get("success_message") or action["label"])}"',
                 "    invoke-static {p0, v0}, Lapkagi/menu/MenuActions;->toast(Landroid/content/Context;Ljava/lang/String;)V",
@@ -1690,12 +1799,12 @@ def _generate_actions_smali(spec: dict[str, Any]) -> str:
                 "    move-result v1",
                 f"    if-eqz v1, {next_label}",
             ])
+            toggle_lines.extend(_toggle_action_lines(action, "p2"))
             if action.get("persist_on_resume"):
                 toggle_lines.extend([
                     f'    const-string v0, "{_escape_smali_string(_toggle_state_key(action))}"',
                     "    invoke-static {p0, v0, p2}, Lapkagi/menu/MenuActions;->setToggleState(Landroid/content/Context;Ljava/lang/String;Z)V",
                 ])
-            toggle_lines.extend(_toggle_action_lines(action, "p2"))
             toggle_lines.extend([
                 f"    if-eqz p2, :apkagi_toggle_disabled_{index}",
                 f'    const-string v0, "{_escape_smali_string(action.get("enabled_message") or action["label"])}"',
@@ -1731,12 +1840,12 @@ def _generate_actions_smali(spec: dict[str, Any]) -> str:
             "    move-result v1",
             f"    if-eqz v1, {next_label}",
         ])
+        slider_lines.extend(_slider_action_lines(action, "p2"))
         if action.get("persist_on_resume"):
             slider_lines.extend([
                 f'    const-string v0, "{_escape_smali_string(_slider_state_key(action))}"',
                 "    invoke-static {p0, v0, p2}, Lapkagi/menu/MenuActions;->setSliderState(Landroid/content/Context;Ljava/lang/String;I)V",
             ])
-        slider_lines.extend(_slider_action_lines(action, "p2"))
         slider_lines.extend([
             f'    const-string v0, "{_escape_smali_string(action.get("success_message") or action["label"])}"',
             "    invoke-static {p0, v0}, Lapkagi/menu/MenuActions;->toast(Landroid/content/Context;Ljava/lang/String;)V",
@@ -1959,14 +2068,23 @@ def _generate_actions_smali(spec: dict[str, Any]) -> str:
         "",
         ".method public static toast(Landroid/content/Context;Ljava/lang/String;)V",
         "    .locals 2",
+        "    if-eqz p0, :apkagi_toast_done",
+        "    if-eqz p1, :apkagi_toast_done",
+        "    :apkagi_toast_try_start",
         "    const/4 v0, 0x0",
         "    invoke-static {p0, p1, v0}, Landroid/widget/Toast;->makeText(Landroid/content/Context;Ljava/lang/CharSequence;I)Landroid/widget/Toast;",
         "    move-result-object v0",
         "    invoke-virtual {v0}, Landroid/widget/Toast;->show()V",
+        "    :apkagi_toast_try_end",
+        "    goto :apkagi_toast_done",
+        "    .catch Ljava/lang/Throwable; {:apkagi_toast_try_start .. :apkagi_toast_try_end} :apkagi_toast_catch",
+        ":apkagi_toast_catch",
+        "    move-exception v1",
+        ":apkagi_toast_done",
         "    return-void",
         ".end method",
         "",
-        ".method public static reapplyEnabled(Landroid/content/Context;)V",
+        ".method private static reapplyEnabledUnsafe(Landroid/content/Context;)V",
         "    .locals 8",
         "    if-eqz p0, :apkagi_reapply_done",
         *reapply_lines,
@@ -1974,7 +2092,21 @@ def _generate_actions_smali(spec: dict[str, Any]) -> str:
         "    return-void",
         ".end method",
         "",
-        ".method public static dispatchClick(Landroid/content/Context;Ljava/lang/String;)V",
+        ".method public static reapplyEnabled(Landroid/content/Context;)V",
+        "    .locals 1",
+        "    :apkagi_reapply_try_start",
+        "    invoke-static {p0}, Lapkagi/menu/MenuActions;->reapplyEnabledUnsafe(Landroid/content/Context;)V",
+        "    :apkagi_reapply_try_end",
+        "    goto :apkagi_reapply_wrapper_done",
+        "    .catch Ljava/lang/Throwable; {:apkagi_reapply_try_start .. :apkagi_reapply_try_end} :apkagi_reapply_catch",
+        ":apkagi_reapply_catch",
+        "    move-exception v0",
+        "    invoke-static {p0}, Lapkagi/menu/MenuActions;->resetControls(Landroid/content/Context;)V",
+        ":apkagi_reapply_wrapper_done",
+        "    return-void",
+        ".end method",
+        "",
+        ".method private static dispatchClickUnsafe(Landroid/content/Context;Ljava/lang/String;)V",
         "    .locals 8",
         "    if-eqz p0, :apkagi_apply_done",
         "    if-eqz p1, :apkagi_apply_done",
@@ -1983,7 +2115,22 @@ def _generate_actions_smali(spec: dict[str, Any]) -> str:
         "    return-void",
         ".end method",
         "",
-        ".method public static dispatchToggle(Landroid/content/Context;Ljava/lang/String;Z)V",
+        ".method public static dispatchClick(Landroid/content/Context;Ljava/lang/String;)V",
+        "    .locals 2",
+        "    :apkagi_dispatch_click_try_start",
+        "    invoke-static {p0, p1}, Lapkagi/menu/MenuActions;->dispatchClickUnsafe(Landroid/content/Context;Ljava/lang/String;)V",
+        "    :apkagi_dispatch_click_try_end",
+        "    goto :apkagi_dispatch_click_done",
+        "    .catch Ljava/lang/Throwable; {:apkagi_dispatch_click_try_start .. :apkagi_dispatch_click_try_end} :apkagi_dispatch_click_catch",
+        ":apkagi_dispatch_click_catch",
+        "    move-exception v0",
+        "    const-string v1, \"Menu action failed\"",
+        "    invoke-static {p0, v1}, Lapkagi/menu/MenuActions;->toast(Landroid/content/Context;Ljava/lang/String;)V",
+        ":apkagi_dispatch_click_done",
+        "    return-void",
+        ".end method",
+        "",
+        ".method private static dispatchToggleUnsafe(Landroid/content/Context;Ljava/lang/String;Z)V",
         "    .locals 6",
         "    if-eqz p0, :apkagi_toggle_done",
         "    if-eqz p1, :apkagi_toggle_done",
@@ -1992,12 +2139,42 @@ def _generate_actions_smali(spec: dict[str, Any]) -> str:
         "    return-void",
         ".end method",
         "",
-        ".method public static dispatchSlider(Landroid/content/Context;Ljava/lang/String;I)V",
+        ".method public static dispatchToggle(Landroid/content/Context;Ljava/lang/String;Z)V",
+        "    .locals 2",
+        "    :apkagi_dispatch_toggle_try_start",
+        "    invoke-static {p0, p1, p2}, Lapkagi/menu/MenuActions;->dispatchToggleUnsafe(Landroid/content/Context;Ljava/lang/String;Z)V",
+        "    :apkagi_dispatch_toggle_try_end",
+        "    goto :apkagi_dispatch_toggle_done",
+        "    .catch Ljava/lang/Throwable; {:apkagi_dispatch_toggle_try_start .. :apkagi_dispatch_toggle_try_end} :apkagi_dispatch_toggle_catch",
+        ":apkagi_dispatch_toggle_catch",
+        "    move-exception v0",
+        "    const-string v1, \"Menu toggle failed\"",
+        "    invoke-static {p0, v1}, Lapkagi/menu/MenuActions;->toast(Landroid/content/Context;Ljava/lang/String;)V",
+        ":apkagi_dispatch_toggle_done",
+        "    return-void",
+        ".end method",
+        "",
+        ".method private static dispatchSliderUnsafe(Landroid/content/Context;Ljava/lang/String;I)V",
         "    .locals 6",
         "    if-eqz p0, :apkagi_slider_done",
         "    if-eqz p1, :apkagi_slider_done",
         *slider_lines,
         ":apkagi_slider_done",
+        "    return-void",
+        ".end method",
+        "",
+        ".method public static dispatchSlider(Landroid/content/Context;Ljava/lang/String;I)V",
+        "    .locals 2",
+        "    :apkagi_dispatch_slider_try_start",
+        "    invoke-static {p0, p1, p2}, Lapkagi/menu/MenuActions;->dispatchSliderUnsafe(Landroid/content/Context;Ljava/lang/String;I)V",
+        "    :apkagi_dispatch_slider_try_end",
+        "    goto :apkagi_dispatch_slider_done",
+        "    .catch Ljava/lang/Throwable; {:apkagi_dispatch_slider_try_start .. :apkagi_dispatch_slider_try_end} :apkagi_dispatch_slider_catch",
+        ":apkagi_dispatch_slider_catch",
+        "    move-exception v0",
+        "    const-string v1, \"Menu slider failed\"",
+        "    invoke-static {p0, v1}, Lapkagi/menu/MenuActions;->toast(Landroid/content/Context;Ljava/lang/String;)V",
+        ":apkagi_dispatch_slider_done",
         "    return-void",
         ".end method",
         "",
@@ -2023,9 +2200,7 @@ def _generate_click_listener_smali() -> str:
         ".method public constructor <init>(Landroid/content/Context;Ljava/lang/String;)V",
         "    .locals 1",
         "    invoke-direct {p0}, Ljava/lang/Object;-><init>()V",
-        "    invoke-virtual {p1}, Landroid/content/Context;->getApplicationContext()Landroid/content/Context;",
-        "    move-result-object v0",
-        "    iput-object v0, p0, Lapkagi/menu/MenuActionClickListener;->appContext:Landroid/content/Context;",
+        "    iput-object p1, p0, Lapkagi/menu/MenuActionClickListener;->appContext:Landroid/content/Context;",
         "    iput-object p2, p0, Lapkagi/menu/MenuActionClickListener;->actionId:Ljava/lang/String;",
         "    return-void",
         ".end method",
@@ -2056,9 +2231,7 @@ def _generate_visibility_listener_smali() -> str:
         ".method public constructor <init>(Landroid/content/Context;Landroid/view/View;Landroid/view/View;I)V",
         "    .locals 1",
         "    invoke-direct {p0}, Ljava/lang/Object;-><init>()V",
-        "    invoke-virtual {p1}, Landroid/content/Context;->getApplicationContext()Landroid/content/Context;",
-        "    move-result-object v0",
-        "    iput-object v0, p0, Lapkagi/menu/MenuVisibilityClickListener;->appContext:Landroid/content/Context;",
+        "    iput-object p1, p0, Lapkagi/menu/MenuVisibilityClickListener;->appContext:Landroid/content/Context;",
         "    iput-object p2, p0, Lapkagi/menu/MenuVisibilityClickListener;->panelView:Landroid/view/View;",
         "    iput-object p3, p0, Lapkagi/menu/MenuVisibilityClickListener;->launcherView:Landroid/view/View;",
         "    iput p4, p0, Lapkagi/menu/MenuVisibilityClickListener;->panelVisibility:I",
@@ -2109,9 +2282,7 @@ def _generate_toggle_listener_smali() -> str:
         ".method public constructor <init>(Landroid/content/Context;Ljava/lang/String;)V",
         "    .locals 1",
         "    invoke-direct {p0}, Ljava/lang/Object;-><init>()V",
-        "    invoke-virtual {p1}, Landroid/content/Context;->getApplicationContext()Landroid/content/Context;",
-        "    move-result-object v0",
-        "    iput-object v0, p0, Lapkagi/menu/MenuToggleCheckedChangeListener;->appContext:Landroid/content/Context;",
+        "    iput-object p1, p0, Lapkagi/menu/MenuToggleCheckedChangeListener;->appContext:Landroid/content/Context;",
         "    iput-object p2, p0, Lapkagi/menu/MenuToggleCheckedChangeListener;->actionId:Ljava/lang/String;",
         "    return-void",
         ".end method",
@@ -2141,9 +2312,7 @@ def _generate_slider_listener_smali() -> str:
         ".method public constructor <init>(Landroid/content/Context;Ljava/lang/String;I)V",
         "    .locals 1",
         "    invoke-direct {p0}, Ljava/lang/Object;-><init>()V",
-        "    invoke-virtual {p1}, Landroid/content/Context;->getApplicationContext()Landroid/content/Context;",
-        "    move-result-object v0",
-        "    iput-object v0, p0, Lapkagi/menu/MenuSliderChangeListener;->appContext:Landroid/content/Context;",
+        "    iput-object p1, p0, Lapkagi/menu/MenuSliderChangeListener;->appContext:Landroid/content/Context;",
         "    iput-object p2, p0, Lapkagi/menu/MenuSliderChangeListener;->actionId:Ljava/lang/String;",
         "    iput p3, p0, Lapkagi/menu/MenuSliderChangeListener;->minValue:I",
         "    return-void",
@@ -2191,9 +2360,7 @@ def _generate_panel_drag_listener_smali() -> str:
         ".method public constructor <init>(Landroid/content/Context;Landroid/view/View;)V",
         "    .locals 1",
         "    invoke-direct {p0}, Ljava/lang/Object;-><init>()V",
-        "    invoke-virtual {p1}, Landroid/content/Context;->getApplicationContext()Landroid/content/Context;",
-        "    move-result-object v0",
-        "    iput-object v0, p0, Lapkagi/menu/MenuPanelDragTouchListener;->appContext:Landroid/content/Context;",
+        "    iput-object p1, p0, Lapkagi/menu/MenuPanelDragTouchListener;->appContext:Landroid/content/Context;",
         "    iput-object p2, p0, Lapkagi/menu/MenuPanelDragTouchListener;->targetView:Landroid/view/View;",
         "    return-void",
         ".end method",
@@ -2519,8 +2686,9 @@ def _generate_bridge_smali(spec: dict[str, Any]) -> str:
 
     install_lines: list[str] = [
         "    if-eqz p0, :apkagi_install_done",
-        "    invoke-static {p0}, Lapkagi/menu/MenuActions;->reapplyEnabled(Landroid/content/Context;)V",
     ]
+    if not include_in_app:
+        install_lines.append("    invoke-static {p0}, Lapkagi/menu/MenuActions;->reapplyEnabled(Landroid/content/Context;)V")
     if include_system_overlay:
         install_lines.append("    invoke-static {p0}, Lapkagi/menu/InAppMenuBridge;->ensureSystemOverlay(Landroid/content/Context;)V")
     if include_in_app:
@@ -2553,6 +2721,19 @@ def _generate_bridge_smali(spec: dict[str, Any]) -> str:
         ".end method",
         "",
         ".method public static install(Landroid/content/Context;)V",
+        "    .locals 1",
+        "    :apkagi_install_try_start",
+        "    invoke-static {p0}, Lapkagi/menu/InAppMenuBridge;->installUnsafe(Landroid/content/Context;)V",
+        "    :apkagi_install_try_end",
+        "    goto :apkagi_install_wrapper_done",
+        "    .catch Ljava/lang/Throwable; {:apkagi_install_try_start .. :apkagi_install_try_end} :apkagi_install_catch",
+        ":apkagi_install_catch",
+        "    move-exception v0",
+        ":apkagi_install_wrapper_done",
+        "    return-void",
+        ".end method",
+        "",
+        ".method private static installUnsafe(Landroid/content/Context;)V",
         "    .locals 3",
         *install_lines,
         ":apkagi_install_done",
@@ -2560,6 +2741,19 @@ def _generate_bridge_smali(spec: dict[str, Any]) -> str:
         ".end method",
         "",
         ".method public static attach(Landroid/app/Activity;)V",
+        "    .locals 1",
+        "    :apkagi_attach_try_start",
+        "    invoke-static {p0}, Lapkagi/menu/InAppMenuBridge;->attachUnsafe(Landroid/app/Activity;)V",
+        "    :apkagi_attach_try_end",
+        "    goto :apkagi_attach_wrapper_done",
+        "    .catch Ljava/lang/Throwable; {:apkagi_attach_try_start .. :apkagi_attach_try_end} :apkagi_attach_catch",
+        ":apkagi_attach_catch",
+        "    move-exception v0",
+        ":apkagi_attach_wrapper_done",
+        "    return-void",
+        ".end method",
+        "",
+        ".method private static attachUnsafe(Landroid/app/Activity;)V",
         "    .locals 15",
         "    if-eqz p0, :apkagi_attach_done",
         "    invoke-static {p0}, Lapkagi/menu/MenuActions;->reapplyEnabled(Landroid/content/Context;)V",
@@ -3019,7 +3213,7 @@ def inject_runtime_menu_scaffold(
     include_default_helpers = bool(normalized_spec.get("include_default_helpers", True))
     custom_helper_files = dict(normalized_spec.get("custom_helper_files") or {})
     requested_target_smali_root = normalize_smali_root_name(
-        target_smali_root or normalized_spec.get("target_smali_root") or "smali"
+        target_smali_root or normalized_spec.get("target_smali_root") or "auto"
     )
 
     helper_files: dict[str, str] = {}
@@ -3044,6 +3238,12 @@ def inject_runtime_menu_scaffold(
             helper_files["OverlayMenuDragTouchListener.smali"] = _generate_overlay_drag_listener_smali()
     helper_files.update(custom_helper_files)
 
+    manifest_path = apktool_dir / "AndroidManifest.xml"
+    entry = find_startup_entry(str(manifest_path), str(apktool_dir))
+    startup_entry_root = ""
+    if entry.get("success") and entry.get("smali_file"):
+        startup_entry_root = _owning_smali_root_name(apktool_dir, Path(str(entry["smali_file"])))
+
     resolved_target_smali_root = requested_target_smali_root
     injection_plan: dict[str, Any] = {}
     if requested_target_smali_root == "auto":
@@ -3053,6 +3253,8 @@ def inject_runtime_menu_scaffold(
             purpose="runtime_scaffold",
         )
         resolved_target_smali_root = str(injection_plan.get("recommended_root") or "smali")
+        if startup_entry_root:
+            resolved_target_smali_root = startup_entry_root
 
     manifest_auto_configured = False
     manifest_followup_required = requested_mode in {"system_overlay", "hybrid"} and not auto_configure_manifest
@@ -3095,6 +3297,7 @@ def inject_runtime_menu_scaffold(
                 "Dry run only: no smali files or bootstrap hooks were written.",
                 "The current implementation generates a floating launcher bubble, remembered open/close state, section headers, and direct dispatcher bindings for runtime hooks.",
                 "custom_helper_files can override generated helpers or replace the whole helper set when include_default_helpers=false.",
+                "When target_smali_root is omitted, helper placement stays dex-aware but startup-bootstrapped helpers are co-located with the resolved startup entry root to avoid early launch class-loading crashes.",
                 "Overlay-based modes expect manifest/service wiring as part of a successful deployment path.",
                 "Foreground-service wiring stays optional; request it only when the deployment also adds a real notification/startForeground path.",
             ],
@@ -3118,8 +3321,6 @@ def inject_runtime_menu_scaffold(
             helper_path.write_text(content, encoding="utf-8")
             touched_files.add(str(helper_path))
 
-        manifest_path = apktool_dir / "AndroidManifest.xml"
-        entry = find_startup_entry(str(manifest_path), str(apktool_dir))
         if not entry.get("success"):
             errors.append(str(entry.get("error", "Could not find startup entry")))
         elif not entry.get("has_onCreate"):
@@ -3237,7 +3438,8 @@ def inject_runtime_menu_scaffold(
             "Buttons can be grouped with section headers using the action-level section field.",
             "Persistent button/toggle/slider state is re-applied on later attaches/resumes until the generated reset button is pressed.",
             "kind=dispatcher binds controls directly to static runtime-hook methods without extra app-side glue.",
-            "Helper classes can be written into a secondary dex root when target_smali_root is set or auto-resolved.",
+            "Helper classes can still be written into a secondary dex root when target_smali_root is set explicitly.",
+            "When target_smali_root is omitted, startup-bootstrapped menu helpers are co-located with the startup entry dex root so launch-time bootstrap calls do not crash before multidex/class loading is ready.",
             "When system_overlay or hybrid is requested, the scaffold generates a real WindowManager overlay service and overlay-permission request flow.",
             "Overlay-based injections now auto-configure manifest permissions/services by default; disable that only when you intentionally want a separate manifest step.",
             "Foreground-service wiring remains optional and should only be requested when the deployment also adds a real notification/startForeground implementation.",

@@ -365,3 +365,44 @@ def summarize_runtime_hook_recommendations(hooks: Iterable[Mapping[str, Any]]) -
         "static_patch_candidate_count": int(counts.get(PatchStrategy.STATIC_PATCH_ONLY.value, 0)) + int(counts.get(PatchStrategy.HYBRID_REQUIRED.value, 0)),
         "external_runtime_candidate_count": int(counts.get(PatchStrategy.NOT_SUITABLE_WITHOUT_EXTERNAL_RUNTIME.value, 0)),
     }
+
+
+def finalize_runtime_hook_strategy_recommendation(
+    routing_summary: Mapping[str, Any] | None,
+    *,
+    resolved_menu_bindings: int = 0,
+) -> str:
+    summary = dict(routing_summary or {})
+    counts = {
+        str(key): int(value or 0)
+        for key, value in dict(summary.get("counts") or {}).items()
+    }
+    recommended = str(summary.get("recommended_next_strategy") or PatchStrategy.RUNTIME_MENU_GOOD_FIT.value)
+    binding_ready_count = int(summary.get("runtime_menu_binding_ready_candidate_count") or 0)
+    provisional_count = int(summary.get("runtime_menu_provisional_candidate_count") or 0)
+
+    if resolved_menu_bindings > 0:
+        return recommended
+
+    if provisional_count > 0 and binding_ready_count <= 0:
+        return PatchStrategy.RUNTIME_OVERRIDE_GOOD_FIT.value
+
+    if recommended == PatchStrategy.RUNTIME_MENU_GOOD_FIT.value:
+        if counts.get(PatchStrategy.HYBRID_REQUIRED.value, 0) > 0:
+            return PatchStrategy.HYBRID_REQUIRED.value
+        if counts.get(PatchStrategy.RUNTIME_OVERRIDE_GOOD_FIT.value, 0) > 0:
+            return PatchStrategy.RUNTIME_OVERRIDE_GOOD_FIT.value
+        if counts.get(PatchStrategy.RUNTIME_MENU_GOOD_FIT.value, 0) > 0:
+            return PatchStrategy.RUNTIME_OVERRIDE_GOOD_FIT.value
+        if counts.get(PatchStrategy.STATIC_PATCH_ONLY.value, 0) > 0:
+            return PatchStrategy.STATIC_PATCH_ONLY.value
+        if counts.get(PatchStrategy.NOT_SUITABLE_WITHOUT_EXTERNAL_RUNTIME.value, 0) > 0:
+            return PatchStrategy.NOT_SUITABLE_WITHOUT_EXTERNAL_RUNTIME.value
+
+    if recommended == PatchStrategy.HYBRID_REQUIRED.value:
+        if counts.get(PatchStrategy.RUNTIME_OVERRIDE_GOOD_FIT.value, 0) > 0:
+            return PatchStrategy.RUNTIME_OVERRIDE_GOOD_FIT.value
+        if counts.get(PatchStrategy.STATIC_PATCH_ONLY.value, 0) > 0:
+            return PatchStrategy.STATIC_PATCH_ONLY.value
+
+    return recommended

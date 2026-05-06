@@ -13,6 +13,7 @@ Goes far beyond basic pattern matching. Provides:
 
 from __future__ import annotations
 
+from difflib import SequenceMatcher
 import os
 import re
 from collections import defaultdict
@@ -36,54 +37,109 @@ def analyze_method_deep(smali_file: str | Path, method_name: str) -> dict:
     text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
 
+    def _available_method_entries() -> list[dict[str, object]]:
+        entries: list[dict[str, object]] = []
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped.startswith(".method"):
+                continue
+            name_match = re.search(r'(\S+)\(', stripped)
+            signature_match = re.search(r'(\S+\(.*?\)\S+)', stripped)
+            if not name_match or not signature_match:
+                continue
+            entries.append({
+                "line_index": idx,
+                "header": stripped,
+                "name": name_match.group(1),
+                "signature": signature_match.group(1),
+            })
+        return entries
+
     # Find the method — extract the real method name from the smali signature
     # so that searching for "a" doesn't match "<clinit>" or constructor params.
-    def _method_name_matches(header_line: str, query: str) -> bool:
-        """Check if *query* matches the method name in a .method line.
+    def _resolve_method_entry(query: str, entries: list[dict[str, object]]) -> tuple[dict[str, object] | None, str, list[str]]:
+        normalized_query = str(query or "").strip()
+        query_lower = normalized_query.lower()
+        if not query_lower:
+            return None, "", []
 
-        Smali method headers look like:
-            .method public a()Z
-            .method static constructor <clinit>()V
-            .method public <init>(I)V
-            .method public final checkServerTrusted(...)V
+        if "(" in normalized_query:
+            exact_signature = [
+                entry for entry in entries
+                if str(entry.get("signature") or "").lower() == query_lower
+            ]
+            if len(exact_signature) == 1:
+                return exact_signature[0], "signature_exact", []
 
-        We extract the token just before '(' — that's the method name.
-        """
-        m = re.search(r'(\S+)\(', header_line)
-        if not m:
-            return False
-        name_token = m.group(1)          # e.g. "a", "<clinit>", "checkServerTrusted"
-        # If query contains '(' it's a partial signature like "a()Z" — match against name+rest
-        if '(' in query:
-            sig_part = header_line[header_line.index(name_token):]
-            return query in sig_part
-        return name_token == query
+            partial_signature = [
+                entry for entry in entries
+                if query_lower in str(entry.get("signature") or "").lower()
+            ]
+            if len(partial_signature) == 1:
+                return partial_signature[0], "signature_partial", []
 
+        exact_name = [
+            entry for entry in entries
+            if str(entry.get("name") or "").lower() == query_lower
+        ]
+        if len(exact_name) == 1:
+            return exact_name[0], "name_exact", []
+
+        if "(" not in normalized_query and not query_lower.startswith(("<", "get", "is", "set")):
+            capitalized = normalized_query[:1].upper() + normalized_query[1:]
+            accessor_aliases = {
+                f"get{capitalized}".lower(),
+                f"is{capitalized}".lower(),
+                f"set{capitalized}".lower(),
+            }
+            alias_matches = [
+                entry for entry in entries
+                if str(entry.get("name") or "").lower() in accessor_aliases
+            ]
+            if len(alias_matches) == 1:
+                return alias_matches[0], "accessor_alias", []
+
+        if query_lower.startswith("on"):
+            lifecycle_matches = [
+                entry for entry in entries
+                if str(entry.get("name") or "").lower().startswith("on")
+            ]
+            if len(lifecycle_matches) == 1:
+                return lifecycle_matches[0], "single_lifecycle_fallback", []
+
+        ranked: list[tuple[float, str]] = []
+        for entry in entries:
+            name = str(entry.get("name") or "")
+            if not name:
+                continue
+            score = SequenceMatcher(None, query_lower, name.lower()).ratio()
+            ranked.append((score, str(entry.get("signature") or name)))
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        closest = [signature for score, signature in ranked[:5] if score >= 0.45]
+        return None, "", closest
+
+    method_entries = _available_method_entries()
+    resolved_entry, resolution_reason, closest_methods = _resolve_method_entry(method_name, method_entries)
     method_start = -1
     method_end = -1
     method_header = ""
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith(".method") and _method_name_matches(stripped, method_name):
-            method_start = i
-            method_header = stripped
-        if method_start >= 0 and stripped == ".end method":
-            method_end = i
-            break
+    if resolved_entry is not None:
+        method_start = int(resolved_entry.get("line_index", -1))
+        method_header = str(resolved_entry.get("header") or "")
+        for i in range(method_start, len(lines)):
+            stripped = lines[i].strip()
+            if stripped == ".end method":
+                method_end = i
+                break
 
     if method_start < 0:
         # Collect all method signatures so the agent can pick the right one
-        available = []
-        for line in lines:
-            s = line.strip()
-            if s.startswith(".method"):
-                m = re.search(r'(\S+\(.*?\)\S+)', s)
-                if m:
-                    available.append(m.group(1))
+        available = [str(entry.get("signature") or "") for entry in method_entries]
         return {
             "success": False,
             "error": f"Method '{method_name}' not found in {path.name}",
             "available_methods": available,
+            "closest_methods": closest_methods,
             "hint": "The method may have a different name due to obfuscation or Kotlin compilation. "
                     "Check the available_methods list and retry with the correct name.",
         }
@@ -100,6 +156,9 @@ def analyze_method_deep(smali_file: str | Path, method_name: str) -> dict:
         "instruction_count": 0,
         "body": body_text,
     }
+    if resolution_reason and resolution_reason != "name_exact":
+        result["requested_method"] = str(method_name)
+        result["resolution_reason"] = resolution_reason
 
     # Registers used
     regs = set()
