@@ -494,8 +494,9 @@ These are supplementary patches to cover data sources OUTSIDE the entity class:
 - `inject_runtime_override_layer(...)` — ONLY if static root-cause patches are still reverted at runtime.
    Use it to re-apply shared prefs/static fields from inside the APK after startup.
 - If the user explicitly wants a manual runtime mod menu / floating in-app control layer:
-  `inject_runtime_menu_scaffold(spec_json, overlay_mode="in_app")` to generate the first in-app
-  runtime menu scaffold, then `configure_runtime_menu_manifest(...)` only if later overlay or
+   `draft_runtime_menu_from_hooks(...)` if you first want the agent to auto-group behavior-graph
+   hook candidates into a floating-menu draft, then `inject_runtime_menu_scaffold(spec_json, overlay_mode="in_app")`
+   to generate the actual in-app runtime menu scaffold, and `configure_runtime_menu_manifest(...)` only if later overlay or
   foreground-service permissions are actually needed.
    Treat `system_overlay` / Tier B as a high-friction escalation only when the user explicitly wants
    a detached overlay and accepts `SYSTEM_ALERT_WINDOW`, `WindowManager`, `TYPE_APPLICATION_OVERLAY`,
@@ -573,6 +574,7 @@ SURGICAL instruments. Misuse corrupts smali files and breaks the APK build.
 ```
 patch_api_response_flow(...)        ← patch response/factory/model-boundary overwrites
 inject_runtime_override_layer(...) ← internal runtime re-apply layer after static patch still gets reverted
+draft_runtime_menu_from_hooks(...) ← auto-draft a grouped floating-menu spec from plan_runtime_hooks candidates
 inject_runtime_menu_scaffold(...)  ← generate a user-driven draggable runtime menu scaffold with button/toggle/slider controls and dispatcher bindings
 configure_runtime_menu_manifest(...) ← declare overlay / foreground-service permissions only when required
 ```

@@ -11076,6 +11076,9 @@ def inject_runtime_menu_scaffold(
         Notes:
         - The scaffold creates real helper classes, drag listeners, dispatcher bindings,
             and startup bootstrap code.
+        - Top-level `launcher_label` customizes the floating bubble text, and
+            `start_collapsed=true` starts from the launcher icon instead of an open panel.
+        - Action-level `section` strings insert grouped headers inside the panel.
         - `kind="dispatcher"` binds buttons/toggles/sliders directly to static runtime
             hook methods.
         - The generated menu is inside the app window itself in `in_app` mode, so no overlay permission
@@ -11118,6 +11121,57 @@ def inject_runtime_menu_scaffold(
                 return json.dumps(result, ensure_ascii=False, indent=2)[:30000]
 
         return _safe_call(_run, "inject_runtime_menu_scaffold")
+
+
+@tool
+def draft_runtime_menu_from_hooks(
+    focus_hint: str = "",
+    class_name: str = "",
+    overlay_mode: str = "in_app",
+    max_results: int = 6,
+    start_collapsed: bool = True,
+) -> str:
+    """Draft a grouped floating-menu spec from behavior-graph runtime hook candidates.
+
+    This is an agent-side planning helper. It turns `plan_runtime_hooks(...)`
+    results into a grouped runtime-menu spec with a floating launcher bubble and
+    real dispatcher bindings when the candidate method resolves to a supported
+    static smali method in the current apktool tree.
+
+    Notes:
+    - The returned `spec_json` is a draft, not an injected patch.
+    - Supported static hook methods are rebound automatically via generated
+        `RuntimeHookBindings`; unresolved hooks remain listed in `binding_hints`.
+    - The draft groups hook candidates by runtime strategy section.
+    """
+    from apk_agent.tools.behavior_engine import plan_runtime_hooks as _plan_runtime_hooks
+    from apk_agent.tools.runtime_menu import build_runtime_menu_spec_from_hook_plan as _build_runtime_menu_spec_from_hook_plan
+
+    def _run():
+        pack = _ensure_behavior_graph_pack(auto_build=True, focus_hint=focus_hint or class_name)
+        if pack is None:
+            return json.dumps({"success": False, "error": "Behavior graph unavailable. Run build_behavior_graph first."})
+        plan = _plan_runtime_hooks(
+            pack,
+            focus_hint=focus_hint,
+            class_name=class_name,
+            max_results=max_results,
+        )
+        draft = _build_runtime_menu_spec_from_hook_plan(
+            plan,
+            title=(f"{class_name} Runtime Hooks" if class_name else "Runtime Hook Menu"),
+            overlay_mode=overlay_mode,
+            start_collapsed=start_collapsed,
+            apktool_dir=_project.apktool_dir,
+        )
+        draft["output_path"] = str(_behavior_graph_path())
+        return json.dumps(draft, ensure_ascii=False, indent=2)[:30000]
+
+    return _safe_call(
+        _run,
+        "draft_runtime_menu_from_hooks",
+        _cache_hint=f"{focus_hint}:{class_name}:{overlay_mode}:{max_results}:{start_collapsed}",
+    )
 
 
 @tool
@@ -11467,6 +11521,7 @@ ALL_TOOLS = [
     plan_runtime_hooks,
     analyze_network_behavior,
     recover_semantic_symbols,
+    draft_runtime_menu_from_hooks,
     inject_runtime_menu_scaffold,
     configure_runtime_menu_manifest,
     patch_api_response_flow,

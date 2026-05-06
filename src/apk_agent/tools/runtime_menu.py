@@ -22,6 +22,7 @@ resource-id bookkeeping.
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 from pathlib import Path
@@ -35,6 +36,8 @@ from apk_agent.tools.manifest_parser import parse_manifest
 _BRIDGE_DESCRIPTOR = "Lapkagi/menu/InAppMenuBridge;"
 _ACTIONS_DESCRIPTOR = "Lapkagi/menu/MenuActions;"
 _CLICK_DESCRIPTOR = "Lapkagi/menu/MenuActionClickListener;"
+_VISIBILITY_DESCRIPTOR = "Lapkagi/menu/MenuVisibilityClickListener;"
+_HOOK_BINDINGS_DESCRIPTOR = "Lapkagi/menu/RuntimeHookBindings;"
 _TOGGLE_DESCRIPTOR = "Lapkagi/menu/MenuToggleCheckedChangeListener;"
 _SLIDER_DESCRIPTOR = "Lapkagi/menu/MenuSliderChangeListener;"
 _PANEL_DRAG_DESCRIPTOR = "Lapkagi/menu/MenuPanelDragTouchListener;"
@@ -180,6 +183,7 @@ def _normalize_action(raw_action: dict[str, Any], index: int, default_persist: b
         "label": label,
         "ui_kind": ui_kind,
         "kind": kind,
+        "section": str(raw_action.get("section") or raw_action.get("group") or "").strip(),
         "persist_on_resume": bool(raw_action.get("persist_on_resume", default_persist)),
         "success_message": str(raw_action.get("success_message") or f"Applied: {label}").strip(),
     }
@@ -277,6 +281,8 @@ def _normalize_menu_spec(spec: dict[str, Any], overlay_mode: str) -> dict[str, A
 
     default_persist = bool(spec.get("persist_on_resume", True))
     title = str(spec.get("title") or spec.get("menu_title") or "APK AGI MOD MENU").strip() or "APK AGI MOD MENU"
+    launcher_label = str(spec.get("launcher_label") or spec.get("floating_icon_label") or spec.get("bubble_label") or "MOD").strip() or "MOD"
+    start_collapsed = bool(spec.get("start_collapsed", False))
     normalized_buttons = [
         _normalize_action(raw_action, idx, default_persist)
         for idx, raw_action in enumerate(buttons_raw)
@@ -300,10 +306,307 @@ def _normalize_menu_spec(spec: dict[str, Any], overlay_mode: str) -> dict[str, A
     return {
         "overlay_mode": chosen_mode,
         "title": title,
+        "launcher_label": launcher_label,
+        "start_collapsed": start_collapsed,
         "buttons": normalized_buttons,
+        "hook_bindings": list(spec.get("hook_bindings") or []),
         "user_buttons": len(buttons_raw),
         "persistent_buttons": sum(1 for button in normalized_buttons if button.get("persist_on_resume")),
+        "section_count": len({button.get("section", "") for button in normalized_buttons if button.get("section")}),
         "control_types": sorted({button.get("ui_kind", "button") for button in normalized_buttons if button.get("kind") != "internal_reset"}),
+    }
+
+
+def _pretty_class_name(descriptor: str) -> str:
+    cleaned = str(descriptor or "").strip()
+    if cleaned.startswith("L") and cleaned.endswith(";"):
+        cleaned = cleaned[1:-1]
+    if "/" in cleaned:
+        cleaned = cleaned.rsplit("/", 1)[-1]
+    return cleaned or "RuntimeHook"
+
+
+def _humanize_runtime_strategy(strategy: str) -> str:
+    label = str(strategy or "runtime_hooks").replace("_", " ").strip()
+    return label.title() or "Runtime Hooks"
+
+
+def _smali_param_descriptors(params_blob: str) -> list[str]:
+    params: list[str] = []
+    index = 0
+    while index < len(params_blob):
+        token = params_blob[index]
+        if token in "ZBCSIFJD":
+            params.append(token)
+            index += 1
+            continue
+        if token == "L":
+            end = params_blob.find(";", index)
+            if end == -1:
+                break
+            params.append(params_blob[index:end + 1])
+            index = end + 1
+            continue
+        if token == "[":
+            start = index
+            index += 1
+            while index < len(params_blob) and params_blob[index] == "[":
+                index += 1
+            if index < len(params_blob) and params_blob[index] == "L":
+                end = params_blob.find(";", index)
+                if end == -1:
+                    break
+                index = end + 1
+            else:
+                index += 1
+            params.append(params_blob[start:index])
+            continue
+        index += 1
+    return params
+
+
+def _extract_method_name(method_query: str) -> str:
+    query = str(method_query or "").strip()
+    if "->" in query:
+        query = query.split("->", 1)[1]
+    if "(" in query:
+        query = query.split("(", 1)[0]
+    return query
+
+
+def _method_header_matches(header_line: str, query: str) -> bool:
+    stripped = header_line.strip()
+    if not stripped.startswith(".method"):
+        return False
+    if "(" in query:
+        return query in stripped
+    method_name = _extract_method_name(query)
+    match = re.search(r"([\w$<>-]+)\(", stripped)
+    return bool(match and match.group(1) == method_name)
+
+
+def _class_descriptor_from_smali(smali_file: Path) -> str:
+    for line in smali_file.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = line.strip()
+        if stripped.startswith(".class "):
+            match = re.search(r"(L[^;]+;)", stripped)
+            if match:
+                return match.group(1)
+    return ""
+
+
+def _resolve_hook_smali_file(apktool_dir: Path, hook: dict[str, Any]) -> Path | None:
+    hook_file = str(hook.get("file") or "").strip()
+    candidate_paths: list[Path] = []
+    if hook_file:
+        raw_path = Path(hook_file)
+        candidate_paths.append(raw_path)
+        if not raw_path.is_absolute():
+            candidate_paths.append(apktool_dir / raw_path)
+            candidate_paths.append(apktool_dir / raw_path.as_posix())
+
+    class_descriptor = str(hook.get("class") or "").strip()
+    if class_descriptor.startswith("L") and class_descriptor.endswith(";"):
+        class_tail = class_descriptor[1:-1].replace("/", "\\") + ".smali"
+        for smali_dir in sorted(apktool_dir.glob("smali*")):
+            candidate_paths.append(smali_dir / class_tail)
+
+    for candidate in candidate_paths:
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def _resolve_static_hook_binding(apktool_dir: Path, hook: dict[str, Any], *, index: int) -> dict[str, Any]:
+    method_query = str(hook.get("method") or "").strip()
+    if not method_query:
+        return {"success": False, "binding_status": "missing_method_name", "error": "Hook candidate had no method name"}
+
+    smali_file = _resolve_hook_smali_file(apktool_dir, hook)
+    if smali_file is None:
+        return {"success": False, "binding_status": "smali_file_not_found", "error": f"Could not locate smali file for hook: {method_query}"}
+
+    class_descriptor = str(hook.get("class") or "").strip() or _class_descriptor_from_smali(smali_file)
+    if not class_descriptor:
+        return {"success": False, "binding_status": "class_descriptor_missing", "error": f"Could not determine class descriptor for {smali_file.name}"}
+
+    supported_candidates: list[dict[str, Any]] = []
+    for line in smali_file.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = line.strip()
+        if not _method_header_matches(stripped, method_query):
+            continue
+        signature_match = re.search(r"([\w$<>-]+)\((.*?)\)(\S+)$", stripped)
+        if not signature_match:
+            continue
+        method_name = signature_match.group(1)
+        params_blob = signature_match.group(2)
+        return_type = signature_match.group(3)
+        if return_type != "V" or " static " not in f" {stripped} ":
+            continue
+        params = _smali_param_descriptors(params_blob)
+        ui_kind = ""
+        if params in ([], ["Landroid/content/Context;"]):
+            ui_kind = "button"
+        elif params in (["Z"], ["Landroid/content/Context;", "Z"]):
+            ui_kind = "toggle"
+        elif params in (["I"], ["Landroid/content/Context;", "I"]):
+            ui_kind = "slider"
+        if not ui_kind:
+            continue
+        supported_candidates.append({
+            "header": stripped,
+            "method_name": method_name,
+            "params_blob": params_blob,
+            "ui_kind": ui_kind,
+            "target_method_descriptor": f"{class_descriptor}->{method_name}({params_blob})V",
+        })
+
+    if not supported_candidates:
+        return {
+            "success": False,
+            "binding_status": "no_supported_static_signature",
+            "error": f"No supported static void signature found for hook: {class_descriptor}->{method_query}",
+            "hook_smali_file": str(smali_file),
+        }
+
+    if len(supported_candidates) > 1:
+        return {
+            "success": False,
+            "binding_status": "ambiguous_supported_overloads",
+            "error": f"Multiple supported static overloads found for hook: {class_descriptor}->{method_query}",
+            "hook_smali_file": str(smali_file),
+            "candidates": [candidate["target_method_descriptor"] for candidate in supported_candidates],
+        }
+
+    chosen = supported_candidates[0]
+    wrapper_method_descriptor = f"{_HOOK_BINDINGS_DESCRIPTOR}->hook_{index}({chosen['params_blob']})V"
+    persist_on_resume = chosen["ui_kind"] in {"toggle", "slider"}
+    binding: dict[str, Any] = {
+        "success": True,
+        "binding_status": "resolved_static_target",
+        "ui_kind": chosen["ui_kind"],
+        "wrapper_method_descriptor": wrapper_method_descriptor,
+        "target_method_descriptor": chosen["target_method_descriptor"],
+        "hook_smali_file": str(smali_file),
+        "hook_target_class": class_descriptor,
+        "hook_target_method": chosen["method_name"],
+        "persist_on_resume": persist_on_resume,
+    }
+    if chosen["ui_kind"] == "slider":
+        binding.update({"min_value": 0, "max_value": 10, "initial_value": 1})
+    return binding
+
+
+def build_runtime_menu_spec_from_hook_plan(
+    hook_plan: dict[str, Any],
+    *,
+    title: str = "",
+    overlay_mode: str = "in_app",
+    launcher_label: str = "HOOK",
+    start_collapsed: bool = True,
+    max_items: int = 6,
+    apktool_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Build a grouped runtime-menu spec draft from behavior-engine runtime hook candidates."""
+    if not hook_plan.get("success"):
+        return {"success": False, "error": hook_plan.get("error", "Runtime hook plan failed")}
+
+    hooks = list(hook_plan.get("runtime_hooks") or [])
+    if not hooks:
+        return {"success": False, "error": "No runtime hook candidates were available for runtime-menu drafting"}
+
+    selected_hooks = hooks[: max(1, int(max_items))]
+    buttons: list[dict[str, Any]] = []
+    binding_hints: list[dict[str, Any]] = []
+    hook_bindings: list[dict[str, Any]] = []
+    apktool_root = Path(apktool_dir) if apktool_dir else None
+
+    for index, hook in enumerate(selected_hooks, start=1):
+        short_class = _pretty_class_name(str(hook.get("class", "")))
+        method_name = str(hook.get("method") or "runtime_probe").strip() or "runtime_probe"
+        section = _humanize_runtime_strategy(str(hook.get("strategy", "runtime_hooks")))
+        action_id = _slugify(f"hook_{short_class}_{method_name}_{index}", fallback=f"hook_{index}")
+        resolved_binding = (
+            _resolve_static_hook_binding(apktool_root, hook, index=index)
+            if apktool_root is not None else None
+        )
+        binding_status = str((resolved_binding or {}).get("binding_status") or "placeholder_dispatcher_descriptor")
+        ui_kind = str((resolved_binding or {}).get("ui_kind") or "button")
+        method_descriptor = str((resolved_binding or {}).get("wrapper_method_descriptor") or f"{_HOOK_BINDINGS_DESCRIPTOR}->hook_{index}(Landroid/content/Context;)V")
+        button_entry: dict[str, Any] = {
+            "id": action_id,
+            "label": f"{short_class}.{method_name}",
+            "section": section,
+            "ui_kind": ui_kind,
+            "kind": "dispatcher",
+            "method_descriptor": method_descriptor,
+            "persist_on_resume": bool((resolved_binding or {}).get("persist_on_resume", False)),
+            "success_message": f"Triggered hook draft: {short_class}.{method_name}",
+        }
+        if ui_kind == "slider":
+            button_entry.update({
+                "min_value": int((resolved_binding or {}).get("min_value", 0)),
+                "max_value": int((resolved_binding or {}).get("max_value", 10)),
+                "initial_value": int((resolved_binding or {}).get("initial_value", 1)),
+            })
+        buttons.append({
+            **button_entry,
+        })
+        binding_hint = {
+            "id": action_id,
+            "placeholder_method_descriptor": f"{_HOOK_BINDINGS_DESCRIPTOR}->hook_{index}(Landroid/content/Context;)V",
+            "hook_target_class": str(hook.get("class", "")),
+            "hook_target_method": method_name,
+            "strategy": str(hook.get("strategy", "")),
+            "recommended_tools": list(hook.get("recommended_tools") or []),
+            "observe": list(hook.get("observe") or []),
+            "mutate": list(hook.get("mutate") or []),
+            "reasons": list(hook.get("reasons") or [])[:5],
+            "binding_status": binding_status,
+        }
+        if resolved_binding is not None:
+            binding_hint.update({
+                "resolved_wrapper_method_descriptor": resolved_binding.get("wrapper_method_descriptor", ""),
+                "resolved_target_method_descriptor": resolved_binding.get("target_method_descriptor", ""),
+                "ui_kind": resolved_binding.get("ui_kind", "button"),
+            })
+            if resolved_binding.get("success"):
+                hook_bindings.append({
+                    "wrapper_method_descriptor": resolved_binding["wrapper_method_descriptor"],
+                    "target_method_descriptor": resolved_binding["target_method_descriptor"],
+                    "ui_kind": resolved_binding["ui_kind"],
+                })
+            elif resolved_binding.get("error"):
+                binding_hint["error"] = resolved_binding["error"]
+        binding_hints.append(binding_hint)
+
+    spec = {
+        "title": title or (f"{_pretty_class_name(str(selected_hooks[0].get('class', '')))} Runtime Hooks"),
+        "overlay_mode": overlay_mode,
+        "launcher_label": launcher_label,
+        "start_collapsed": bool(start_collapsed),
+        "buttons": buttons,
+        "hook_bindings": hook_bindings,
+    }
+    real_bindings = sum(1 for hint in binding_hints if hint.get("binding_status") == "resolved_static_target")
+    return {
+        "success": True,
+        "focus_hint": hook_plan.get("focus_hint", ""),
+        "class_name": hook_plan.get("class_name", ""),
+        "draft_mode": "real_dispatcher_bindings" if real_bindings else "placeholder_dispatchers",
+        "resolved_bindings": real_bindings,
+        "unsupported_bindings": [hint for hint in binding_hints if hint.get("binding_status") != "resolved_static_target"],
+        "spec": spec,
+        "spec_json": json.dumps(spec, ensure_ascii=False, indent=2),
+        "binding_hints": binding_hints,
+        "notes": [
+            "This draft auto-groups runtime-hook candidates into a floating-menu spec.",
+            "Supported static hook candidates are rebound to real generated RuntimeHookBindings methods automatically.",
+            "Unsupported or ambiguous hook candidates remain listed in binding_hints/unsupported_bindings for manual follow-up.",
+        ],
     }
 
 
@@ -360,6 +663,55 @@ def _toggle_state_key(action: dict[str, Any]) -> str:
 
 def _slider_state_key(action: dict[str, Any]) -> str:
     return f"slider_state:{action['id']}"
+
+
+def _menu_open_key() -> str:
+    return "ui:menu_open"
+
+
+def _menu_left_key() -> str:
+    return "ui:menu_left"
+
+
+def _menu_top_key() -> str:
+    return "ui:menu_top"
+
+
+def _generate_runtime_hook_bindings_smali(bindings: list[dict[str, Any]]) -> str:
+    helper_lines: list[str] = [
+        ".class public final Lapkagi/menu/RuntimeHookBindings;",
+        ".super Ljava/lang/Object;",
+        '.source "RuntimeHookBindings.java"',
+        "",
+        ".method public constructor <init>()V",
+        "    .locals 0",
+        "    invoke-direct {p0}, Ljava/lang/Object;-><init>()V",
+        "    return-void",
+        ".end method",
+        "",
+    ]
+
+    for binding in bindings:
+        wrapper = str(binding.get("wrapper_method_descriptor") or "").strip()
+        target = str(binding.get("target_method_descriptor") or "").strip()
+        if not wrapper or not target or "->" not in wrapper or "->" not in target:
+            continue
+        wrapper_sig = wrapper.split("->", 1)[1]
+        wrapper_name = _extract_method_name(wrapper_sig)
+        wrapper_params = wrapper_sig.split("(", 1)[1].rsplit(")", 1)[0]
+        params = _smali_param_descriptors(wrapper_params)
+        invoke_registers = [f"p{index}" for index in range(len(params))]
+        invoke_blob = "{" + ", ".join(invoke_registers) + "}" if invoke_registers else "{}"
+        helper_lines.extend([
+            f".method public static {wrapper_name}({wrapper_params})V",
+            "    .locals 0",
+            f"    invoke-static {invoke_blob}, {target}",
+            "    return-void",
+            ".end method",
+            "",
+        ])
+
+    return "\n".join(helper_lines) + "\n"
 
 
 def _shared_pref_action_lines(action: dict[str, Any], *, value_register: str | None = None) -> list[str]:
@@ -493,6 +845,41 @@ def _dispatcher_action_lines(action: dict[str, Any], *, value_register: str | No
     return [f"    invoke-static {{p0, {value_register}}}, {descriptor}"]
 
 
+def _reset_control_state_lines(spec: dict[str, Any]) -> list[str]:
+    reset_keys: list[str] = []
+    for action in spec["buttons"]:
+        if action.get("kind") == "internal_reset" or not action.get("persist_on_resume"):
+            continue
+        ui_kind = action.get("ui_kind", "button")
+        if ui_kind == "button":
+            reset_keys.append(str(action["id"]))
+        elif ui_kind == "toggle":
+            reset_keys.append(_toggle_state_key(action))
+        else:
+            reset_keys.append(_slider_state_key(action))
+
+    if not reset_keys:
+        return ["    return-void"]
+
+    lines = [
+        "    invoke-static {p0}, Lapkagi/menu/MenuActions;->prefs(Landroid/content/Context;)Landroid/content/SharedPreferences;",
+        "    move-result-object v0",
+        "    invoke-interface {v0}, Landroid/content/SharedPreferences;->edit()Landroid/content/SharedPreferences$Editor;",
+        "    move-result-object v0",
+    ]
+    for key in reset_keys:
+        lines.extend([
+            f'    const-string v1, "{_escape_smali_string(key)}"',
+            "    invoke-interface {v0, v1}, Landroid/content/SharedPreferences$Editor;->remove(Ljava/lang/String;)Landroid/content/SharedPreferences$Editor;",
+            "    move-result-object v0",
+        ])
+    lines.extend([
+        "    invoke-interface {v0}, Landroid/content/SharedPreferences$Editor;->apply()V",
+        "    return-void",
+    ])
+    return lines
+
+
 def _button_action_lines(action: dict[str, Any]) -> list[str]:
     kind = action["kind"]
     if kind == "shared_pref":
@@ -504,7 +891,7 @@ def _button_action_lines(action: dict[str, Any]) -> list[str]:
     if kind == "dispatcher":
         return _dispatcher_action_lines(action)
     if kind == "internal_reset":
-        return ["    invoke-static {p0}, Lapkagi/menu/MenuActions;->clearAll(Landroid/content/Context;)V"]
+        return ["    invoke-static {p0}, Lapkagi/menu/MenuActions;->resetControls(Landroid/content/Context;)V"]
     raise ValueError(f"Unsupported runtime-menu action kind: {kind}")
 
 
@@ -535,6 +922,7 @@ def _generate_actions_smali(spec: dict[str, Any]) -> str:
     toggle_lines: list[str] = []
     slider_lines: list[str] = []
     reapply_lines: list[str] = []
+    reset_lines = _reset_control_state_lines(spec)
 
     for index, action in enumerate(spec["buttons"]):
         ui_kind = action.get("ui_kind", "button")
@@ -711,7 +1099,7 @@ def _generate_actions_smali(spec: dict[str, Any]) -> str:
         "    return-void",
         ".end method",
         "",
-        ".method private static hasState(Landroid/content/Context;Ljava/lang/String;)Z",
+        ".method public static hasState(Landroid/content/Context;Ljava/lang/String;)Z",
         "    .locals 2",
         "    invoke-static {p0}, Lapkagi/menu/MenuActions;->prefs(Landroid/content/Context;)Landroid/content/SharedPreferences;",
         "    move-result-object v0",
@@ -730,7 +1118,7 @@ def _generate_actions_smali(spec: dict[str, Any]) -> str:
         "    return v0",
         ".end method",
         "",
-        ".method private static setToggleState(Landroid/content/Context;Ljava/lang/String;Z)V",
+        ".method public static setToggleState(Landroid/content/Context;Ljava/lang/String;Z)V",
         "    .locals 3",
         "    invoke-static {p0}, Lapkagi/menu/MenuActions;->prefs(Landroid/content/Context;)Landroid/content/SharedPreferences;",
         "    move-result-object v0",
@@ -742,7 +1130,7 @@ def _generate_actions_smali(spec: dict[str, Any]) -> str:
         "    return-void",
         ".end method",
         "",
-        ".method private static getToggleState(Landroid/content/Context;Ljava/lang/String;Z)Z",
+        ".method public static getToggleState(Landroid/content/Context;Ljava/lang/String;Z)Z",
         "    .locals 3",
         "    invoke-static {p0}, Lapkagi/menu/MenuActions;->prefs(Landroid/content/Context;)Landroid/content/SharedPreferences;",
         "    move-result-object v0",
@@ -751,7 +1139,7 @@ def _generate_actions_smali(spec: dict[str, Any]) -> str:
         "    return v0",
         ".end method",
         "",
-        ".method private static setSliderState(Landroid/content/Context;Ljava/lang/String;I)V",
+        ".method public static setSliderState(Landroid/content/Context;Ljava/lang/String;I)V",
         "    .locals 3",
         "    invoke-static {p0}, Lapkagi/menu/MenuActions;->prefs(Landroid/content/Context;)Landroid/content/SharedPreferences;",
         "    move-result-object v0",
@@ -763,13 +1151,77 @@ def _generate_actions_smali(spec: dict[str, Any]) -> str:
         "    return-void",
         ".end method",
         "",
-        ".method private static getSliderState(Landroid/content/Context;Ljava/lang/String;I)I",
+        ".method public static getSliderState(Landroid/content/Context;Ljava/lang/String;I)I",
         "    .locals 3",
         "    invoke-static {p0}, Lapkagi/menu/MenuActions;->prefs(Landroid/content/Context;)Landroid/content/SharedPreferences;",
         "    move-result-object v0",
         "    invoke-interface {v0, p1, p2}, Landroid/content/SharedPreferences;->getInt(Ljava/lang/String;I)I",
         "    move-result v0",
         "    return v0",
+        ".end method",
+        "",
+        ".method public static setMenuOpen(Landroid/content/Context;Z)V",
+        "    .locals 3",
+        "    invoke-static {p0}, Lapkagi/menu/MenuActions;->prefs(Landroid/content/Context;)Landroid/content/SharedPreferences;",
+        "    move-result-object v0",
+        "    invoke-interface {v0}, Landroid/content/SharedPreferences;->edit()Landroid/content/SharedPreferences$Editor;",
+        "    move-result-object v0",
+        f'    const-string v1, "{_menu_open_key()}"',
+        "    invoke-interface {v0, v1, p1}, Landroid/content/SharedPreferences$Editor;->putBoolean(Ljava/lang/String;Z)Landroid/content/SharedPreferences$Editor;",
+        "    move-result-object v0",
+        "    invoke-interface {v0}, Landroid/content/SharedPreferences$Editor;->apply()V",
+        "    return-void",
+        ".end method",
+        "",
+        ".method public static isMenuOpen(Landroid/content/Context;Z)Z",
+        "    .locals 3",
+        "    invoke-static {p0}, Lapkagi/menu/MenuActions;->prefs(Landroid/content/Context;)Landroid/content/SharedPreferences;",
+        "    move-result-object v0",
+        f'    const-string v1, "{_menu_open_key()}"',
+        "    invoke-interface {v0, v1, p1}, Landroid/content/SharedPreferences;->getBoolean(Ljava/lang/String;Z)Z",
+        "    move-result v0",
+        "    return v0",
+        ".end method",
+        "",
+        ".method public static rememberMenuPosition(Landroid/content/Context;II)V",
+        "    .locals 3",
+        "    invoke-static {p0}, Lapkagi/menu/MenuActions;->prefs(Landroid/content/Context;)Landroid/content/SharedPreferences;",
+        "    move-result-object v0",
+        "    invoke-interface {v0}, Landroid/content/SharedPreferences;->edit()Landroid/content/SharedPreferences$Editor;",
+        "    move-result-object v0",
+        f'    const-string v1, "{_menu_left_key()}"',
+        "    invoke-interface {v0, v1, p1}, Landroid/content/SharedPreferences$Editor;->putInt(Ljava/lang/String;I)Landroid/content/SharedPreferences$Editor;",
+        "    move-result-object v0",
+        f'    const-string v1, "{_menu_top_key()}"',
+        "    invoke-interface {v0, v1, p2}, Landroid/content/SharedPreferences$Editor;->putInt(Ljava/lang/String;I)Landroid/content/SharedPreferences$Editor;",
+        "    move-result-object v0",
+        "    invoke-interface {v0}, Landroid/content/SharedPreferences$Editor;->apply()V",
+        "    return-void",
+        ".end method",
+        "",
+        ".method public static getMenuLeft(Landroid/content/Context;I)I",
+        "    .locals 3",
+        "    invoke-static {p0}, Lapkagi/menu/MenuActions;->prefs(Landroid/content/Context;)Landroid/content/SharedPreferences;",
+        "    move-result-object v0",
+        f'    const-string v1, "{_menu_left_key()}"',
+        "    invoke-interface {v0, v1, p1}, Landroid/content/SharedPreferences;->getInt(Ljava/lang/String;I)I",
+        "    move-result v0",
+        "    return v0",
+        ".end method",
+        "",
+        ".method public static getMenuTop(Landroid/content/Context;I)I",
+        "    .locals 3",
+        "    invoke-static {p0}, Lapkagi/menu/MenuActions;->prefs(Landroid/content/Context;)Landroid/content/SharedPreferences;",
+        "    move-result-object v0",
+        f'    const-string v1, "{_menu_top_key()}"',
+        "    invoke-interface {v0, v1, p1}, Landroid/content/SharedPreferences;->getInt(Ljava/lang/String;I)I",
+        "    move-result v0",
+        "    return v0",
+        ".end method",
+        "",
+        ".method public static resetControls(Landroid/content/Context;)V",
+        "    .locals 2",
+        *reset_lines,
         ".end method",
         "",
         ".method public static clearAll(Landroid/content/Context;)V",
@@ -868,6 +1320,61 @@ def _generate_click_listener_smali() -> str:
     ]) + "\n"
 
 
+def _generate_visibility_listener_smali() -> str:
+    return "\n".join([
+        ".class public final Lapkagi/menu/MenuVisibilityClickListener;",
+        ".super Ljava/lang/Object;",
+        ".implements Landroid/view/View$OnClickListener;",
+        '.source "MenuVisibilityClickListener.java"',
+        "",
+        ".field private final appContext:Landroid/content/Context;",
+        ".field private final launcherView:Landroid/view/View;",
+        ".field private final panelView:Landroid/view/View;",
+        ".field private final panelVisibility:I",
+        "",
+        ".method public constructor <init>(Landroid/content/Context;Landroid/view/View;Landroid/view/View;I)V",
+        "    .locals 1",
+        "    invoke-direct {p0}, Ljava/lang/Object;-><init>()V",
+        "    invoke-virtual {p1}, Landroid/content/Context;->getApplicationContext()Landroid/content/Context;",
+        "    move-result-object v0",
+        "    iput-object v0, p0, Lapkagi/menu/MenuVisibilityClickListener;->appContext:Landroid/content/Context;",
+        "    iput-object p2, p0, Lapkagi/menu/MenuVisibilityClickListener;->panelView:Landroid/view/View;",
+        "    iput-object p3, p0, Lapkagi/menu/MenuVisibilityClickListener;->launcherView:Landroid/view/View;",
+        "    iput p4, p0, Lapkagi/menu/MenuVisibilityClickListener;->panelVisibility:I",
+        "    return-void",
+        ".end method",
+        "",
+        ".method public onClick(Landroid/view/View;)V",
+        "    .locals 4",
+        "    iget-object v0, p0, Lapkagi/menu/MenuVisibilityClickListener;->panelView:Landroid/view/View;",
+        "    iget v1, p0, Lapkagi/menu/MenuVisibilityClickListener;->panelVisibility:I",
+        "    invoke-virtual {v0, v1}, Landroid/view/View;->setVisibility(I)V",
+        "    iget-object v0, p0, Lapkagi/menu/MenuVisibilityClickListener;->launcherView:Landroid/view/View;",
+        "    if-eqz v0, :apkagi_visibility_store",
+        "    iget v1, p0, Lapkagi/menu/MenuVisibilityClickListener;->panelVisibility:I",
+        "    if-nez v1, :apkagi_visibility_show_launcher",
+        "    const/16 v1, 0x8",
+        "    goto :apkagi_visibility_apply_launcher",
+        ":apkagi_visibility_show_launcher",
+        "    const/4 v1, 0x0",
+        ":apkagi_visibility_apply_launcher",
+        "    invoke-virtual {v0, v1}, Landroid/view/View;->setVisibility(I)V",
+        ":apkagi_visibility_store",
+        "    iget-object v0, p0, Lapkagi/menu/MenuVisibilityClickListener;->appContext:Landroid/content/Context;",
+        "    iget v1, p0, Lapkagi/menu/MenuVisibilityClickListener;->panelVisibility:I",
+        "    if-nez v1, :apkagi_visibility_closed",
+        "    const/4 v1, 0x1",
+        "    invoke-static {v0, v1}, Lapkagi/menu/MenuActions;->setMenuOpen(Landroid/content/Context;Z)V",
+        "    return-void",
+        ":apkagi_visibility_closed",
+        "    const/4 v1, 0x0",
+        "    invoke-static {v0, v1}, Lapkagi/menu/MenuActions;->setMenuOpen(Landroid/content/Context;Z)V",
+        "    return-void",
+        ".end method",
+        "",
+    ]) + "\n"
+
+
 def _generate_toggle_listener_smali() -> str:
     return "\n".join([
         ".class public final Lapkagi/menu/MenuToggleCheckedChangeListener;",
@@ -953,19 +1460,25 @@ def _generate_panel_drag_listener_smali() -> str:
         ".implements Landroid/view/View$OnTouchListener;",
         '.source "MenuPanelDragTouchListener.java"',
         "",
+        ".field private final appContext:Landroid/content/Context;",
+        ".field private final targetView:Landroid/view/View;",
         ".field private startLeft:I",
         ".field private startRawX:F",
         ".field private startRawY:F",
         ".field private startTop:I",
         "",
-        ".method public constructor <init>()V",
-        "    .locals 0",
+        ".method public constructor <init>(Landroid/content/Context;Landroid/view/View;)V",
+        "    .locals 1",
         "    invoke-direct {p0}, Ljava/lang/Object;-><init>()V",
+        "    invoke-virtual {p1}, Landroid/content/Context;->getApplicationContext()Landroid/content/Context;",
+        "    move-result-object v0",
+        "    iput-object v0, p0, Lapkagi/menu/MenuPanelDragTouchListener;->appContext:Landroid/content/Context;",
+        "    iput-object p2, p0, Lapkagi/menu/MenuPanelDragTouchListener;->targetView:Landroid/view/View;",
         "    return-void",
         ".end method",
         "",
         ".method public onTouch(Landroid/view/View;Landroid/view/MotionEvent;)Z",
-        "    .locals 8",
+        "    .locals 12",
         "    invoke-virtual {p2}, Landroid/view/MotionEvent;->getAction()I",
         "    move-result v0",
         "    if-nez v0, :apkagi_drag_check_move",
@@ -975,7 +1488,8 @@ def _generate_panel_drag_listener_smali() -> str:
         "    invoke-virtual {p2}, Landroid/view/MotionEvent;->getRawY()F",
         "    move-result v1",
         "    iput v1, p0, Lapkagi/menu/MenuPanelDragTouchListener;->startRawY:F",
-        "    invoke-virtual {p1}, Landroid/view/View;->getLayoutParams()Landroid/view/ViewGroup$LayoutParams;",
+        "    iget-object v1, p0, Lapkagi/menu/MenuPanelDragTouchListener;->targetView:Landroid/view/View;",
+        "    invoke-virtual {v1}, Landroid/view/View;->getLayoutParams()Landroid/view/ViewGroup$LayoutParams;",
         "    move-result-object v1",
         "    instance-of v2, v1, Landroid/widget/FrameLayout$LayoutParams;",
         "    if-eqz v2, :apkagi_drag_handled",
@@ -1004,17 +1518,57 @@ def _generate_panel_drag_listener_smali() -> str:
         "    float-to-int v3, v3",
         "    iget v4, p0, Lapkagi/menu/MenuPanelDragTouchListener;->startTop:I",
         "    add-int/2addr v3, v4",
-        "    invoke-virtual {p1}, Landroid/view/View;->getLayoutParams()Landroid/view/ViewGroup$LayoutParams;",
+        "    iget-object v4, p0, Lapkagi/menu/MenuPanelDragTouchListener;->targetView:Landroid/view/View;",
+        "    invoke-virtual {v4}, Landroid/view/View;->getLayoutParams()Landroid/view/ViewGroup$LayoutParams;",
         "    move-result-object v4",
         "    instance-of v5, v4, Landroid/widget/FrameLayout$LayoutParams;",
         "    if-eqz v5, :apkagi_drag_return_true",
         "    check-cast v4, Landroid/widget/FrameLayout$LayoutParams;",
         "    iput v2, v4, Landroid/widget/FrameLayout$LayoutParams;->leftMargin:I",
         "    iput v3, v4, Landroid/widget/FrameLayout$LayoutParams;->topMargin:I",
-        "    invoke-virtual {p1, v4}, Landroid/view/View;->setLayoutParams(Landroid/view/ViewGroup$LayoutParams;)V",
+        "    iget-object v5, p0, Lapkagi/menu/MenuPanelDragTouchListener;->targetView:Landroid/view/View;",
+        "    invoke-virtual {v5, v4}, Landroid/view/View;->setLayoutParams(Landroid/view/ViewGroup$LayoutParams;)V",
+        "    iget-object v5, p0, Lapkagi/menu/MenuPanelDragTouchListener;->appContext:Landroid/content/Context;",
+        "    invoke-static {v5, v2, v3}, Lapkagi/menu/MenuActions;->rememberMenuPosition(Landroid/content/Context;II)V",
         ":apkagi_drag_return_true",
         "    const/4 v0, 0x1",
         "    return v0",
+        ":apkagi_drag_unhandled",
+        "    const/4 v1, 0x1",
+        "    if-ne v0, v1, :apkagi_drag_fallthrough",
+        "    iget-object v1, p0, Lapkagi/menu/MenuPanelDragTouchListener;->targetView:Landroid/view/View;",
+        "    invoke-virtual {v1}, Landroid/view/View;->getLayoutParams()Landroid/view/ViewGroup$LayoutParams;",
+        "    move-result-object v2",
+        "    instance-of v3, v2, Landroid/widget/FrameLayout$LayoutParams;",
+        "    if-eqz v3, :apkagi_drag_snap_done",
+        "    check-cast v2, Landroid/widget/FrameLayout$LayoutParams;",
+        "    iget-object v3, p0, Lapkagi/menu/MenuPanelDragTouchListener;->appContext:Landroid/content/Context;",
+        "    invoke-virtual {v3}, Landroid/content/Context;->getResources()Landroid/content/res/Resources;",
+        "    move-result-object v4",
+        "    invoke-virtual {v4}, Landroid/content/res/Resources;->getDisplayMetrics()Landroid/util/DisplayMetrics;",
+        "    move-result-object v4",
+        "    iget v5, v4, Landroid/util/DisplayMetrics;->widthPixels:I",
+        "    iget v6, v2, Landroid/widget/FrameLayout$LayoutParams;->leftMargin:I",
+        "    div-int/lit8 v7, v5, 0x2",
+        "    const/16 v8, 0x10",
+        "    if-le v6, v7, :apkagi_drag_snap_left",
+        "    invoke-virtual {v1}, Landroid/view/View;->getWidth()I",
+        "    move-result v9",
+        "    sub-int/2addr v5, v9",
+        "    sub-int/2addr v5, v8",
+        "    iput v5, v2, Landroid/widget/FrameLayout$LayoutParams;->leftMargin:I",
+        "    goto :apkagi_drag_snap_apply",
+        ":apkagi_drag_snap_left",
+        "    iput v8, v2, Landroid/widget/FrameLayout$LayoutParams;->leftMargin:I",
+        ":apkagi_drag_snap_apply",
+        "    invoke-virtual {v1, v2}, Landroid/view/View;->setLayoutParams(Landroid/view/ViewGroup$LayoutParams;)V",
+        "    iget v5, v2, Landroid/widget/FrameLayout$LayoutParams;->leftMargin:I",
+        "    iget v6, v2, Landroid/widget/FrameLayout$LayoutParams;->topMargin:I",
+        "    invoke-static {v3, v5, v6}, Lapkagi/menu/MenuActions;->rememberMenuPosition(Landroid/content/Context;II)V",
+        ":apkagi_drag_snap_done",
+        "    const/4 v0, 0x1",
+        "    return v0",
+        ":apkagi_drag_fallthrough",
         ":apkagi_drag_unhandled",
         "    const/4 v0, 0x0",
         "    return v0",
@@ -1085,6 +1639,14 @@ def _generate_overlay_drag_listener_smali() -> str:
         "    const/4 v0, 0x1",
         "    return v0",
         ":apkagi_overlay_drag_unhandled",
+        "    const/4 v1, 0x1",
+        "    if-ne v0, v1, :apkagi_overlay_drag_fallthrough",
+        "    iget-object v1, p0, Lapkagi/menu/OverlayMenuDragTouchListener;->service:Lapkagi/menu/OverlayMenuService;",
+        "    invoke-virtual {v1}, Lapkagi/menu/OverlayMenuService;->snapOverlayToEdge()V",
+        "    const/4 v0, 0x1",
+        "    return v0",
+        ":apkagi_overlay_drag_fallthrough",
+        ":apkagi_overlay_drag_unhandled",
         "    const/4 v0, 0x0",
         "    return v0",
         ".end method",
@@ -1146,7 +1708,21 @@ def _generate_lifecycle_callbacks_smali() -> str:
 
 def _generate_widget_lines(spec: dict[str, Any], *, context_register: str, container_register: str) -> list[str]:
     widget_lines: list[str] = []
+    current_section = ""
     for action in spec["buttons"]:
+        section = str(action.get("section") or "").strip()
+        if section and section != current_section:
+            current_section = section
+            widget_lines.extend([
+                "    new-instance v3, Landroid/widget/TextView;",
+                f"    invoke-direct {{v3, {context_register}}}, Landroid/widget/TextView;-><init>(Landroid/content/Context;)V",
+                f'    const-string v4, "{_escape_smali_string(section)}"',
+                "    invoke-virtual {v3, v4}, Landroid/widget/TextView;->setText(Ljava/lang/CharSequence;)V",
+                "    const v4, 0x55ffffff",
+                "    invoke-virtual {v3, v4}, Landroid/widget/TextView;->setTextColor(I)V",
+                f"    invoke-virtual {{{container_register}, v3}}, Landroid/widget/LinearLayout;->addView(Landroid/view/View;)V",
+            ])
+
         ui_kind = action.get("ui_kind", "button")
         if ui_kind == "button":
             widget_lines.extend([
@@ -1219,7 +1795,8 @@ def _generate_bridge_smali(spec: dict[str, Any]) -> str:
     overlay_mode = str(spec.get("overlay_mode") or "in_app")
     include_in_app = overlay_mode in {"in_app", "hybrid"}
     include_system_overlay = overlay_mode in {"system_overlay", "hybrid"}
-    widget_lines = _generate_widget_lines(spec, context_register="p0", container_register="v2")
+    widget_lines = _generate_widget_lines(spec, context_register="p0", container_register="v12")
+    default_open = "0x0" if bool(spec.get("start_collapsed")) else "0x1"
 
     install_lines: list[str] = [
         "    if-eqz p0, :apkagi_install_done",
@@ -1264,7 +1841,7 @@ def _generate_bridge_smali(spec: dict[str, Any]) -> str:
         ".end method",
         "",
         ".method public static attach(Landroid/app/Activity;)V",
-        "    .locals 12",
+        "    .locals 18",
         "    if-eqz p0, :apkagi_attach_done",
         "    invoke-static {p0}, Lapkagi/menu/MenuActions;->reapplyEnabled(Landroid/content/Context;)V",
         "    const v0, 0x1020002",
@@ -1272,39 +1849,98 @@ def _generate_bridge_smali(spec: dict[str, Any]) -> str:
         "    move-result-object v0",
         "    if-eqz v0, :apkagi_attach_done",
         "    check-cast v0, Landroid/view/ViewGroup;",
-        '    const-string v1, "APKAGI_MOD_MENU_PANEL"',
+        '    const-string v1, "APKAGI_FLOATING_ROOT"',
         "    invoke-virtual {v0, v1}, Landroid/view/View;->findViewWithTag(Ljava/lang/Object;)Landroid/view/View;",
-        "    move-result-object v7",
-        "    if-nez v7, :apkagi_attach_done",
-        "    new-instance v2, Landroid/widget/LinearLayout;",
-        "    invoke-direct {v2, p0}, Landroid/widget/LinearLayout;-><init>(Landroid/content/Context;)V",
+        "    move-result-object v2",
+        "    if-nez v2, :apkagi_attach_done",
+        "    new-instance v2, Landroid/widget/FrameLayout;",
+        "    invoke-direct {v2, p0}, Landroid/widget/FrameLayout;-><init>(Landroid/content/Context;)V",
         "    invoke-virtual {v2, v1}, Landroid/view/View;->setTag(Ljava/lang/Object;)V",
-        "    const/4 v3, 0x1",
-        "    invoke-virtual {v2, v3}, Landroid/widget/LinearLayout;->setOrientation(I)V",
-        "    const/16 v4, 0x10",
-        "    invoke-virtual {v2, v4, v4, v4, v4}, Landroid/view/View;->setPadding(IIII)V",
-        "    const v5, 0x66000000",
-        "    invoke-virtual {v2, v5}, Landroid/view/View;->setBackgroundColor(I)V",
         "    new-instance v3, Landroid/widget/TextView;",
         "    invoke-direct {v3, p0}, Landroid/widget/TextView;-><init>(Landroid/content/Context;)V",
-        f'    const-string v4, "{_escape_smali_string(spec["title"])}"',
+        '    const-string v4, "APKAGI_FLOATING_ICON"',
+        "    invoke-virtual {v3, v4}, Landroid/view/View;->setTag(Ljava/lang/Object;)V",
+        f'    const-string v4, "{_escape_smali_string(spec["launcher_label"])}"',
         "    invoke-virtual {v3, v4}, Landroid/widget/TextView;->setText(Ljava/lang/CharSequence;)V",
         "    const/4 v4, -0x1",
         "    invoke-virtual {v3, v4}, Landroid/widget/TextView;->setTextColor(I)V",
-        "    new-instance v5, Lapkagi/menu/MenuPanelDragTouchListener;",
-        "    invoke-direct {v5}, Lapkagi/menu/MenuPanelDragTouchListener;-><init>()V",
-        "    invoke-virtual {v3, v5}, Landroid/view/View;->setOnTouchListener(Landroid/view/View$OnTouchListener;)V",
-        "    invoke-virtual {v2, v3}, Landroid/widget/LinearLayout;->addView(Landroid/view/View;)V",
+        "    const/16 v4, 0x10",
+        "    invoke-virtual {v3, v4, v4, v4, v4}, Landroid/view/View;->setPadding(IIII)V",
+        "    const v5, 0xaa2255aa",
+        "    invoke-virtual {v3, v5}, Landroid/view/View;->setBackgroundColor(I)V",
+        "    new-instance v12, Landroid/widget/LinearLayout;",
+        "    invoke-direct {v12, p0}, Landroid/widget/LinearLayout;-><init>(Landroid/content/Context;)V",
+        '    const-string v5, "APKAGI_MOD_MENU_PANEL"',
+        "    invoke-virtual {v12, v5}, Landroid/view/View;->setTag(Ljava/lang/Object;)V",
+        "    const/4 v5, 0x1",
+        "    invoke-virtual {v12, v5}, Landroid/widget/LinearLayout;->setOrientation(I)V",
+        "    invoke-virtual {v12, v4, v4, v4, v4}, Landroid/view/View;->setPadding(IIII)V",
+        "    const v5, 0x66000000",
+        "    invoke-virtual {v12, v5}, Landroid/view/View;->setBackgroundColor(I)V",
+        "    new-instance v13, Landroid/widget/LinearLayout;",
+        "    invoke-direct {v13, p0}, Landroid/widget/LinearLayout;-><init>(Landroid/content/Context;)V",
+        "    const/4 v5, 0x0",
+        "    invoke-virtual {v13, v5}, Landroid/widget/LinearLayout;->setOrientation(I)V",
+        "    new-instance v14, Landroid/widget/TextView;",
+        "    invoke-direct {v14, p0}, Landroid/widget/TextView;-><init>(Landroid/content/Context;)V",
+        f'    const-string v4, "{_escape_smali_string(spec["title"])}"',
+        "    invoke-virtual {v14, v4}, Landroid/widget/TextView;->setText(Ljava/lang/CharSequence;)V",
+        "    const/4 v4, -0x1",
+        "    invoke-virtual {v14, v4}, Landroid/widget/TextView;->setTextColor(I)V",
+        "    new-instance v15, Landroid/widget/TextView;",
+        "    invoke-direct {v15, p0}, Landroid/widget/TextView;-><init>(Landroid/content/Context;)V",
+        '    const-string v4, "x"',
+        "    invoke-virtual {v15, v4}, Landroid/widget/TextView;->setText(Ljava/lang/CharSequence;)V",
+        "    const/4 v4, -0x1",
+        "    invoke-virtual {v15, v4}, Landroid/widget/TextView;->setTextColor(I)V",
+        "    const/16 v4, 0x8",
+        "    invoke-virtual {v15, v4, v4, v4, v4}, Landroid/view/View;->setPadding(IIII)V",
+        "    new-instance v16, Lapkagi/menu/MenuVisibilityClickListener;",
+        "    const/16 v17, 0x8",
+        "    invoke-direct {v16, p0, v12, v3, v17}, Lapkagi/menu/MenuVisibilityClickListener;-><init>(Landroid/content/Context;Landroid/view/View;Landroid/view/View;I)V",
+        "    invoke-virtual {v15, v16}, Landroid/view/View;->setOnClickListener(Landroid/view/View$OnClickListener;)V",
+        "    new-instance v16, Lapkagi/menu/MenuVisibilityClickListener;",
+        "    const/4 v17, 0x0",
+        "    invoke-direct {v16, p0, v12, v3, v17}, Lapkagi/menu/MenuVisibilityClickListener;-><init>(Landroid/content/Context;Landroid/view/View;Landroid/view/View;I)V",
+        "    invoke-virtual {v3, v16}, Landroid/view/View;->setOnClickListener(Landroid/view/View$OnClickListener;)V",
+        "    new-instance v16, Lapkagi/menu/MenuPanelDragTouchListener;",
+        "    invoke-direct {v16, p0, v2}, Lapkagi/menu/MenuPanelDragTouchListener;-><init>(Landroid/content/Context;Landroid/view/View;)V",
+        "    invoke-virtual {v3, v16}, Landroid/view/View;->setOnTouchListener(Landroid/view/View$OnTouchListener;)V",
+        "    invoke-virtual {v13, v16}, Landroid/view/View;->setOnTouchListener(Landroid/view/View$OnTouchListener;)V",
+        "    invoke-virtual {v13, v14}, Landroid/widget/LinearLayout;->addView(Landroid/view/View;)V",
+        "    invoke-virtual {v13, v15}, Landroid/widget/LinearLayout;->addView(Landroid/view/View;)V",
+        "    invoke-virtual {v12, v13}, Landroid/widget/LinearLayout;->addView(Landroid/view/View;)V",
         *widget_lines,
-        "    new-instance v3, Landroid/widget/FrameLayout$LayoutParams;",
-        "    const/4 v4, -0x2",
-        "    invoke-direct {v3, v4, v4}, Landroid/widget/FrameLayout$LayoutParams;-><init>(II)V",
-        "    const v4, 0x800033",
-        "    iput v4, v3, Landroid/widget/FrameLayout$LayoutParams;->gravity:I",
-        "    const/16 v4, 0x18",
-        "    iput v4, v3, Landroid/widget/FrameLayout$LayoutParams;->leftMargin:I",
-        "    iput v4, v3, Landroid/widget/FrameLayout$LayoutParams;->topMargin:I",
-        "    invoke-virtual {v0, v2, v3}, Landroid/view/ViewGroup;->addView(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V",
+        f"    const/4 v16, {default_open}",
+        "    invoke-static {p0, v16}, Lapkagi/menu/MenuActions;->isMenuOpen(Landroid/content/Context;Z)Z",
+        "    move-result v16",
+        "    if-eqz v16, :apkagi_attach_collapsed",
+        "    const/16 v17, 0x8",
+        "    invoke-virtual {v3, v17}, Landroid/view/View;->setVisibility(I)V",
+        "    const/4 v17, 0x0",
+        "    invoke-virtual {v12, v17}, Landroid/view/View;->setVisibility(I)V",
+        "    goto :apkagi_attach_visibility_done",
+        ":apkagi_attach_collapsed",
+        "    const/4 v17, 0x0",
+        "    invoke-virtual {v3, v17}, Landroid/view/View;->setVisibility(I)V",
+        "    const/16 v17, 0x8",
+        "    invoke-virtual {v12, v17}, Landroid/view/View;->setVisibility(I)V",
+        ":apkagi_attach_visibility_done",
+        "    invoke-virtual {v2, v3}, Landroid/widget/FrameLayout;->addView(Landroid/view/View;)V",
+        "    invoke-virtual {v2, v12}, Landroid/widget/FrameLayout;->addView(Landroid/view/View;)V",
+        "    new-instance v4, Landroid/widget/FrameLayout$LayoutParams;",
+        "    const/4 v5, -0x2",
+        "    invoke-direct {v4, v5, v5}, Landroid/widget/FrameLayout$LayoutParams;-><init>(II)V",
+        "    const v5, 0x800033",
+        "    iput v5, v4, Landroid/widget/FrameLayout$LayoutParams;->gravity:I",
+        "    const/16 v5, 0x18",
+        "    invoke-static {p0, v5}, Lapkagi/menu/MenuActions;->getMenuLeft(Landroid/content/Context;I)I",
+        "    move-result v6",
+        "    iput v6, v4, Landroid/widget/FrameLayout$LayoutParams;->leftMargin:I",
+        "    invoke-static {p0, v5}, Lapkagi/menu/MenuActions;->getMenuTop(Landroid/content/Context;I)I",
+        "    move-result v6",
+        "    iput v6, v4, Landroid/widget/FrameLayout$LayoutParams;->topMargin:I",
+        "    invoke-virtual {v0, v2, v4}, Landroid/view/ViewGroup;->addView(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V",
         ":apkagi_attach_done",
         "    return-void",
         ".end method",
@@ -1383,7 +2019,8 @@ def _generate_bridge_smali(spec: dict[str, Any]) -> str:
 
 
 def _generate_overlay_service_smali(spec: dict[str, Any]) -> str:
-    widget_lines = _generate_widget_lines(spec, context_register="p1", container_register="v2")
+    widget_lines = _generate_widget_lines(spec, context_register="p1", container_register="v12")
+    default_open = "0x0" if bool(spec.get("start_collapsed")) else "0x1"
 
     return "\n".join([
         ".class public Lapkagi/menu/OverlayMenuService;",
@@ -1468,7 +2105,37 @@ def _generate_overlay_service_smali(spec: dict[str, Any]) -> str:
         "    iput p1, v0, Landroid/view/WindowManager$LayoutParams;->x:I",
         "    iput p2, v0, Landroid/view/WindowManager$LayoutParams;->y:I",
         "    invoke-interface {v1, v2, v0}, Landroid/view/WindowManager;->updateViewLayout(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V",
+        "    invoke-static {p0, p1, p2}, Lapkagi/menu/MenuActions;->rememberMenuPosition(Landroid/content/Context;II)V",
         ":apkagi_overlay_update_done",
+        "    return-void",
+        ".end method",
+        "",
+        ".method public snapOverlayToEdge()V",
+        "    .locals 8",
+        "    iget-object v0, p0, Lapkagi/menu/OverlayMenuService;->overlayParams:Landroid/view/WindowManager$LayoutParams;",
+        "    iget-object v1, p0, Lapkagi/menu/OverlayMenuService;->overlayRoot:Landroid/view/View;",
+        "    if-eqz v0, :apkagi_overlay_snap_done",
+        "    if-eqz v1, :apkagi_overlay_snap_done",
+        "    invoke-virtual {p0}, Landroid/content/Context;->getResources()Landroid/content/res/Resources;",
+        "    move-result-object v2",
+        "    invoke-virtual {v2}, Landroid/content/res/Resources;->getDisplayMetrics()Landroid/util/DisplayMetrics;",
+        "    move-result-object v2",
+        "    iget v3, v2, Landroid/util/DisplayMetrics;->widthPixels:I",
+        "    iget v4, v0, Landroid/view/WindowManager$LayoutParams;->x:I",
+        "    div-int/lit8 v5, v3, 0x2",
+        "    const/16 v6, 0x10",
+        "    if-le v4, v5, :apkagi_overlay_snap_left",
+        "    invoke-virtual {v1}, Landroid/view/View;->getWidth()I",
+        "    move-result v7",
+        "    sub-int/2addr v3, v7",
+        "    sub-int/2addr v3, v6",
+        "    goto :apkagi_overlay_snap_apply",
+        ":apkagi_overlay_snap_left",
+        "    move v3, v6",
+        ":apkagi_overlay_snap_apply",
+        "    iget v4, v0, Landroid/view/WindowManager$LayoutParams;->y:I",
+        "    invoke-virtual {p0, v3, v4}, Lapkagi/menu/OverlayMenuService;->updateOverlayPosition(II)V",
+        ":apkagi_overlay_snap_done",
         "    return-void",
         ".end method",
         "",
@@ -1508,8 +2175,12 @@ def _generate_overlay_service_smali(spec: dict[str, Any]) -> str:
         "    const v2, 0x800033",
         "    iput v2, v7, Landroid/view/WindowManager$LayoutParams;->gravity:I",
         "    const/16 v2, 0x18",
-        "    iput v2, v7, Landroid/view/WindowManager$LayoutParams;->x:I",
-        "    iput v2, v7, Landroid/view/WindowManager$LayoutParams;->y:I",
+        "    invoke-static {p0, v2}, Lapkagi/menu/MenuActions;->getMenuLeft(Landroid/content/Context;I)I",
+        "    move-result v3",
+        "    iput v3, v7, Landroid/view/WindowManager$LayoutParams;->x:I",
+        "    invoke-static {p0, v2}, Lapkagi/menu/MenuActions;->getMenuTop(Landroid/content/Context;I)I",
+        "    move-result v3",
+        "    iput v3, v7, Landroid/view/WindowManager$LayoutParams;->y:I",
         "    iput-object v7, p0, Lapkagi/menu/OverlayMenuService;->overlayParams:Landroid/view/WindowManager$LayoutParams;",
         "    invoke-interface {v0, v1, v7}, Landroid/view/WindowManager;->addView(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V",
         ":apkagi_overlay_done",
@@ -1517,28 +2188,83 @@ def _generate_overlay_service_smali(spec: dict[str, Any]) -> str:
         ".end method",
         "",
         ".method private buildOverlayView(Landroid/content/Context;)Landroid/view/View;",
-        "    .locals 10",
-        "    new-instance v2, Landroid/widget/LinearLayout;",
-        "    invoke-direct {v2, p1}, Landroid/widget/LinearLayout;-><init>(Landroid/content/Context;)V",
-        '    const-string v0, "APKAGI_SYSTEM_OVERLAY_PANEL"',
+        "    .locals 18",
+        "    new-instance v2, Landroid/widget/FrameLayout;",
+        "    invoke-direct {v2, p1}, Landroid/widget/FrameLayout;-><init>(Landroid/content/Context;)V",
+        '    const-string v0, "APKAGI_SYSTEM_OVERLAY_ROOT"',
         "    invoke-virtual {v2, v0}, Landroid/view/View;->setTag(Ljava/lang/Object;)V",
-        "    const/4 v0, 0x1",
-        "    invoke-virtual {v2, v0}, Landroid/widget/LinearLayout;->setOrientation(I)V",
-        "    const/16 v0, 0x10",
-        "    invoke-virtual {v2, v0, v0, v0, v0}, Landroid/view/View;->setPadding(IIII)V",
-        "    const v0, 0x66000000",
-        "    invoke-virtual {v2, v0}, Landroid/view/View;->setBackgroundColor(I)V",
         "    new-instance v3, Landroid/widget/TextView;",
         "    invoke-direct {v3, p1}, Landroid/widget/TextView;-><init>(Landroid/content/Context;)V",
-        f'    const-string v4, "{_escape_smali_string(spec["title"])}"',
+        '    const-string v0, "APKAGI_SYSTEM_OVERLAY_ICON"',
+        "    invoke-virtual {v3, v0}, Landroid/view/View;->setTag(Ljava/lang/Object;)V",
+        f'    const-string v4, "{_escape_smali_string(spec["launcher_label"])}"',
         "    invoke-virtual {v3, v4}, Landroid/widget/TextView;->setText(Ljava/lang/CharSequence;)V",
         "    const/4 v4, -0x1",
         "    invoke-virtual {v3, v4}, Landroid/widget/TextView;->setTextColor(I)V",
-        "    new-instance v5, Lapkagi/menu/OverlayMenuDragTouchListener;",
-        "    invoke-direct {v5, p0}, Lapkagi/menu/OverlayMenuDragTouchListener;-><init>(Lapkagi/menu/OverlayMenuService;)V",
-        "    invoke-virtual {v3, v5}, Landroid/view/View;->setOnTouchListener(Landroid/view/View$OnTouchListener;)V",
-        "    invoke-virtual {v2, v3}, Landroid/widget/LinearLayout;->addView(Landroid/view/View;)V",
+        "    const/16 v0, 0x10",
+        "    invoke-virtual {v3, v0, v0, v0, v0}, Landroid/view/View;->setPadding(IIII)V",
+        "    const v4, 0xaa2255aa",
+        "    invoke-virtual {v3, v4}, Landroid/view/View;->setBackgroundColor(I)V",
+        "    new-instance v12, Landroid/widget/LinearLayout;",
+        "    invoke-direct {v12, p1}, Landroid/widget/LinearLayout;-><init>(Landroid/content/Context;)V",
+        '    const-string v4, "APKAGI_SYSTEM_OVERLAY_PANEL"',
+        "    invoke-virtual {v12, v4}, Landroid/view/View;->setTag(Ljava/lang/Object;)V",
+        "    const/4 v4, 0x1",
+        "    invoke-virtual {v12, v4}, Landroid/widget/LinearLayout;->setOrientation(I)V",
+        "    invoke-virtual {v12, v0, v0, v0, v0}, Landroid/view/View;->setPadding(IIII)V",
+        "    const v4, 0x66000000",
+        "    invoke-virtual {v12, v4}, Landroid/view/View;->setBackgroundColor(I)V",
+        "    new-instance v13, Landroid/widget/LinearLayout;",
+        "    invoke-direct {v13, p1}, Landroid/widget/LinearLayout;-><init>(Landroid/content/Context;)V",
+        "    const/4 v4, 0x0",
+        "    invoke-virtual {v13, v4}, Landroid/widget/LinearLayout;->setOrientation(I)V",
+        "    new-instance v14, Landroid/widget/TextView;",
+        "    invoke-direct {v14, p1}, Landroid/widget/TextView;-><init>(Landroid/content/Context;)V",
+        f'    const-string v4, "{_escape_smali_string(spec["title"])}"',
+        "    invoke-virtual {v14, v4}, Landroid/widget/TextView;->setText(Ljava/lang/CharSequence;)V",
+        "    const/4 v4, -0x1",
+        "    invoke-virtual {v14, v4}, Landroid/widget/TextView;->setTextColor(I)V",
+        "    new-instance v15, Landroid/widget/TextView;",
+        "    invoke-direct {v15, p1}, Landroid/widget/TextView;-><init>(Landroid/content/Context;)V",
+        '    const-string v4, "x"',
+        "    invoke-virtual {v15, v4}, Landroid/widget/TextView;->setText(Ljava/lang/CharSequence;)V",
+        "    const/4 v4, -0x1",
+        "    invoke-virtual {v15, v4}, Landroid/widget/TextView;->setTextColor(I)V",
+        "    const/16 v4, 0x8",
+        "    invoke-virtual {v15, v4, v4, v4, v4}, Landroid/view/View;->setPadding(IIII)V",
+        "    new-instance v16, Lapkagi/menu/MenuVisibilityClickListener;",
+        "    const/16 v17, 0x8",
+        "    invoke-direct {v16, p1, v12, v3, v17}, Lapkagi/menu/MenuVisibilityClickListener;-><init>(Landroid/content/Context;Landroid/view/View;Landroid/view/View;I)V",
+        "    invoke-virtual {v15, v16}, Landroid/view/View;->setOnClickListener(Landroid/view/View$OnClickListener;)V",
+        "    new-instance v16, Lapkagi/menu/MenuVisibilityClickListener;",
+        "    const/4 v17, 0x0",
+        "    invoke-direct {v16, p1, v12, v3, v17}, Lapkagi/menu/MenuVisibilityClickListener;-><init>(Landroid/content/Context;Landroid/view/View;Landroid/view/View;I)V",
+        "    invoke-virtual {v3, v16}, Landroid/view/View;->setOnClickListener(Landroid/view/View$OnClickListener;)V",
+        "    new-instance v16, Lapkagi/menu/OverlayMenuDragTouchListener;",
+        "    invoke-direct {v16, p0}, Lapkagi/menu/OverlayMenuDragTouchListener;-><init>(Lapkagi/menu/OverlayMenuService;)V",
+        "    invoke-virtual {v3, v16}, Landroid/view/View;->setOnTouchListener(Landroid/view/View$OnTouchListener;)V",
+        "    invoke-virtual {v13, v16}, Landroid/view/View;->setOnTouchListener(Landroid/view/View$OnTouchListener;)V",
+        "    invoke-virtual {v13, v14}, Landroid/widget/LinearLayout;->addView(Landroid/view/View;)V",
+        "    invoke-virtual {v13, v15}, Landroid/widget/LinearLayout;->addView(Landroid/view/View;)V",
+        "    invoke-virtual {v12, v13}, Landroid/widget/LinearLayout;->addView(Landroid/view/View;)V",
         *widget_lines,
+        f"    const/4 v16, {default_open}",
+        "    invoke-static {p1, v16}, Lapkagi/menu/MenuActions;->isMenuOpen(Landroid/content/Context;Z)Z",
+        "    move-result v16",
+        "    if-eqz v16, :apkagi_overlay_view_collapsed",
+        "    const/16 v17, 0x8",
+        "    invoke-virtual {v3, v17}, Landroid/view/View;->setVisibility(I)V",
+        "    const/4 v17, 0x0",
+        "    invoke-virtual {v12, v17}, Landroid/view/View;->setVisibility(I)V",
+        "    goto :apkagi_overlay_view_visibility_done",
+        ":apkagi_overlay_view_collapsed",
+        "    const/4 v17, 0x0",
+        "    invoke-virtual {v3, v17}, Landroid/view/View;->setVisibility(I)V",
+        "    const/16 v17, 0x8",
+        "    invoke-virtual {v12, v17}, Landroid/view/View;->setVisibility(I)V",
+        ":apkagi_overlay_view_visibility_done",
+        "    invoke-virtual {v2, v3}, Landroid/widget/FrameLayout;->addView(Landroid/view/View;)V",
+        "    invoke-virtual {v2, v12}, Landroid/widget/FrameLayout;->addView(Landroid/view/View;)V",
         "    return-object v2",
         ".end method",
         "",
@@ -1563,13 +2289,17 @@ def inject_runtime_menu_scaffold(
     requirements = _runtime_menu_requirements(requested_mode)
     has_toggle = "toggle" in normalized_spec["control_types"]
     has_slider = "slider" in normalized_spec["control_types"]
+    hook_bindings = [binding for binding in normalized_spec.get("hook_bindings", []) if isinstance(binding, dict)]
 
     helper_files = {
         "InAppMenuBridge.smali": _generate_bridge_smali(normalized_spec),
         "MenuLifecycleCallbacks.smali": _generate_lifecycle_callbacks_smali(),
         "MenuActionClickListener.smali": _generate_click_listener_smali(),
+        "MenuVisibilityClickListener.smali": _generate_visibility_listener_smali(),
         "MenuActions.smali": _generate_actions_smali(normalized_spec),
     }
+    if hook_bindings:
+        helper_files["RuntimeHookBindings.smali"] = _generate_runtime_hook_bindings_smali(hook_bindings)
     if requested_mode in {"in_app", "hybrid"}:
         helper_files["MenuPanelDragTouchListener.smali"] = _generate_panel_drag_listener_smali()
     if has_toggle:
@@ -1587,13 +2317,17 @@ def inject_runtime_menu_scaffold(
             "requested_overlay_mode": requested_mode,
             "effective_overlay_mode": effective_mode,
             "menu_title": normalized_spec["title"],
+            "launcher_label": normalized_spec["launcher_label"],
+            "start_collapsed": normalized_spec["start_collapsed"],
             "actions_generated": [button["id"] for button in normalized_spec["buttons"]],
             "control_types": normalized_spec["control_types"],
+            "section_count": normalized_spec["section_count"],
+            "hook_binding_count": len(hook_bindings),
             "helper_files": sorted(helper_files),
             "tier_b_requirements": requirements,
             "notes": [
                 "Dry run only: no smali files or bootstrap hooks were written.",
-                "The current implementation generates draggable button/toggle/slider controls plus direct dispatcher bindings for runtime hooks.",
+                "The current implementation generates a floating launcher bubble, remembered open/close state, section headers, and direct dispatcher bindings for runtime hooks.",
             ],
         }
 
@@ -1663,16 +2397,22 @@ def inject_runtime_menu_scaffold(
         "requested_overlay_mode": requested_mode,
         "effective_overlay_mode": effective_mode,
         "menu_title": normalized_spec["title"],
+        "launcher_label": normalized_spec["launcher_label"],
+        "start_collapsed": normalized_spec["start_collapsed"],
         "actions_generated": [button["id"] for button in normalized_spec["buttons"]],
         "user_buttons": normalized_spec["user_buttons"],
         "persistent_buttons": normalized_spec["persistent_buttons"],
         "control_types": normalized_spec["control_types"],
+        "section_count": normalized_spec["section_count"],
+        "hook_binding_count": len(hook_bindings),
         "tier_b_requirements": requirements,
         "helper_classes": [
             _BRIDGE_DESCRIPTOR,
             _CLICK_DESCRIPTOR,
+            _VISIBILITY_DESCRIPTOR,
             _ACTIONS_DESCRIPTOR,
             _LIFECYCLE_DESCRIPTOR,
+            *([_HOOK_BINDINGS_DESCRIPTOR] if hook_bindings else []),
             *([_PANEL_DRAG_DESCRIPTOR] if requested_mode in {"in_app", "hybrid"} else []),
             *([_TOGGLE_DESCRIPTOR] if has_toggle else []),
             *([_SLIDER_DESCRIPTOR] if has_slider else []),
@@ -1684,7 +2424,9 @@ def inject_runtime_menu_scaffold(
         "rollback_files": list(backed_up.values()),
         "validation": validations,
         "notes": [
-            "The runtime-menu scaffold now generates a draggable floating panel with button, toggle, and slider controls.",
+            "The runtime-menu scaffold now generates a real floating launcher bubble that opens/closes a draggable panel.",
+            "Launcher visibility and floating position are remembered across later attaches/service restarts.",
+            "Buttons can be grouped with section headers using the action-level section field.",
             "Persistent button/toggle/slider state is re-applied on later attaches/resumes until the generated reset button is pressed.",
             "kind=dispatcher binds controls directly to static runtime-hook methods without extra app-side glue.",
             "When system_overlay or hybrid is requested, the scaffold generates a real WindowManager overlay service and overlay-permission request flow.",
