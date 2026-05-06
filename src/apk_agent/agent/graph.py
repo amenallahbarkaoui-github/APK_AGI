@@ -1147,17 +1147,18 @@ def _tools_post_router(state: AgentState) -> Literal["agent", "human_step"]:
     return "agent"
 
 
-def _auto_build_graph_and_index():
+def _auto_build_graph_and_index(progress_task_id: str | None = None):
     """Automatically build code graph + index after decompilation.
     Runs graph and index builds in parallel threads for ~2x speedup.
     Each build internally uses ThreadPoolExecutor for file I/O parallelism.
     """
     try:
         from concurrent.futures import ThreadPoolExecutor
+        from threading import Lock
         from apk_agent.agent.execution_context import set_runtime_slot
         from apk_agent.tools.code_graph import build_code_graph, save_graph
         from apk_agent.tools.index_cache import build_code_index, save_index
-        from apk_agent.progress import report_progress
+        from apk_agent.progress import progress_manager, report_progress, set_current_task
 
         smali_dirs = _get_all_smali_dirs()
         if not smali_dirs:
@@ -1172,19 +1173,74 @@ def _auto_build_graph_and_index():
         # Build graph and index in PARALLEL (each also uses internal threading)
         logger.info("Auto-building code graph + index in parallel after decompilation...")
 
+        progress_lock = Lock()
+        progress_state = {
+            "graph": 0.0,
+            "index": 0.0,
+            "overall": 20.0,
+        }
+
+        def _emit_build_progress(kind: str, pct: float, detail: str = "") -> None:
+            pct_value = max(0.0, min(100.0, float(pct or 0.0)))
+            if not progress_task_id:
+                report_progress(pct_value, detail)
+                return
+
+            with progress_lock:
+                prior = float(progress_state.get(kind, 0.0))
+                if pct_value < prior:
+                    pct_value = prior
+                progress_state[kind] = pct_value
+                combined_pct = (float(progress_state["graph"]) + float(progress_state["index"])) / 2.0
+                overall_pct = 20.0 + (combined_pct / 100.0) * 65.0
+                overall_pct = max(float(progress_state["overall"]), min(85.0, overall_pct))
+                progress_state["overall"] = overall_pct
+                graph_pct = int(round(float(progress_state["graph"])))
+                index_pct = int(round(float(progress_state["index"])))
+
+            compact_detail = " ".join(str(detail or "").split())
+            if len(compact_detail) > 72:
+                compact_detail = compact_detail[:69].rstrip() + "..."
+            summary = f"Graph {graph_pct}% | Index {index_pct}%"
+            if compact_detail:
+                label = "Graph" if kind == "graph" else "Index"
+                summary += f" | {label}: {compact_detail}"
+            progress_manager.update_task(progress_task_id, progress_pct=overall_pct, detail=summary)
+
         def _build_graph():
-            G = build_code_graph(smali_dirs, progress_callback=report_progress)
+            if progress_task_id:
+                set_current_task(progress_task_id)
+            G = build_code_graph(
+                smali_dirs,
+                progress_callback=lambda pct, detail="": _emit_build_progress("graph", pct, detail),
+            )
             if G.number_of_nodes() == 0:
                 raise RuntimeError("Code graph build produced 0 nodes — decompilation may have failed")
             graph_path = outputs_dir / "call_graph.pickle"
             save_graph(G, graph_path)
+            _emit_build_progress(
+                "graph",
+                100,
+                f"Graph built: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges",
+            )
             return G
 
         def _build_index():
-            idx = build_code_index(smali_dirs, jadx_dir=jadx_dir,
-                                   progress_callback=report_progress)
+            if progress_task_id:
+                set_current_task(progress_task_id)
+            idx = build_code_index(
+                smali_dirs,
+                jadx_dir=jadx_dir,
+                progress_callback=lambda pct, detail="": _emit_build_progress("index", pct, detail),
+            )
             index_path = outputs_dir / "code_index.json"
             save_index(idx, index_path)
+            stats = idx.get("stats", {}) if isinstance(idx, dict) else {}
+            _emit_build_progress(
+                "index",
+                100,
+                f"Index built: {stats.get('total_classes', '?')} classes, {stats.get('total_methods', '?')} methods",
+            )
             return idx
 
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -1198,6 +1254,12 @@ def _auto_build_graph_and_index():
             idx = index_future.result()
             set_runtime_slot("code_index", idx)
             logger.info(f"Code index built: {idx['stats']['total_classes']} classes, {idx['stats']['total_methods']} methods")
+            if progress_task_id:
+                progress_manager.update_task(
+                    progress_task_id,
+                    progress_pct=85,
+                    detail="Graph 100% | Index 100% | Graph and index build complete",
+                )
 
     except ImportError as e:
         logger.error(f"CRITICAL: Skipping graph build (missing dependency): {e}")
@@ -1653,9 +1715,9 @@ def tools_postprocess(state: AgentState) -> dict:
                     progress_manager.update_task(
                         postprocess_task_id,
                         progress_pct=20,
-                        detail="Building graph and index after decompilation",
+                        detail="Starting graph and index build after decompilation",
                     )
-                    _auto_build_graph_and_index()
+                    _auto_build_graph_and_index(progress_task_id=postprocess_task_id)
                     updates["graph_ready"] = True
                     # Inject a visible message so the agent KNOWS graph is ready
                     from apk_agent.agent.execution_context import get_runtime_slot

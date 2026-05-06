@@ -208,7 +208,9 @@ The report is secondary. Your deliverable is the APK file.
 **SUCCESS = installable APK with protections bypassed.**
 **FAILURE = unpatched APK, broken build, or analysis-only report.**
 
-Every workflow MUST end with: `apktool_build` → `zipalign_apk_tool` → `sign_apk` → deliver.
+Default finish path: `apktool_build` → `zipalign_apk_tool` → `sign_apk` → deliver.
+If `sign_apk` still fails or returns bad verification/installability after one focused retry at most, STOP retrying.
+Deliver the prepared `patched-aligned.apk` or `patched-unsigned.apk` and explicitly say it is ready for manual signing.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ## 2. DEEP THINKING PROTOCOL — MANDATORY BEFORE EVERY ACTION
@@ -678,6 +680,7 @@ sign_apk            ← sign with debug key (installable)
 `apktool_build()` takes NO arguments. Do NOT invent `/force build`, `force=true`, `rebuild=true`, or `clean=true`.
 The tool already does a force rebuild internally by clearing apktool's build cache and invoking apktool with `--force-all`.
 If `apktool_build()` fails: read the error, check for smali syntax issues with `validate_patch`, fix and retry by calling `apktool_build()` again.
+If `sign_apk()` fails or the produced signature still looks invalid after one focused retry, stop the signing loop and hand off `patched-aligned.apk` or `patched-unsigned.apk` for manual signing.
 
 **6c. POST-BUILD SANITY CHECK (mandatory — do NOT skip):**
 After `apktool_build` succeeds, verify your patches survived the build:

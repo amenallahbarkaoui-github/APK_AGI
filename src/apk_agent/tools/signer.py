@@ -16,7 +16,7 @@ _APKSIGNER_VERIFY_SCHEME_RE = re.compile(
     re.IGNORECASE,
 )
 
-_REQUIRED_SIGNATURE_SCHEMES = ("v1", "v2", "v3")
+_MODERN_SIGNATURE_SCHEMES = ("v2", "v3", "v3.1", "v4")
 
 
 def _extract_verified_signature_schemes(verify_output: str) -> tuple[list[str], dict[str, bool]]:
@@ -31,6 +31,48 @@ def _extract_verified_signature_schemes(verify_output: str) -> tuple[list[str], 
             schemes.append(scheme)
 
     return schemes, scheme_details
+
+
+def _build_verify_commands(
+    *,
+    signer_bin: str,
+    signer_name: str,
+    final_apk: Path,
+    verify_bin: Optional[str | Path] = None,
+) -> list[list[str]]:
+    commands: list[list[str]] = []
+    seen: set[tuple[str, ...]] = set()
+
+    def _add(cmd: list[str]) -> None:
+        key = tuple(str(part) for part in cmd)
+        if key in seen:
+            return
+        seen.add(key)
+        commands.append(cmd)
+
+    apksigner_verify_bin = str(verify_bin) if verify_bin else ""
+    if not apksigner_verify_bin:
+        if "uber" not in signer_name and not signer_name.endswith(".jar") and "jarsigner" not in signer_name:
+            apksigner_verify_bin = signer_bin
+        else:
+            apksigner_verify_bin = "apksigner"
+
+    if apksigner_verify_bin:
+        _add([apksigner_verify_bin, "verify", "--verbose", "--print-certs", str(final_apk)])
+
+    if "jarsigner" in signer_name:
+        _add([signer_bin, "-verify", "-certs", "-verbose", str(final_apk)])
+    elif "uber" in signer_name or signer_name.endswith(".jar"):
+        _add(["jarsigner", "-verify", "-certs", "-verbose", str(final_apk)])
+
+    return commands
+
+
+def _is_apksigner_verify_command(cmd: list[str]) -> bool:
+    if not cmd:
+        return False
+    binary_name = Path(str(cmd[0])).stem.lower()
+    return "apksigner" in binary_name and len(cmd) > 1 and cmd[1] == "verify"
 
 
 def _validate_keystore(
@@ -123,6 +165,7 @@ def sign_apk(
     keystore_password: str = "android",
     key_alias: str = "androiddebugkey",
     key_password: str = "android",
+    verify_bin: Optional[str | Path] = None,
     log_file: Optional[Path] = None,
 ) -> ToolResult:
     """Sign an APK using apksigner, uber-apk-signer, or jarsigner.
@@ -211,54 +254,91 @@ def sign_apk(
         result.stderr = "Signer reported success but no signed APK was created."
         return result
 
-    if "uber" not in signer_name and signer_name.endswith(".jar") is False and "jarsigner" not in signer_name:
-        verify_cmd = [signer_bin, "verify", "--verbose", "--print-certs", str(final_apk)]
-        verify_result = run_tool_command(verify_cmd, log_file=log_file, timeout=120)
-        if not verify_result.success:
-            result.success = False
-            result.exit_code = verify_result.exit_code
-            verify_details = (verify_result.stderr or verify_result.stdout or "apksigner verify failed").strip()
-            result.stderr = (
-                (result.stderr + "\n" if result.stderr else "")
-                + f"Signature verification failed: {verify_details}"
-            )
-            try:
-                final_apk.unlink(missing_ok=True)
-            except OSError:
-                pass
-            return result
+    verify_result: ToolResult | None = None
+    verify_cmd_used: list[str] | None = None
+    last_verify_failure: ToolResult | None = None
+    for verify_cmd in _build_verify_commands(
+        signer_bin=signer_bin,
+        signer_name=signer_name,
+        final_apk=final_apk,
+        verify_bin=verify_bin,
+    ):
+        current_verify = run_tool_command(verify_cmd, log_file=log_file, timeout=120)
+        if current_verify.success:
+            verify_result = current_verify
+            verify_cmd_used = verify_cmd
+            break
+        last_verify_failure = current_verify
+        if current_verify.exit_code != -2:
+            break
 
+    if verify_result is None:
+        verify_details = "No available verification command succeeded."
+        exit_code = -4
+        if last_verify_failure is not None:
+            exit_code = last_verify_failure.exit_code
+            verify_details = (last_verify_failure.stderr or last_verify_failure.stdout or verify_details).strip()
+        result.success = False
+        result.exit_code = exit_code
+        result.artifacts["signature_verified"] = False
+        result.stderr = (
+            (result.stderr + "\n" if result.stderr else "")
+            + f"Signature verification failed: {verify_details}"
+        )
+        try:
+            final_apk.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return result
+
+    if verify_cmd_used and _is_apksigner_verify_command(verify_cmd_used):
         verify_output = "\n".join(
             chunk for chunk in [verify_result.stdout, verify_result.stderr] if chunk
         )
         verified_schemes, scheme_details = _extract_verified_signature_schemes(verify_output)
         if scheme_details:
             result.artifacts["signature_scheme_details"] = scheme_details
+            result.artifacts["signature_scheme_source"] = "apksigner verify"
+            if not any(scheme_details.values()):
+                result.success = False
+                result.exit_code = -4
+                result.artifacts["signature_verified"] = False
+                result.stderr = (
+                    (result.stderr + "\n" if result.stderr else "")
+                    + "Signature verification failed: apksigner verify did not confirm any enabled signature scheme."
+                )
+                try:
+                    final_apk.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return result
 
-        missing_required_schemes = [
-            scheme for scheme in _REQUIRED_SIGNATURE_SCHEMES
-            if not scheme_details.get(scheme, False)
-        ]
-        if missing_required_schemes:
-            result.success = False
-            result.exit_code = -4
-            result.artifacts["signature_verified"] = False
-            result.artifacts["missing_signature_schemes"] = ",".join(missing_required_schemes)
-            result.stderr = (
-                (result.stderr + "\n" if result.stderr else "")
-                + "Signature verification failed: required schemes missing or unverified: "
-                + ", ".join(missing_required_schemes)
-                + ". Refusing to report success because Android installability may depend on the full v1/v2/v3 set."
-            )
-            try:
-                final_apk.unlink(missing_ok=True)
-            except OSError:
-                pass
-            return result
+            modern_schemes = [
+                scheme for scheme in _MODERN_SIGNATURE_SCHEMES
+                if scheme_details.get(scheme, False)
+            ]
+            if modern_schemes and not scheme_details.get("v1", False):
+                result.artifacts["signature_compatibility_warning"] = (
+                    "Modern signature schemes were verified without v1/JAR signing. "
+                    "This is installable on modern Android but may not support very old devices."
+                )
+            elif scheme_details.get("v1", False) and not modern_schemes:
+                result.artifacts["signature_compatibility_warning"] = (
+                    "Only v1/JAR signing was verified. Installability may vary on newer-device policy combinations."
+                )
 
         result.artifacts["signature_verified"] = True
         if verified_schemes:
             result.artifacts["signature_schemes"] = ",".join(verified_schemes)
+    else:
+        result.artifacts["signature_verified"] = True
+        result.artifacts.setdefault("signature_scheme_source", "jarsigner verify")
+        if "jarsigner" in signer_name:
+            result.artifacts.setdefault("signature_schemes", "v1")
+            result.artifacts.setdefault(
+                "signature_compatibility_warning",
+                "Verified with jarsigner only; modern v2/v3 scheme information is unavailable from this verifier.",
+            )
 
     result.artifacts["signed_apk"] = str(final_apk)
     return result

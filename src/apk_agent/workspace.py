@@ -156,6 +156,36 @@ def _normalize_zip_name(name: str) -> str:
     return name.replace("\\", "/").strip("/")
 
 
+def _safe_archive_member_path(output_dir: Path, member_name: str) -> Path:
+    normalized = _normalize_zip_name(member_name)
+    if not normalized or normalized in {".", ".."}:
+        raise ValueError(f"Unsafe archive entry path: {member_name}")
+
+    output_root = output_dir.resolve()
+    candidate = (output_root / normalized).resolve()
+    try:
+        candidate.relative_to(output_root)
+    except ValueError as exc:
+        raise ValueError(f"Unsafe archive entry path: {member_name}") from exc
+    return candidate
+
+
+def _safe_extract_zip(zf: zipfile.ZipFile, output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for info in zf.infolist():
+        normalized = _normalize_zip_name(info.filename)
+        if not normalized:
+            continue
+        target = _safe_archive_member_path(output_dir, info.filename)
+        if info.is_dir() or info.filename.endswith(("/", "\\")):
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with zf.open(info) as src, open(target, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+
+
 def _read_xapk_manifest(zf: zipfile.ZipFile) -> dict:
     manifest_entry = next((name for name in zf.namelist() if Path(name).name == "manifest.json"), None)
     if not manifest_entry:
@@ -255,7 +285,7 @@ def extract_xapk_bundle(xapk_path: Path, output_dir: Path) -> dict:
     """Extract an XAPK bundle and return metadata about its contents."""
     output_dir.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(xapk_path) as zf:
-        zf.extractall(output_dir)
+        _safe_extract_zip(zf, output_dir)
         apk_entries = [
             _normalize_zip_name(name)
             for name in zf.namelist()

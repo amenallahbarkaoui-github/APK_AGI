@@ -1410,7 +1410,9 @@ def sign_apk() -> str:
     When to use: LAST step in the build pipeline (after apktool_build → zipalign_apk_tool).
     Automatically uses a fresh aligned APK when possible, auto-zipaligning the
     latest unsigned build if the aligned copy is missing or stale. Produces a
-    verified v1+v2+v3 signature before reporting success.
+    verified signature when signing succeeds. If signing/verification still
+    fails, do not loop on retries — hand off the aligned/unsigned APK for
+    manual signing.
 
     Returns: Text summary with success/failure status and path to the signed APK,
     or the rebuilt XAPK bundle when the original input was an XAPK.
@@ -1427,6 +1429,23 @@ def sign_apk() -> str:
     zipalign_bin = _config.get_tool_path("zipalign") or "zipalign"
     input_apk = aligned if aligned.is_file() else unsigned
     alignment_note = ""
+
+    def _manual_sign_handoff_note() -> str:
+        payload: dict[str, Any] = {
+            "manual_sign_recommended": True,
+            "reason": "Signing or signature verification failed; the user may sign the prepared APK manually.",
+        }
+        if aligned.is_file():
+            payload["preferred_manual_sign_input"] = str(aligned)
+            payload["aligned_apk"] = str(aligned)
+        if unsigned.is_file():
+            payload["unsigned_apk"] = str(unsigned)
+        if len(payload) <= 2:
+            return ""
+        return (
+            "\n\n--- manual signing fallback ---\n"
+            + json.dumps(payload, ensure_ascii=False, indent=2)[:5000]
+        )
 
     if not unsigned.is_file() and not aligned.is_file():
         return ToolResult(
@@ -1495,10 +1514,11 @@ def sign_apk() -> str:
         keystore_password=_config.keystore.password,
         key_alias=_config.keystore.key_alias,
         key_password=_config.keystore.key_password,
+        verify_bin=_config.get_tool_path("apksigner") or "apksigner",
         log_file=_log_file(),
     )
     if not result.success:
-        return alignment_note + result.to_llm_str()
+        return alignment_note + result.to_llm_str() + _manual_sign_handoff_note()
 
     signed_path = Path(result.artifacts.get("signed_apk", signed)).resolve()
     apk_errors = validate_apk(signed_path, _config.max_apk_size_mb)
@@ -1515,11 +1535,11 @@ def sign_apk() -> str:
         scheme_details = result.artifacts.get("signature_scheme_details")
         if isinstance(scheme_details, dict) and scheme_details:
             cert_info["signature_scheme_details"] = scheme_details
-    has_v1_signature = "v1" in verified_schemes or (
-        bool(cert_info.get("signing_files")) and "v1" in str(cert_info.get("signature_scheme", "")).lower()
-    )
+    compatibility_warning = str(result.artifacts.get("signature_compatibility_warning", "") or "").strip()
+    if compatibility_warning:
+        cert_info["signature_compatibility_warning"] = compatibility_warning
 
-    if apk_errors or not has_v1_signature:
+    if apk_errors:
         failure = ToolResult(
             success=False,
             exit_code=-8,
@@ -1529,7 +1549,6 @@ def sign_apk() -> str:
             artifacts={
                 "signed_apk": str(signed_path),
                 "apk_structure_errors": apk_errors,
-                "v1_signature_detected": has_v1_signature,
             },
         )
         return (
@@ -1537,6 +1556,7 @@ def sign_apk() -> str:
             + failure.to_llm_str()
             + "\n\n--- certificate analysis ---\n"
             + json.dumps(cert_info, ensure_ascii=False, indent=2)[:5000]
+            + _manual_sign_handoff_note()
         )
 
     xapk_note = ""
