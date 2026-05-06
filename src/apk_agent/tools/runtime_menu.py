@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from apk_agent.tools.code_injector import find_startup_entry, inject_code_in_method
+from apk_agent.tools.dex_engine import normalize_smali_root_name, plan_dex_injection
 from apk_agent.tools.deep_analysis import validate_smali_syntax
 from apk_agent.tools.manifest_parser import parse_manifest
 
@@ -115,8 +116,8 @@ def _slugify(value: str, *, fallback: str) -> str:
     return lowered or fallback
 
 
-def _helper_file_path(apktool_dir: Path, relative_name: str) -> Path:
-    return apktool_dir / "smali" / "apkagi" / "menu" / relative_name
+def _helper_file_path(apktool_dir: Path, relative_name: str, *, target_smali_root: str = "smali") -> Path:
+    return apktool_dir / target_smali_root / "apkagi" / "menu" / relative_name
 
 
 def _normalize_custom_helper_files(raw_files: Any) -> dict[str, str]:
@@ -359,6 +360,9 @@ def _normalize_menu_spec(spec: dict[str, Any], overlay_mode: str) -> dict[str, A
     title = str(spec.get("title") or spec.get("menu_title") or "APK AGI MOD MENU").strip() or "APK AGI MOD MENU"
     launcher_label = str(spec.get("launcher_label") or spec.get("floating_icon_label") or spec.get("bubble_label") or "MOD").strip() or "MOD"
     start_collapsed = bool(spec.get("start_collapsed", False))
+    target_smali_root = normalize_smali_root_name(
+        spec.get("target_smali_root") or spec.get("helper_smali_root") or spec.get("target_dex_root") or "smali"
+    )
     normalized_buttons = [
         _normalize_action(raw_action, idx, default_persist)
         for idx, raw_action in enumerate(buttons_raw)
@@ -384,6 +388,7 @@ def _normalize_menu_spec(spec: dict[str, Any], overlay_mode: str) -> dict[str, A
         "title": title,
         "launcher_label": launcher_label,
         "start_collapsed": start_collapsed,
+        "target_smali_root": target_smali_root,
         "buttons": normalized_buttons,
         "hook_bindings": list(spec.get("hook_bindings") or []),
         "custom_helper_files": custom_helper_files,
@@ -2285,7 +2290,6 @@ def _generate_panel_drag_listener_smali() -> str:
         "    const/4 v0, 0x1",
         "    return v0",
         ":apkagi_drag_fallthrough",
-        ":apkagi_drag_unhandled",
         "    const/4 v0, 0x0",
         "    return v0",
         ".end method",
@@ -2362,7 +2366,6 @@ def _generate_overlay_drag_listener_smali() -> str:
         "    const/4 v0, 0x1",
         "    return v0",
         ":apkagi_overlay_drag_fallthrough",
-        ":apkagi_overlay_drag_unhandled",
         "    const/4 v0, 0x0",
         "    return v0",
         ".end method",
@@ -2994,6 +2997,7 @@ def inject_runtime_menu_scaffold(
     overlay_mode: str = "in_app",
     backup_dir: str | Path | None = None,
     reapply_on_resume: bool = True,
+    target_smali_root: str = "",
     dry_run: bool = False,
 ) -> dict[str, Any]:
     """Generate and inject a first-pass runtime mod-menu scaffold into an APK tree."""
@@ -3008,6 +3012,9 @@ def inject_runtime_menu_scaffold(
     hook_bindings = [binding for binding in normalized_spec.get("hook_bindings", []) if isinstance(binding, dict)]
     include_default_helpers = bool(normalized_spec.get("include_default_helpers", True))
     custom_helper_files = dict(normalized_spec.get("custom_helper_files") or {})
+    requested_target_smali_root = normalize_smali_root_name(
+        target_smali_root or normalized_spec.get("target_smali_root") or "smali"
+    )
 
     helper_files: dict[str, str] = {}
     if include_default_helpers:
@@ -3031,12 +3038,24 @@ def inject_runtime_menu_scaffold(
             helper_files["OverlayMenuDragTouchListener.smali"] = _generate_overlay_drag_listener_smali()
     helper_files.update(custom_helper_files)
 
+    resolved_target_smali_root = requested_target_smali_root
+    injection_plan: dict[str, Any] = {}
+    if requested_target_smali_root == "auto":
+        injection_plan = plan_dex_injection(
+            apktool_dir,
+            helper_files={f"apkagi/menu/{name}": content for name, content in helper_files.items()},
+            purpose="runtime_scaffold",
+        )
+        resolved_target_smali_root = str(injection_plan.get("recommended_root") or "smali")
+
     if dry_run:
         return {
             "success": True,
             "dry_run": True,
             "requested_overlay_mode": requested_mode,
             "effective_overlay_mode": effective_mode,
+            "requested_target_smali_root": requested_target_smali_root,
+            "target_smali_root": resolved_target_smali_root,
             "menu_title": normalized_spec["title"],
             "launcher_label": normalized_spec["launcher_label"],
             "start_collapsed": normalized_spec["start_collapsed"],
@@ -3045,6 +3064,7 @@ def inject_runtime_menu_scaffold(
             "section_count": normalized_spec["section_count"],
             "hook_binding_count": len(hook_bindings),
             "helper_files": sorted(helper_files),
+            "injection_plan": injection_plan,
             "tier_b_requirements": requirements,
             "notes": [
                 "Dry run only: no smali files or bootstrap hooks were written.",
@@ -3061,7 +3081,11 @@ def inject_runtime_menu_scaffold(
 
     try:
         for relative_name, content in helper_files.items():
-            helper_path = _helper_file_path(apktool_dir, relative_name)
+            helper_path = _helper_file_path(
+                apktool_dir,
+                relative_name,
+                target_smali_root=resolved_target_smali_root,
+            )
             helper_path.parent.mkdir(parents=True, exist_ok=True)
             _backup_file(helper_path, apktool_dir, backup_root, backed_up)
             helper_path.write_text(content, encoding="utf-8")
@@ -3118,6 +3142,8 @@ def inject_runtime_menu_scaffold(
         "success": len(errors) == 0 and bool(touched_files),
         "requested_overlay_mode": requested_mode,
         "effective_overlay_mode": effective_mode,
+        "requested_target_smali_root": requested_target_smali_root,
+        "target_smali_root": resolved_target_smali_root,
         "menu_title": normalized_spec["title"],
         "launcher_label": normalized_spec["launcher_label"],
         "start_collapsed": normalized_spec["start_collapsed"],
@@ -3151,6 +3177,7 @@ def inject_runtime_menu_scaffold(
             "Buttons can be grouped with section headers using the action-level section field.",
             "Persistent button/toggle/slider state is re-applied on later attaches/resumes until the generated reset button is pressed.",
             "kind=dispatcher binds controls directly to static runtime-hook methods without extra app-side glue.",
+            "Helper classes can be written into a secondary dex root when target_smali_root is set or auto-resolved.",
             "When system_overlay or hybrid is requested, the scaffold generates a real WindowManager overlay service and overlay-permission request flow.",
             "custom_helper_files may override generated menu helpers so the agent can inject fully authored smali menu implementations through this tool.",
         ],

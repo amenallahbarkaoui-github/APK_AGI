@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from apk_agent.tools.code_injector import find_launcher_activity_entry, find_startup_entry, inject_code_in_method
+from apk_agent.tools.dex_engine import normalize_smali_root_name, plan_dex_injection
 from apk_agent.tools.deep_analysis import validate_smali_syntax
 
 
@@ -32,8 +33,8 @@ def _escape_smali_string(value: object) -> str:
     return str(value).replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _helper_file_path(apktool_dir: Path) -> Path:
-    smali_root = apktool_dir / "smali"
+def _helper_file_path(apktool_dir: Path, *, target_smali_root: str = "smali") -> Path:
+    smali_root = apktool_dir / target_smali_root
     return smali_root / "apkagi" / "runtime" / "RuntimeOverrides.smali"
 
 
@@ -590,6 +591,7 @@ def inject_runtime_override_layer(
     *,
     backup_dir: str | Path | None = None,
     reapply_on_resume: bool = False,
+    target_smali_root: str = "smali",
 ) -> dict[str, Any]:
     """Inject an internal runtime override bootstrap and helper layer."""
     apktool_dir = Path(apktool_dir)
@@ -597,9 +599,18 @@ def inject_runtime_override_layer(
     if not rules:
         return {"success": False, "error": "At least one runtime rule is required"}
 
-    helper_file = _helper_file_path(apktool_dir)
-    helper_file.parent.mkdir(parents=True, exist_ok=True)
+    requested_target_smali_root = normalize_smali_root_name(target_smali_root)
     helper_smali = _generate_helper_smali(rules)
+    resolved_target_smali_root = requested_target_smali_root
+    if requested_target_smali_root == "auto":
+        injection_plan = plan_dex_injection(
+            apktool_dir,
+            helper_files={"apkagi/runtime/RuntimeOverrides.smali": helper_smali},
+            purpose="runtime_scaffold",
+        )
+        resolved_target_smali_root = str(injection_plan.get("recommended_root") or "smali")
+    helper_file = _helper_file_path(apktool_dir, target_smali_root=resolved_target_smali_root)
+    helper_file.parent.mkdir(parents=True, exist_ok=True)
     backed_up: dict[str, str] = {}
     touched_files: set[str] = set()
     validations: list[dict[str, Any]] = []
@@ -677,6 +688,8 @@ def inject_runtime_override_layer(
         "success": len(errors) == 0 and bool(touched_files),
         "helper_class": _HELPER_DESCRIPTOR,
         "helper_file": str(helper_file),
+        "requested_target_smali_root": requested_target_smali_root,
+        "target_smali_root": resolved_target_smali_root,
         "rules_applied": len(rules),
         "runtime_modes": sorted({str(rule.get("kind", "")).lower() for rule in rules if rule.get("kind")}),
         "bootstrap_targets": bootstrap_targets,

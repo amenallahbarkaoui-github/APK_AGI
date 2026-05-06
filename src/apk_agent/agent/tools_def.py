@@ -13024,6 +13024,7 @@ def inject_runtime_menu_scaffold(
         spec_json: str,
         overlay_mode: str = "in_app",
         reapply_on_resume: bool = True,
+    target_smali_root: str = "",
         dry_run: bool = False,
 ) -> str:
         """Inject a first-pass runtime mod-menu scaffold into the current APK project.
@@ -13112,6 +13113,7 @@ def inject_runtime_menu_scaffold(
                         overlay_mode=overlay_mode,
                         backup_dir=_project.patch_backup_dir,
                         reapply_on_resume=reapply_on_resume,
+                    target_smali_root=target_smali_root,
                         dry_run=dry_run,
                 )
                 if result.get("success") and not dry_run:
@@ -13382,7 +13384,7 @@ def patch_api_response_flow(
 
 
 @tool
-def inject_runtime_override_layer(rules_json: str, reapply_on_resume: bool = False) -> str:
+def inject_runtime_override_layer(rules_json: str, reapply_on_resume: bool = False, target_smali_root: str = "smali") -> str:
     """Inject an in-APK runtime override helper and bootstrap hook.
 
     Supported rule kinds:
@@ -13405,6 +13407,7 @@ def inject_runtime_override_layer(rules_json: str, reapply_on_resume: bool = Fal
             rules,
             backup_dir=_project.patch_backup_dir,
             reapply_on_resume=reapply_on_resume,
+            target_smali_root=target_smali_root,
         )
         _patch_journal.append({
             "success": result.get("success", False),
