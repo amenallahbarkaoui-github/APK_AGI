@@ -45,6 +45,7 @@ def print_welcome(project_id: str | None = None, apk_name: str | None = None) ->
     console.print()
     console.print("[dim]Modes: normal chat │ /orchestrator (parallel) │ /auto (one-shot) │ /human (step-by-step)[/]")
     console.print("[dim]Commands: /dashboard /findings /patches /tools /status /session /tokens /help[/]")
+    console.print("[dim]More: /progress /plan /report /logs /context[/]")
     console.print("[dim]Type your task (e.g., 'full security audit', 'bypass premium', 'remove ads')[/]")
     console.print()
 
@@ -720,9 +721,9 @@ def print_help() -> None:
 
     help_text = f"""
 [bold cyan]━━━ Project ━━━[/]
-  [cyan]/new <apk_path>[/]    — Create a new project from an APK/XAPK file
-  [cyan]/open <id>[/]         — Open an existing project by ID
+    [cyan]/new <apk_path>[/]    — Create another project from an APK/XAPK file
   [cyan]/list[/]               — List all projects
+    [dim]Open an existing project:[/] restart with [cyan]--project <id>[/]
 
 [bold cyan]━━━ Dashboard & Info ━━━[/]
   [cyan]/dashboard[/]          — Full overview: findings, patches, context, progress
@@ -751,8 +752,10 @@ def print_help() -> None:
   [cyan]/quit[/]               — Exit APK Agent
 
 [bold cyan]━━━ CLI Flags ━━━[/]
+    [dim]--project / -p ID[/]         — Start directly in an existing project
   [dim]--model / -m MODEL[/]         — Override LLM model name
   [dim]--context-window / -c N[/]    — Set context window in tokens (0=auto)
+    [dim]--telegram / --no-telegram[/] — Start/skip the Telegram bridge
   [dim]--auto[/]                      — Start in auto mode
   [dim]--verbose / -v[/]             — Enable debug logging
 
@@ -769,6 +772,115 @@ def print_help() -> None:
   • [dim]"remove all ads and tracking"[/]
 """
     console.print(Panel(help_text.strip(), title="📖 Help", border_style="bright_cyan", padding=(0, 1)))
+
+
+_TOOL_CATEGORY_ORDER = [
+    "Planning & Memory",
+    "Decompilation & Build",
+    "Manifest & Components",
+    "Smali Analysis",
+    "Graph, Index & Architecture",
+    "Search & Discovery",
+    "Security & Scanning",
+    "Feature & Bypass",
+    "Deep Tracing & Injection",
+    "File & Evidence",
+    "Patching & Validation",
+    "Other & Unsorted",
+]
+
+_TOOL_CATEGORY_ICONS = {
+    "Planning & Memory": "🧠",
+    "Decompilation & Build": "🔨",
+    "Manifest & Components": "📋",
+    "Smali Analysis": "🔬",
+    "Graph, Index & Architecture": "🕸️ ",
+    "Search & Discovery": "🔍",
+    "Security & Scanning": "🛡️ ",
+    "Feature & Bypass": "🔓",
+    "Deep Tracing & Injection": "💉",
+    "File & Evidence": "📁",
+    "Patching & Validation": "🩹",
+    "Other & Unsorted": "📦",
+}
+
+
+def _categorize_tool_name(name: str) -> str:
+    if name in {"update_task_plan", "edit_task_plan", "mark_task_done", "update_scratchpad"}:
+        return "Planning & Memory"
+    if name in {"apktool_decompile", "jadx_decompile", "dex2jar_convert", "aapt2_dump", "apktool_build", "zipalign_apk_tool", "sign_apk"}:
+        return "Decompilation & Build"
+    if name in {
+        "parse_manifest", "identify_app_packages", "analyze_attack_surface", "analyze_network_config",
+        "rename_package_identity", "find_resource_colors", "find_resource_styles", "replace_resource_colors",
+        "list_resource_drawables", "analyze_native_libs", "analyze_native_re_core", "analyze_manifest_deep",
+        "score_permissions", "analyze_certificate",
+    }:
+        return "Manifest & Components"
+    if name in {
+        "scan_smali_classes", "analyze_smali_class", "find_string_decryption_patterns", "find_method_xrefs",
+        "analyze_method_deep", "detect_protections", "trace_call_chain", "reconstruct_strings",
+    }:
+        return "Smali Analysis"
+    if name.startswith("graph_") or name.startswith("index_") or name in {
+        "build_graph_and_index", "build_smali_index", "smali_index_stats", "semantic_method_slice",
+        "find_enforcement_surfaces", "map_semantic_architecture", "recover_hidden_state_model",
+        "profile_guard_and_revalidation_surface", "build_app_knowledge_pack", "summarize_app_knowledge",
+        "query_app_knowledge", "build_behavior_graph", "summarize_behavior_graph", "query_behavior_graph",
+        "recover_state_transitions", "map_security_surfaces", "analyze_network_behavior",
+        "recover_semantic_symbols", "build_dart_aot_index",
+    }:
+        return "Graph, Index & Architecture"
+    if name in {
+        "context_search", "multi_search", "xref_search", "directory_overview", "refine_search",
+        "batch_read_smali_methods", "smart_search", "extract_strings", "search_in_code", "search_interceptors",
+        "search_native_code", "search_dynamic_loaders", "route_reverse_engineering_workflow", "find_entry_points",
+        "map_hierarchy", "analyze_shared_prefs", "extract_native_strings", "scan_assets_secrets", "search_binary_strings",
+        "analyze_dart_aot", "locate_dart_aot_candidates", "plan_native_patch_targets",
+    }:
+        return "Search & Discovery"
+    if name in {
+        "scan_vulnerabilities", "list_vuln_patterns", "unified_scan", "get_threat_model", "analyze_data_flow",
+        "run_taint_analysis", "find_hardcoded_crypto", "scan_cloud_secrets",
+    }:
+        return "Security & Scanning"
+    if name in {
+        "map_feature_checks", "analyze_subscription_model", "auto_patch_bypass", "patch_flutter_ssl",
+        "inject_network_security_config", "patch_manifest_security", "remove_ads", "list_bypass_categories",
+        "generate_bypass_plans", "locate_feature_controls", "discover_entity_classes", "detect_gate_chain",
+        "trace_field_writers", "validate_patch_completeness", "smart_entity_patch", "frida_script_generator",
+        "diff_apk_variants",
+    }:
+        return "Feature & Bypass"
+    if name in {
+        "trace_field_access", "find_class_instantiations", "inject_smali_code", "generate_constructor_override",
+        "inject_startup_hook", "batch_patch_methods", "trace_data_pipeline", "map_ui_gates",
+        "patch_shared_prefs_reads", "identify_server_checks", "cross_reference_map", "deobfuscate_names",
+        "find_dynamic_checks", "extract_all_urls", "verify_bypass_completeness", "plan_runtime_hooks",
+        "plan_runtime_menu_workflow", "draft_runtime_menu_from_hooks", "inject_runtime_menu_scaffold",
+        "configure_runtime_menu_manifest", "inject_runtime_override_layer",
+    }:
+        return "Deep Tracing & Injection"
+    if name in {
+        "read_file", "write_file", "list_files", "save_evidence", "load_evidence", "search_evidence",
+        "get_evidence_summary", "generate_report",
+    }:
+        return "File & Evidence"
+    if name in {
+        "validate_patch", "diff_patched_file", "apply_text_patch", "preview_text_patch", "apply_smali_patch",
+        "preview_smali_patch", "restore_smali_backup", "patch_binary_hex", "patch_binary_strings",
+        "patch_api_response_flow", "validate_patch_pipeline", "generate_runtime_validation_plan",
+        "preview_dart_aot_patch", "apply_dart_aot_patch", "validate_dart_aot_patch",
+    }:
+        return "Patching & Validation"
+    return "Other & Unsorted"
+
+
+def _build_tool_categories(tool_names: list[str]) -> dict[str, list[str]]:
+    categories = {category: [] for category in _TOOL_CATEGORY_ORDER}
+    for name in tool_names:
+        categories[_categorize_tool_name(name)].append(name)
+    return categories
 
 
 # ---------------------------------------------------------------------------
@@ -1132,62 +1244,7 @@ def print_tools_list() -> None:
         console.print("[dim]Could not load tools.[/]")
         return
 
-    categories = {
-        "Decompilation & Build": [],
-        "Manifest & Components": [],
-        "Smali Analysis": [],
-        "Graph & Index": [],
-        "Search & Discovery": [],
-        "Security & Scanning": [],
-        "Premium Bypass": [],
-        "Deep Tracing & Injection": [],
-        "SOTA Analysis": [],
-        "File & Evidence": [],
-        "Patching": [],
-    }
-
-    # Categorize tools by name patterns
-    for t in ALL_TOOLS:
-        name = t.name
-        if name in ("apktool_decompile", "jadx_decompile", "dex2jar_convert", "apktool_build", "zipalign_apk_tool", "sign_apk", "aapt2_dump"):
-            categories["Decompilation & Build"].append(name)
-        elif name in ("parse_manifest", "identify_app_packages", "analyze_attack_surface", "analyze_network_config", "analyze_native_libs", "analyze_native_re_core", "analyze_manifest_deep", "score_permissions", "analyze_certificate"):
-            categories["Manifest & Components"].append(name)
-        elif name in ("scan_smali_classes", "analyze_smali_class", "find_string_decryption_patterns", "find_method_xrefs", "analyze_method_deep", "detect_protections", "trace_call_chain", "reconstruct_strings"):
-            categories["Smali Analysis"].append(name)
-        elif "graph_" in name or "index_" in name or name in ("build_graph_and_index", "build_smali_index", "smali_index_stats", "semantic_method_slice", "find_enforcement_surfaces", "build_behavior_graph", "summarize_behavior_graph", "query_behavior_graph", "recover_state_transitions"):
-            categories["Graph & Index"].append(name)
-        elif name in ("context_search", "multi_search", "xref_search", "directory_overview", "refine_search", "batch_read_smali_methods", "smart_search", "extract_strings", "search_in_code", "search_interceptors", "search_native_code", "search_dynamic_loaders", "route_reverse_engineering_workflow"):
-            categories["Search & Discovery"].append(name)
-        elif name in ("scan_vulnerabilities", "list_vuln_patterns", "unified_scan", "analyze_data_flow", "run_taint_analysis", "find_hardcoded_crypto", "scan_cloud_secrets", "generate_runtime_validation_plan", "map_security_surfaces", "analyze_network_behavior"):
-            categories["Security & Scanning"].append(name)
-        elif name in ("map_feature_checks", "analyze_subscription_model", "auto_patch_bypass", "patch_flutter_ssl", "inject_network_security_config", "patch_manifest_security", "remove_ads", "list_bypass_categories", "generate_bypass_plans", "locate_feature_controls"):
-            categories["Premium Bypass"].append(name)
-        elif name in ("trace_field_access", "find_class_instantiations", "inject_smali_code", "generate_constructor_override", "inject_startup_hook", "batch_patch_methods", "trace_data_pipeline", "map_ui_gates", "patch_shared_prefs_reads", "identify_server_checks", "plan_runtime_hooks", "recover_semantic_symbols"):
-            categories["Deep Tracing & Injection"].append(name)
-        elif name in ("cross_reference_map", "deobfuscate_names", "find_dynamic_checks", "extract_all_urls", "verify_bypass_completeness", "plan_native_patch_targets"):
-            categories["SOTA Analysis"].append(name)
-        elif name in ("read_file", "write_file", "list_files", "save_evidence", "load_evidence", "search_evidence", "get_evidence_summary", "generate_report"):
-            categories["File & Evidence"].append(name)
-        elif name in ("apply_smali_patch", "preview_smali_patch", "restore_smali_backup", "validate_patch_pipeline"):
-            categories["Patching"].append(name)
-        else:
-            # Default to SOTA
-            categories["SOTA Analysis"].append(name)
-
-    cat_icons = {
-        "Decompilation & Build": "🔨",
-        "Manifest & Components": "📋",
-        "Smali Analysis": "🔬",
-        "Graph & Index": "🕸️ ",
-        "Search & Discovery": "🔍",
-        "Security & Scanning": "🛡️ ",
-        "Premium Bypass": "🔓",
-        "Deep Tracing & Injection": "💉",
-        "SOTA Analysis": "🚀",
-        "File & Evidence": "📁",
-        "Patching": "🩹",
-    }
+    categories = _build_tool_categories([tool.name for tool in ALL_TOOLS])
 
     total = len(ALL_TOOLS)
     console.print(f"\n[bold bright_cyan]🧰 APK Agent Tools — {total} total[/]\n")
@@ -1195,7 +1252,7 @@ def print_tools_list() -> None:
     for cat_name, tools in categories.items():
         if not tools:
             continue
-        icon = cat_icons.get(cat_name, "📦")
+        icon = _TOOL_CATEGORY_ICONS.get(cat_name, "📦")
         tools_str = ", ".join(f"[cyan]{t}[/]" for t in tools)
         console.print(f"  {icon} [bold]{cat_name}[/] [dim]({len(tools)})[/]")
         console.print(f"     {tools_str}")

@@ -21,8 +21,9 @@ def run_patch_validation_pipeline(
     apktool_dir: Path,
     backup_dir: Path,
     patch_journal: list[dict[str, Any]],
+    task_plan: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Run a journal-aware syntax validation pass over patched outputs."""
+    """Run a journal-aware syntax + plan-consistency validation pass."""
     patched_files = _collect_patched_files(apktool_dir, backup_dir, patch_journal)
     patched_smali = [p for p in patched_files if p.suffix.lower() == ".smali"]
     patched_xml = [p for p in patched_files if p.suffix.lower() == ".xml"]
@@ -55,6 +56,15 @@ def run_patch_validation_pipeline(
     if not patched_files:
         next_actions.append("No patched files were detected from patch journal/backups; confirm a patch actually ran.")
 
+    plan_consistency = _evaluate_plan_consistency(
+        patch_journal=patch_journal,
+        task_plan=list(task_plan or []),
+    )
+    next_actions.extend(
+        action for action in plan_consistency["next_actions"]
+        if action not in next_actions
+    )
+
     return {
         "success": True,
         "project_root": str(project_root),
@@ -63,6 +73,7 @@ def run_patch_validation_pipeline(
         "patched_xml_count": len(patched_xml),
         "patched_files": [_rel_to_apktool(apktool_dir, p) for p in patched_files[:40]],
         "prebuild_mode": "syntax_only",
+        "plan_consistency_mode": "additive",
         "journal_summary": {
             "entries": len(patch_journal),
             "by_tool": dict(sorted(tool_summary.items())),
@@ -73,6 +84,11 @@ def run_patch_validation_pipeline(
             "invalid_smali": invalid_smali[:20],
             "warning_samples": warning_samples,
         },
+        "plan_consistency": plan_consistency,
+        "plan_consistency_score": plan_consistency["score"],
+        "coverage_gaps": plan_consistency["coverage_gaps"],
+        "unsafe_overlaps": plan_consistency["unsafe_overlaps"],
+        "missing_followups": plan_consistency["missing_followups"],
         "next_actions": next_actions,
     }
 
@@ -139,6 +155,89 @@ def generate_runtime_validation_plan(
             "Capture screenshots/logcat/network evidence for every failure condition.",
             "If a scenario fails after refresh only, inspect caller/deserializer paths rather than re-patching blindly.",
         ],
+    }
+
+
+def _evaluate_plan_consistency(
+    *,
+    patch_journal: list[dict[str, Any]],
+    task_plan: list[dict[str, Any]],
+) -> dict[str, Any]:
+    successful_entries = [entry for entry in patch_journal if entry.get("success", True)]
+    coverage_gaps: list[str] = []
+    missing_followups: list[str] = []
+    unsafe_overlaps: list[dict[str, Any]] = []
+
+    pending_statuses = {"pending", "in_progress", "in-progress", "not-started", "not_started"}
+    for item in task_plan[:12]:
+        status = str(item.get("status", "")).strip().lower()
+        desc = str(item.get("desc") or item.get("task") or item.get("label") or "").strip()
+        if status in pending_statuses and desc:
+            coverage_gaps.append(f"Task plan item still {status}: {desc}")
+
+    if successful_entries and not task_plan:
+        coverage_gaps.append("Patches were recorded without any durable task plan for this workflow.")
+
+    gate_patch_tools = {
+        "apply_smali_patch",
+        "apply_text_patch",
+        "smart_entity_patch",
+        "batch_patch_methods",
+        "patch_binary_hex",
+        "patch_shared_prefs_reads",
+        "apply_dart_aot_patch",
+    }
+    companion_tools = {"patch_api_response_flow", "inject_runtime_override_layer"}
+
+    gate_like_seen = any(str(entry.get("tool", "")) in gate_patch_tools for entry in successful_entries)
+    companion_seen = any(str(entry.get("tool", "")) in companion_tools for entry in successful_entries)
+    if gate_like_seen and not companion_seen:
+        missing_followups.append(
+            "Gate-oriented patches were recorded without any response/state-boundary or runtime override companion patch."
+        )
+
+    targets: dict[str, set[str]] = {}
+    for entry in successful_entries:
+        target = str(entry.get("target_file", "") or "").strip()
+        tool = str(entry.get("tool", "unknown") or "unknown")
+        if not target:
+            continue
+        targets.setdefault(target, set()).add(tool)
+
+    for target, tools in sorted(targets.items()):
+        if len(tools) > 1:
+            unsafe_overlaps.append({
+                "target_file": target,
+                "tools": sorted(tools),
+                "risk": "multiple_patch_tools_same_target",
+            })
+
+    score = 100
+    score -= min(40, len(coverage_gaps) * 10)
+    score -= min(30, len(missing_followups) * 20)
+    score -= min(20, len(unsafe_overlaps) * 10)
+    score = max(0, score)
+
+    next_actions: list[str] = []
+    if coverage_gaps:
+        next_actions.append("Close the remaining task-plan gaps before treating the patch set as complete.")
+    if missing_followups:
+        next_actions.append("Review response/state-boundary or runtime override followups before build if runtime revalidation can overwrite the patched state.")
+    if unsafe_overlaps:
+        next_actions.append("Inspect files touched by multiple patch tools and confirm the final method/file state before rebuild.")
+
+    return {
+        "score": score,
+        "coverage_gaps": coverage_gaps,
+        "unsafe_overlaps": unsafe_overlaps,
+        "missing_followups": missing_followups,
+        "next_actions": next_actions,
+        "signals": {
+            "task_plan_items": len(task_plan),
+            "successful_patch_entries": len(successful_entries),
+            "gate_like_seen": gate_like_seen,
+            "companion_seen": companion_seen,
+        },
     }
 
 

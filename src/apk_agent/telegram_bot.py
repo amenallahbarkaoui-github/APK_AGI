@@ -1495,6 +1495,11 @@ class TelegramBotService:
                     "excluded_packages": [],
                     "scratchpad": {},
                     "task_plan": [],
+                    "planning_started": False,
+                    "analysis_complete_for_patching": False,
+                    "patch_plan_ready": False,
+                    "prebuild_validation_ready": False,
+                    "runtime_validation_ready": False,
                 }
             )
         return input_state

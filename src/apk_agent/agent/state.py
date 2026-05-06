@@ -60,3 +60,10 @@ class AgentState(TypedDict):
 
     # ---- task decomposition ----
     task_plan: list[dict[str, Any]]  # [{id, desc, status: pending|in_progress|done}, ...]
+
+    # ---- planning readiness ----
+    planning_started: bool  # True once a concrete task plan exists
+    analysis_complete_for_patching: bool  # True after evidence-first analysis has run
+    patch_plan_ready: bool  # True after a concrete patch preview/plan exists
+    prebuild_validation_ready: bool  # True after validate_patch_pipeline passes
+    runtime_validation_ready: bool  # True after a runtime validation checklist exists

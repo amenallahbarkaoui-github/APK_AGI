@@ -340,6 +340,18 @@ def agent_node(state: AgentState) -> dict:
             icon = "✅" if status == "done" else "🔄" if status == "in_progress" else "⬜"
             summary_parts.append(f"  {icon} [{t.get('id', '?')}] {_shorten_state_text(t.get('desc', ''), max_chars=110)}")
 
+    planning_started = bool(state.get("planning_started", False) or task_plan)
+    if planning_started or state.get("patch_plan_ready") or state.get("prebuild_validation_ready") or state.get("runtime_validation_ready"):
+        summary_parts.append("🧭 Planning Readiness:")
+        summary_parts.append(
+            "  "
+            f"{'✅' if planning_started else '⬜'} plan  "
+            f"{'✅' if state.get('analysis_complete_for_patching', False) else '⬜'} analysis  "
+            f"{'✅' if state.get('patch_plan_ready', False) else '⬜'} patch-plan  "
+            f"{'✅' if state.get('prebuild_validation_ready', False) else '⬜'} prebuild-validation  "
+            f"{'✅' if state.get('runtime_validation_ready', False) else '⬜'} runtime-validation"
+        )
+
     # Patch registry — full journal of every patch attempt (survives compaction)
     # (uses local `registry` which may have user-feedback updates from above)
     if registry:
@@ -661,9 +673,131 @@ _PLAN_REQUIRED_PATCH_TOOLS = frozenset({
     "remove_ads",
     "apply_dart_aot_patch",
 })
+_BUILD_AND_SIGN_TOOLS = frozenset({"apktool_build", "zipalign_apk_tool", "sign_apk"})
+_STRATEGIC_ANALYSIS_TOOLS = frozenset({
+    "map_semantic_architecture",
+    "recover_hidden_state_model",
+    "profile_guard_and_revalidation_surface",
+    "find_enforcement_surfaces",
+    "build_app_knowledge_pack",
+    "summarize_app_knowledge",
+    "build_behavior_graph",
+    "summarize_behavior_graph",
+    "query_behavior_graph",
+    "locate_feature_controls",
+    "recover_state_transitions",
+    "map_security_surfaces",
+    "semantic_method_slice",
+    "analyze_network_behavior",
+    "recover_semantic_symbols",
+})
 
 
-def should_continue(state: AgentState) -> Literal["tools", "human_review", "planning_guard", "nudge", "__end__"]:
+def _tool_call_name(tool_call: dict[str, Any]) -> str:
+    return str(tool_call.get("name", "") or "")
+
+
+def _tool_call_args(tool_call: dict[str, Any]) -> dict[str, Any]:
+    args = tool_call.get("args")
+    return args if isinstance(args, dict) else {}
+
+
+def _is_patch_planning_call(tool_call: dict[str, Any]) -> bool:
+    name = _tool_call_name(tool_call)
+    args = _tool_call_args(tool_call)
+    if name in _TASK_PLAN_TOOL_NAMES:
+        return True
+    if name in _STRATEGIC_ANALYSIS_TOOLS:
+        return True
+    if name in {"validate_patch_pipeline", "generate_runtime_validation_plan", "preview_smali_patch", "preview_text_patch"}:
+        return True
+    if name == "smart_entity_patch":
+        return str(args.get("mode", "preview") or "preview").strip().lower() != "auto"
+    if name == "patch_api_response_flow":
+        return bool(args.get("dry_run"))
+    return False
+
+
+def _is_mutating_patch_call(tool_call: dict[str, Any]) -> bool:
+    name = _tool_call_name(tool_call)
+    if name not in _PLAN_REQUIRED_PATCH_TOOLS:
+        return False
+    return not _is_patch_planning_call(tool_call)
+
+
+def _planning_blockers_for_tool_calls(state: AgentState, tool_calls: list[dict[str, Any]]) -> list[str]:
+    blockers: list[str] = []
+    mutating_patch_calls = [tc for tc in tool_calls if _is_mutating_patch_call(tc)]
+    build_calls = [tc for tc in tool_calls if _tool_call_name(tc) in _BUILD_AND_SIGN_TOOLS]
+    has_patch_workflow = bool(
+        state.get("patch_plan_ready")
+        or state.get("patch_registry")
+        or state.get("patch_results")
+    )
+
+    if mutating_patch_calls:
+        if not (state.get("task_plan") or []):
+            blockers.append("task_plan")
+        if not bool(state.get("analysis_complete_for_patching", False)):
+            blockers.append("analysis_complete_for_patching")
+        if not bool(state.get("patch_plan_ready", False)):
+            blockers.append("patch_plan_ready")
+
+    if build_calls and has_patch_workflow:
+        if not bool(state.get("prebuild_validation_ready", False)):
+            blockers.append("prebuild_validation_ready")
+        if not bool(state.get("runtime_validation_ready", False)):
+            blockers.append("runtime_validation_ready")
+
+    return blockers
+
+
+def _planning_guidance_text(blockers: list[str]) -> str:
+    guidance: list[str] = []
+    if "task_plan" in blockers:
+        guidance.append("Consider recording a concrete multi-step task plan with update_task_plan.")
+    if "analysis_complete_for_patching" in blockers:
+        guidance.append("Consider running evidence-first analysis such as map_semantic_architecture, recover_hidden_state_model, profile_guard_and_revalidation_surface, or find_enforcement_surfaces.")
+    if "patch_plan_ready" in blockers:
+        guidance.append("Consider producing a patch preview first via smart_entity_patch(mode='preview'), patch_api_response_flow(dry_run=true), preview_smali_patch, or preview_text_patch.")
+    if "prebuild_validation_ready" in blockers:
+        guidance.append("Consider running validate_patch_pipeline before rebuild/sign so syntax and consistency risks are explicit.")
+    if "runtime_validation_ready" in blockers:
+        guidance.append("Consider generating a runtime checklist with generate_runtime_validation_plan before shipping the final APK.")
+    return " ".join(guidance).strip()
+
+
+def _tool_result_success(data: Any, content: str) -> bool:
+    if isinstance(data, dict):
+        if data.get("success") is False:
+            return False
+        if data.get("error") and data.get("success") is not True:
+            return False
+        return True
+    lower = str(content or "").strip().lower()
+    return '"success": false' not in lower and '"error"' not in lower[:160] and not lower.startswith("error")
+
+
+def _validation_pipeline_passed(result: Any) -> bool:
+    if not isinstance(result, dict) or not result.get("success", False):
+        return False
+
+    syntax = result.get("syntax")
+    if isinstance(syntax, dict) and int(syntax.get("invalid_smali_count", 0) or 0) > 0:
+        return False
+
+    class_check = result.get("class_completeness")
+    if isinstance(class_check, dict) and class_check.get("success") is False:
+        return False
+
+    global_check = result.get("global_gate_check")
+    if isinstance(global_check, dict) and global_check.get("success") is False:
+        return False
+
+    return True
+
+
+def should_continue(state: AgentState) -> Literal["tools", "human_review", "nudge", "__end__"]:
     """Route after agent node: tool call → tools, text-only → nudge or end."""
 
     if not state["messages"]:
@@ -679,11 +813,6 @@ def should_continue(state: AgentState) -> Literal["tools", "human_review", "plan
     # If the LLM wants to call tools
     if last_msg.tool_calls:
         _set_nudge_count(0)
-        task_plan = state.get("task_plan") or []
-        requested_tools = {str(tc.get("name", "")) for tc in last_msg.tool_calls}
-        if not task_plan and any(name in _PLAN_REQUIRED_PATCH_TOOLS for name in requested_tools):
-            if not requested_tools.issubset(_TASK_PLAN_TOOL_NAMES):
-                return "planning_guard"
         # Check if any tool call is a high-risk patch (apply_smali_patch)
         for tc in last_msg.tool_calls:
             if tc["name"] == "apply_smali_patch":
@@ -760,44 +889,56 @@ def nudge_node(state: AgentState) -> dict:
 
 
 def planning_guard_node(state: AgentState) -> dict:
-    """Reject patch tool calls until the agent records a concrete task plan."""
+    """Generate advisory guidance for missing planning and validation signals."""
     last_msg = state["messages"][-1]
     if not isinstance(last_msg, AIMessage):
         return {"messages": []}
 
-    blocked_calls = [
-        tc for tc in last_msg.tool_calls
-        if str(tc.get("name", "")) in _PLAN_REQUIRED_PATCH_TOOLS
-    ]
-    if not blocked_calls:
+    blockers = _planning_blockers_for_tool_calls(state, list(last_msg.tool_calls))
+    if not blockers:
         return {"messages": []}
 
-    last_msg.tool_calls = []
-    if "tool_calls" in last_msg.additional_kwargs:
-        last_msg.additional_kwargs["tool_calls"] = []
-
-    rejection_messages = [
-        ToolMessage(
-            content=json.dumps({
-                "success": False,
-                "error": "task_plan_required_before_patching",
-                "recovery_hint": "First call update_task_plan with a concrete multi-step plan, then continue with patch tools.",
-            }),
-            tool_call_id=tc["id"],
-            name=str(tc.get("name", "tool")),
-        )
-        for tc in blocked_calls
-    ]
-    rejection_messages.append(
-        HumanMessage(
-            content=(
-                "[SYSTEM] Planning is mandatory before patching. "
-                "First call update_task_plan with a concrete multi-step plan. "
-                "Then use edit_task_plan and mark_task_done to keep it current as you execute patches."
+    guidance_text = _planning_guidance_text(blockers)
+    return {
+        "messages": [
+            HumanMessage(
+                content=(
+                    "[SYSTEM] Advisory only — planning or validation signals are incomplete. "
+                    f"Missing signals: {', '.join(blockers)}. {guidance_text} "
+                    "Execution remains allowed; treat any resulting patch/build/sign outcome as lower-confidence until the followups are checked."
+                )
             )
+        ]
+    }
+
+
+def _build_execution_advisory_message(state: AgentState) -> HumanMessage | None:
+    messages = list(state.get("messages") or [])
+    idx = len(messages) - 1
+    while idx >= 0 and isinstance(messages[idx], ToolMessage):
+        idx -= 1
+    if idx < 0 or not isinstance(messages[idx], AIMessage):
+        return None
+
+    tool_calls = list(messages[idx].tool_calls or [])
+    if not tool_calls:
+        return None
+
+    blockers = _planning_blockers_for_tool_calls(state, tool_calls)
+    if not blockers:
+        return None
+
+    if not any(_is_mutating_patch_call(tc) or _tool_call_name(tc) in _BUILD_AND_SIGN_TOOLS for tc in tool_calls):
+        return None
+
+    guidance_text = _planning_guidance_text(blockers)
+    return HumanMessage(
+        content=(
+            "[SYSTEM] Advisory only — the last execution continued despite incomplete planning/validation signals. "
+            f"Missing signals: {', '.join(blockers)}. {guidance_text} "
+            "Use these as risk annotations and suggested followups, not as mandatory blockers."
         )
     )
-    return {"messages": rejection_messages}
 
 
 def human_review_node(state: AgentState) -> dict:
@@ -1202,6 +1343,11 @@ def tools_postprocess(state: AgentState) -> dict:
     new_patches: list[dict] = []
     new_registry_entries: list[dict] = []
     new_tool_history: list[dict[str, Any]] = []
+    planning_started = bool(state.get("planning_started", False))
+    analysis_complete_for_patching = bool(state.get("analysis_complete_for_patching", False))
+    patch_plan_ready = bool(state.get("patch_plan_ready", False))
+    prebuild_validation_ready = bool(state.get("prebuild_validation_ready", False))
+    runtime_validation_ready = bool(state.get("runtime_validation_ready", False))
 
     import time as _time
     _ts = _time.strftime("%Y-%m-%d %H:%M:%S")
@@ -1220,7 +1366,44 @@ def tools_postprocess(state: AgentState) -> dict:
         tool_name = getattr(msg, "name", "") or ""
         raw_content = msg.content if isinstance(msg.content, str) else ""
         content = _resolve_tool_postprocess_content(raw_content)
+        try:
+            parsed = json.loads(content)
+        except (json.JSONDecodeError, TypeError):
+            parsed = None
+        success = _tool_result_success(parsed, content)
         new_tool_history.append(_summarize_tool_result(tool_name, content, _ts))
+
+        if tool_name in _STRATEGIC_ANALYSIS_TOOLS and success:
+            analysis_complete_for_patching = True
+
+        if tool_name in _PLAN_REQUIRED_PATCH_TOOLS and success and not (
+            tool_name == "smart_entity_patch" and isinstance(parsed, dict) and str(parsed.get("mode", "preview") or "preview").strip().lower() != "auto"
+        ) and not (
+            tool_name == "patch_api_response_flow" and isinstance(parsed, dict) and bool(parsed.get("dry_run"))
+        ):
+            prebuild_validation_ready = False
+            runtime_validation_ready = False
+
+        if tool_name == "smart_entity_patch" and isinstance(parsed, dict) and success:
+            mode = str(parsed.get("mode", "") or "").strip().lower()
+            semantic_plan = parsed.get("semantic_plan") if isinstance(parsed.get("semantic_plan"), dict) else {}
+            if mode == "preview" and (
+                parsed.get("patches_preview")
+                or semantic_plan.get("execution_order")
+                or semantic_plan.get("preferred_first_action")
+            ):
+                analysis_complete_for_patching = True
+                patch_plan_ready = True
+        elif tool_name == "patch_api_response_flow" and isinstance(parsed, dict) and success:
+            analysis_complete_for_patching = True
+            if parsed.get("selected_strategy") or parsed.get("validation") or parsed.get("files_modified") or parsed.get("patches_applied"):
+                patch_plan_ready = True
+        elif tool_name in {"preview_smali_patch", "preview_text_patch"} and isinstance(parsed, dict) and success:
+            patch_plan_ready = True
+        elif tool_name == "validate_patch_pipeline":
+            prebuild_validation_ready = _validation_pipeline_passed(parsed)
+        elif tool_name == "generate_runtime_validation_plan":
+            runtime_validation_ready = bool(success and isinstance(parsed, dict) and parsed.get("scenarios"))
 
         # Extract vulnerability findings
         if tool_name in ("scan_vulnerabilities", "detect_protections"):
@@ -1497,9 +1680,29 @@ def tools_postprocess(state: AgentState) -> dict:
         existing.extend(reversed(new_tool_history))
         updates["tool_history"] = existing[-60:]
 
+    execution_advisory = _build_execution_advisory_message(state)
+    if execution_advisory is not None:
+        updates.setdefault("messages", []).append(execution_advisory)
+
     # Sync working memory from module-level storage into durable state
     updates["scratchpad"] = _get_scratchpad()
-    updates["task_plan"] = _get_task_plan()
+    synced_task_plan = _get_task_plan()
+    updates["task_plan"] = synced_task_plan
+
+    planning_started = bool(synced_task_plan)
+    if not planning_started:
+        analysis_complete_for_patching = False
+        patch_plan_ready = False
+        prebuild_validation_ready = False
+        runtime_validation_ready = False
+    elif patch_plan_ready:
+        analysis_complete_for_patching = True
+
+    updates["planning_started"] = planning_started
+    updates["analysis_complete_for_patching"] = analysis_complete_for_patching
+    updates["patch_plan_ready"] = patch_plan_ready
+    updates["prebuild_validation_ready"] = prebuild_validation_ready
+    updates["runtime_validation_ready"] = runtime_validation_ready
 
     return updates
 
@@ -1567,7 +1770,6 @@ def build_graph(config: AppConfig, project: Project, checkpointer=None):
     graph.add_node("tools_post", tools_postprocess)
     graph.add_node("human_review", human_review_node)
     graph.add_node("human_step", human_step_node)
-    graph.add_node("planning_guard", planning_guard_node)
     graph.add_node("nudge", nudge_node)
 
     graph.set_entry_point("agent")
@@ -1578,7 +1780,6 @@ def build_graph(config: AppConfig, project: Project, checkpointer=None):
         {
             "tools": "tools",
             "human_review": "human_review",
-            "planning_guard": "planning_guard",
             "nudge": "nudge",
             "__end__": END,
         },
@@ -1602,9 +1803,6 @@ def build_graph(config: AppConfig, project: Project, checkpointer=None):
 
     # After nudge → back to agent to retry with tool calls
     graph.add_edge("nudge", "agent")
-
-    # After planning guard → back to agent with an explicit planning requirement
-    graph.add_edge("planning_guard", "agent")
 
     # After human review → route based on feedback
     graph.add_conditional_edges(

@@ -1290,25 +1290,30 @@ def apktool_build() -> str:
         apktool_dir=_project.apktool_dir,
         backup_dir=_project.patch_backup_dir,
         patch_journal=list(_patch_journal),
+        task_plan=_get_task_plan(),
     )
     syntax = validation_result.get("syntax", {}) if isinstance(validation_result, dict) else {}
     invalid_smali_count = int(syntax.get("invalid_smali_count", 0) or 0)
-
+    plan_consistency_score = int(validation_result.get("plan_consistency_score", 100) or 0) if isinstance(validation_result, dict) else 100
+    coverage_gaps = validation_result.get("coverage_gaps", []) if isinstance(validation_result, dict) else []
+    missing_followups = validation_result.get("missing_followups", []) if isinstance(validation_result, dict) else []
+    unsafe_overlaps = validation_result.get("unsafe_overlaps", []) if isinstance(validation_result, dict) else []
+    validation_warnings: list[str] = []
     if invalid_smali_count > 0:
-        failure = ToolResult(
-            success=False,
-            exit_code=-4,
-            stdout="",
-            stderr="Pre-build syntax validation failed. Refusing to rebuild until patched smali is valid.",
-            command="apktool_build()",
-            artifacts={
-                "invalid_smali_count": invalid_smali_count,
-            },
+        validation_warnings.append(
+            f"Invalid smali was detected ({invalid_smali_count} file(s)); rebuild is still allowed but likely lower-confidence and may fail naturally."
         )
-        return (
-            failure.to_llm_str()
-            + "\n\n--- pre-build validation ---\n"
-            + json.dumps(validation_result, ensure_ascii=False, indent=2)[:12000]
+    if coverage_gaps:
+        validation_warnings.append(
+            f"Task-plan coverage gaps remain ({len(coverage_gaps)}); followups are recommended before treating the rebuilt APK as durable."
+        )
+    if missing_followups:
+        validation_warnings.append(
+            f"Potential missing companion followups detected ({len(missing_followups)}); gate-only or partial workflows may be overwritten at runtime."
+        )
+    if unsafe_overlaps:
+        validation_warnings.append(
+            f"Overlapping patch activity was detected on {len(unsafe_overlaps)} target(s); verify final file/method state carefully after rebuild."
         )
 
     # --- PRE-BUILD: verify patched files still contain our patches ---
@@ -1334,8 +1339,23 @@ def apktool_build() -> str:
         "\n\n--- pre-build validation ---\n"
         f"mode={validation_result.get('prebuild_mode', 'syntax_only')}  "
         f"invalid_smali={invalid_smali_count}  "
-        f"patched_files={validation_result.get('patched_files_count', 0)}"
+        f"patched_files={validation_result.get('patched_files_count', 0)}  "
+        f"plan_consistency_score={plan_consistency_score}"
     )
+    if validation_warnings:
+        build_output += "\n\n--- advisory warnings ---"
+        for warning in validation_warnings:
+            build_output += f"\n⚠️ {warning}"
+    if coverage_gaps:
+        build_output += "\nSuggested followups: " + " | ".join(str(item) for item in coverage_gaps[:3])
+    if missing_followups:
+        build_output += "\nMissing followups: " + " | ".join(str(item) for item in missing_followups[:3])
+    if unsafe_overlaps:
+        build_output += "\nUnsafe overlaps: " + " | ".join(
+            f"{item.get('target_file', '?')} via {','.join(item.get('tools', [])[:3])}"
+            for item in unsafe_overlaps[:3]
+            if isinstance(item, dict)
+        )
 
     # --- POST-BUILD: verify patches survived the rebuild ---
     post_warnings = []
@@ -10917,6 +10937,7 @@ def validate_patch_pipeline(target_class: str = "", include_global_gate_check: b
             apktool_dir=_project.apktool_dir,
             backup_dir=_project.patch_backup_dir,
             patch_journal=list(_patch_journal),
+            task_plan=_get_task_plan(),
         )
 
         if target_class:

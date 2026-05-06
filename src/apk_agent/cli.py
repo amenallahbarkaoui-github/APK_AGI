@@ -859,10 +859,28 @@ def _handle_command(
                 try:
                     new_project = pm.create_project(new_path, config.max_apk_size_mb)
                     print_success(f"New project: {new_project.id} ({new_project.apk_name})")
+                    print_info(
+                        "Current session stays on the active project. "
+                        f"Restart with --project {new_project.id} to switch into the new project."
+                    )
                 except ValueError as e:
                     print_error(str(e))
             else:
                 print_error("Usage: /new <apk_path>")
+        case "/open":
+            if not arg:
+                print_error("Usage: /open <project_id>  (restart with --project <id> to switch sessions)")
+            else:
+                target_id = arg.strip()
+                try:
+                    target = pm.open_project(target_id)
+                except FileNotFoundError:
+                    print_error(f"Project {target_id} not found.")
+                else:
+                    print_info(
+                        f"Project {target.id} ({target.apk_name}) is available. "
+                        f"Restart with --project {target.id} to make it the active session."
+                    )
         case "/list":
             projects = pm.list_projects()
             if projects:
@@ -938,6 +956,11 @@ def _run_agent_turn(graph, graph_config: dict, user_input: str, project: Project
             "excluded_packages": [],
             "scratchpad": {},
             "task_plan": [],
+            "planning_started": False,
+            "analysis_complete_for_patching": False,
+            "patch_plan_ready": False,
+            "prebuild_validation_ready": False,
+            "runtime_validation_ready": False,
         })
 
     max_consecutive_errors = 3
