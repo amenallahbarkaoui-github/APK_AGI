@@ -2997,6 +2997,8 @@ def inject_runtime_menu_scaffold(
     overlay_mode: str = "in_app",
     backup_dir: str | Path | None = None,
     reapply_on_resume: bool = True,
+    auto_configure_manifest: bool = True,
+    require_foreground_service: bool = False,
     target_smali_root: str = "",
     dry_run: bool = False,
 ) -> dict[str, Any]:
@@ -3048,6 +3050,18 @@ def inject_runtime_menu_scaffold(
         )
         resolved_target_smali_root = str(injection_plan.get("recommended_root") or "smali")
 
+    manifest_auto_configured = False
+    manifest_followup_required = requested_mode in {"system_overlay", "hybrid"} and not auto_configure_manifest
+    effective_foreground_service = bool(require_foreground_service or requested_mode == "hybrid")
+    manifest_result: dict[str, Any] = {
+        "success": True,
+        "requested_overlay_mode": requested_mode,
+        "effective_overlay_mode": effective_mode,
+        "permissions_added": [],
+        "components_added": [],
+        "notes": [],
+    }
+
     if dry_run:
         return {
             "success": True,
@@ -3066,10 +3080,19 @@ def inject_runtime_menu_scaffold(
             "helper_files": sorted(helper_files),
             "injection_plan": injection_plan,
             "tier_b_requirements": requirements,
+            "manifest_auto_configure_default": requested_mode in {"system_overlay", "hybrid"},
+            "manifest_followup_required": manifest_followup_required,
+            "recommended_next_tool": "configure_runtime_menu_manifest" if manifest_followup_required else "generate_runtime_validation_plan",
+            "recommended_next_args": {
+                "overlay_mode": requested_mode,
+                "add_overlay_permission": requested_mode in {"system_overlay", "hybrid"},
+                "require_foreground_service": effective_foreground_service,
+            } if manifest_followup_required else {"task": "runtime menu scaffold and controls"},
             "notes": [
                 "Dry run only: no smali files or bootstrap hooks were written.",
                 "The current implementation generates a floating launcher bubble, remembered open/close state, section headers, and direct dispatcher bindings for runtime hooks.",
                 "custom_helper_files can override generated helpers or replace the whole helper set when include_default_helpers=false.",
+                "Overlay-based modes expect manifest/service wiring as part of a successful deployment path.",
             ],
         }
 
@@ -3135,6 +3158,22 @@ def inject_runtime_menu_scaffold(
                 if backup_path and Path(backup_path).exists():
                     shutil.copy2(backup_path, file_name)
                 errors.append(f"Syntax validation failed for {file_name}; restored from backup")
+
+        if requested_mode in {"system_overlay", "hybrid"} and auto_configure_manifest and not errors:
+            manifest_result = configure_runtime_menu_manifest(
+                apktool_dir,
+                overlay_mode=requested_mode,
+                backup_dir=backup_root,
+                add_overlay_permission=True,
+                require_foreground_service=effective_foreground_service,
+            )
+            manifest_auto_configured = True
+            if manifest_result.get("success"):
+                manifest_file = str(manifest_result.get("manifest_file") or "")
+                if manifest_file:
+                    touched_files.add(manifest_file)
+            else:
+                errors.append(f"Manifest configuration failed: {manifest_result.get('error', 'unknown error')}")
     except Exception as exc:
         errors.append(str(exc))
 
@@ -3154,6 +3193,9 @@ def inject_runtime_menu_scaffold(
         "section_count": normalized_spec["section_count"],
         "hook_binding_count": len(hook_bindings),
         "tier_b_requirements": requirements,
+        "manifest_auto_configured": manifest_auto_configured,
+        "manifest_followup_required": manifest_followup_required,
+        "manifest_config": manifest_result,
         "helper_classes": [
             _BRIDGE_DESCRIPTOR,
             _CLICK_DESCRIPTOR,
@@ -3171,6 +3213,20 @@ def inject_runtime_menu_scaffold(
         "files_modified": sorted(touched_files),
         "rollback_files": list(backed_up.values()),
         "validation": validations,
+        "recommended_next_tool": (
+            "configure_runtime_menu_manifest"
+            if manifest_followup_required
+            else "generate_runtime_validation_plan"
+        ),
+        "recommended_next_args": (
+            {
+                "overlay_mode": requested_mode,
+                "add_overlay_permission": requested_mode in {"system_overlay", "hybrid"},
+                "require_foreground_service": effective_foreground_service,
+            }
+            if manifest_followup_required
+            else {"task": "runtime menu scaffold and controls"}
+        ),
         "notes": [
             "The runtime-menu scaffold now generates a real floating launcher bubble that opens/closes a draggable panel.",
             "Launcher visibility and floating position are remembered across later attaches/service restarts.",
@@ -3179,6 +3235,7 @@ def inject_runtime_menu_scaffold(
             "kind=dispatcher binds controls directly to static runtime-hook methods without extra app-side glue.",
             "Helper classes can be written into a secondary dex root when target_smali_root is set or auto-resolved.",
             "When system_overlay or hybrid is requested, the scaffold generates a real WindowManager overlay service and overlay-permission request flow.",
+            "Overlay-based injections now auto-configure manifest permissions/services by default; disable that only when you intentionally want a separate manifest step.",
             "custom_helper_files may override generated menu helpers so the agent can inject fully authored smali menu implementations through this tool.",
         ],
         "errors": errors[:20],

@@ -12668,18 +12668,20 @@ def plan_runtime_menu_workflow(
                     "spec_json": spec_json or "<use top-level spec_json from this tool result>",
                     "overlay_mode": overlay_mode,
                     "reapply_on_resume": True,
+                    "auto_configure_manifest": overlay_requires_manifest,
+                    "require_foreground_service": overlay_mode == "hybrid",
                 },
             ),
             _step(
                 4,
                 "configure_runtime_menu_manifest",
-                "Declare overlay or service permissions only for overlay-based deployments.",
+                "Optionally rerun or verify overlay/service manifest wiring only when the injection step did not auto-apply it.",
                 {
                     "overlay_mode": overlay_mode,
                     "add_overlay_permission": overlay_requires_manifest,
                     "require_foreground_service": overlay_mode == "hybrid",
                 },
-                when="Only when overlay_mode is system_overlay or hybrid.",
+                when="Only when overlay_mode is system_overlay or hybrid and automatic manifest configuration was disabled or needs manual verification.",
             ),
             _step(
                 5,
@@ -12748,18 +12750,20 @@ def plan_runtime_menu_workflow(
                         "spec_json": spec_json or "<use top-level spec_json from this tool result>",
                         "overlay_mode": overlay_mode,
                         "reapply_on_resume": True,
+                        "auto_configure_manifest": overlay_requires_manifest,
+                        "require_foreground_service": overlay_mode == "hybrid",
                     },
                 ),
                 _step(
                     4,
                     "configure_runtime_menu_manifest",
-                    "Apply overlay or service manifest requirements only when the chosen deployment mode needs them.",
+                    "Optionally rerun or verify overlay/service manifest wiring only when the injection step did not auto-apply it.",
                     {
                         "overlay_mode": overlay_mode,
                         "add_overlay_permission": overlay_requires_manifest,
                         "require_foreground_service": overlay_mode == "hybrid",
                     },
-                    when="Only when overlay_mode is system_overlay or hybrid.",
+                    when="Only when overlay_mode is system_overlay or hybrid and automatic manifest configuration was disabled or needs manual verification.",
                 ),
                 _step(
                     5,
@@ -12829,6 +12833,8 @@ def plan_runtime_menu_workflow(
                     "spec_json": spec_json,
                     "overlay_mode": overlay_mode,
                     "reapply_on_resume": True,
+                    "auto_configure_manifest": overlay_mode in {"system_overlay", "hybrid"},
+                    "require_foreground_service": overlay_mode == "hybrid",
                 }
             return "draft_runtime_menu_from_hooks", {
                 "focus_hint": focus_hint,
@@ -13024,6 +13030,8 @@ def inject_runtime_menu_scaffold(
         spec_json: str,
         overlay_mode: str = "in_app",
         reapply_on_resume: bool = True,
+    auto_configure_manifest: bool = True,
+    require_foreground_service: bool = False,
     target_smali_root: str = "",
         dry_run: bool = False,
 ) -> str:
@@ -13096,6 +13104,9 @@ def inject_runtime_menu_scaffold(
             is required for overlay_mode='in_app'.
         - If overlay_mode='system_overlay' or 'hybrid' is requested, the tool generates
             a real WindowManager overlay service and explicit Tier B requirements/warnings.
+        - `auto_configure_manifest=true` now applies the needed overlay/service manifest wiring
+            automatically for overlay-based modes; set it to false only when you intentionally want
+            a separate explicit `configure_runtime_menu_manifest(...)` step.
         - Persistent actions and control states are re-applied on later resumes/attaches until the
             generated reset button is pressed.
         """
@@ -13113,6 +13124,8 @@ def inject_runtime_menu_scaffold(
                         overlay_mode=overlay_mode,
                         backup_dir=_project.patch_backup_dir,
                         reapply_on_resume=reapply_on_resume,
+                    auto_configure_manifest=auto_configure_manifest,
+                    require_foreground_service=require_foreground_service,
                     target_smali_root=target_smali_root,
                         dry_run=dry_run,
                 )
