@@ -276,8 +276,6 @@ def _normalize_menu_spec(spec: dict[str, Any], overlay_mode: str) -> dict[str, A
     buttons_raw = spec.get("buttons") or spec.get("actions") or spec.get("items")
     if not isinstance(buttons_raw, list) or not buttons_raw:
         raise ValueError("spec must contain a non-empty buttons array")
-    if len(buttons_raw) > 8:
-        raise ValueError("buttons array is capped at 8 entries for the first runtime-menu scaffold")
 
     default_persist = bool(spec.get("persist_on_resume", True))
     title = str(spec.get("title") or spec.get("menu_title") or "APK AGI MOD MENU").strip() or "APK AGI MOD MENU"

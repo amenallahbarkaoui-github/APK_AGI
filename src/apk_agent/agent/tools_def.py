@@ -180,6 +180,7 @@ def _normalize_task_plan_items(raw_items: list[Any], *, existing: list[dict] | N
         if isinstance(raw, dict):
             text = str(
                 raw.get("desc")
+                or raw.get("text")
                 or raw.get("label")
                 or raw.get("task")
                 or raw.get("title")
@@ -6355,6 +6356,11 @@ def patch_binary_hex(
         return idx
 
     def _run():
+        from apk_agent.tools.binary_patch import (
+            describe_unsupported_binary_artifact,
+            is_unsupported_binary_artifact,
+        )
+
         p = Path(file_path)
         if not p.is_absolute():
             resolved = _resolve_file(file_path)
@@ -6365,6 +6371,20 @@ def patch_binary_hex(
 
         if not p.is_file():
             return json.dumps({"success": False, "error": f"File not found: {p}"})
+
+        if is_unsupported_binary_artifact(p):
+            return json.dumps({
+                "success": False,
+                "path": str(p),
+                "file_type": p.suffix.lower(),
+                "error": describe_unsupported_binary_artifact(
+                    p,
+                    supported_targets_hint=(
+                        "Use this tool on app binaries such as `.so`, `.dex`, `.bundle`, `.jsbundle`, "
+                        "or app-owned binary assets under `lib/` and `assets/`."
+                    ),
+                ),
+            })
 
         try:
             search = _normalize_hex(search_hex)
@@ -11431,7 +11451,7 @@ def plan_runtime_menu_workflow(
             ),
         ]
 
-        pack = _ensure_behavior_graph_pack(auto_build=True, focus_hint=focus_hint or class_name)
+        pack = _ensure_behavior_graph_pack(auto_build=False, focus_hint=focus_hint or class_name)
         if pack is None:
             return json.dumps({
                 "success": True,
@@ -11451,6 +11471,7 @@ def plan_runtime_menu_workflow(
                 "recommended_next_args": {"focus_hint": focus_hint or class_name},
                 "notes": [
                     "Behavior graph data is unavailable, so no automatic runtime-menu draft was produced yet.",
+                    "This planning helper intentionally avoids triggering a full behavior-graph build on its own.",
                     "After build_behavior_graph succeeds, rerun this helper to get a resolved spec_json and binding hints.",
                 ],
             }, ensure_ascii=False, indent=2)[:30000]
@@ -11661,9 +11682,14 @@ def draft_runtime_menu_from_hooks(
     from apk_agent.tools.runtime_menu import build_runtime_menu_spec_from_hook_plan as _build_runtime_menu_spec_from_hook_plan
 
     def _run():
-        pack = _ensure_behavior_graph_pack(auto_build=True, focus_hint=focus_hint or class_name)
+        pack = _ensure_behavior_graph_pack(auto_build=False, focus_hint=focus_hint or class_name)
         if pack is None:
-            return json.dumps({"success": False, "error": "Behavior graph unavailable. Run build_behavior_graph first."})
+            return json.dumps({
+                "success": False,
+                "error": "Behavior graph unavailable. Run build_behavior_graph first.",
+                "recommended_next_tool": "build_behavior_graph",
+                "recommended_next_args": {"focus_hint": focus_hint or class_name},
+            })
         plan = _plan_runtime_hooks(
             pack,
             focus_hint=focus_hint,

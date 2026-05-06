@@ -477,7 +477,7 @@ def _live_progress_listener(event: str, task) -> None:
         token_tracker.clear_active_tool(task.name)
         token_tracker.sync_running_tools(active_names)
         if not active_names:
-            token_tracker.set_agent_phase("processing tool results")
+            token_tracker.set_agent_phase("finalizing tool batch")
         live_bar.update()
 
 

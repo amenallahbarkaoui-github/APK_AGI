@@ -22,6 +22,11 @@ import struct
 from pathlib import Path
 from typing import Any
 
+from apk_agent.tools.binary_patch import (
+    describe_unsupported_binary_artifact,
+    is_unsupported_binary_artifact,
+)
+
 
 _ELF_MAGIC = b"\x7fELF"
 
@@ -107,6 +112,19 @@ def analyze_native_binary(
     path = Path(file_path)
     if not path.is_file():
         return {"success": False, "error": f"File not found: {path}"}
+
+    if is_unsupported_binary_artifact(path):
+        return {
+            "success": False,
+            "path": str(path),
+            "error": describe_unsupported_binary_artifact(
+                path,
+                supported_targets_hint=(
+                    "Native RE tools only support app native libraries such as `.so` / ELF binaries, "
+                    "typically under `lib/` in the decoded APK."
+                ),
+            ),
+        }
 
     data = path.read_bytes()
     parsed = _parse_elf(data)

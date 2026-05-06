@@ -1338,6 +1338,18 @@ def tools_postprocess(state: AgentState) -> dict:
     Also maintains the **patch_registry** — a durable journal of every patch
     attempt with tool, target, pattern, status, and user feedback.
     """
+    from apk_agent.progress import get_current_task, progress_manager, set_current_task
+
+    postprocess_task_id = f"tools_post_{time.time_ns()}"
+    previous_task_id = get_current_task() or ""
+    progress_manager.start_task(postprocess_task_id, "updating agent state")
+    set_current_task(postprocess_task_id)
+    progress_manager.update_task(
+        postprocess_task_id,
+        progress_pct=5,
+        detail="Syncing recent tool outputs into durable state",
+    )
+
     updates: dict = {}
     new_findings: list[dict] = []
     new_patches: list[dict] = []
@@ -1359,352 +1371,369 @@ def tools_postprocess(state: AgentState) -> dict:
         "rename_package_identity", "remove_ads", "patch_api_response_flow", "inject_runtime_override_layer",
     }
 
-    # Only look at the most recent tool messages (from last tool call batch)
-    for msg in reversed(state["messages"]):
-        if not isinstance(msg, ToolMessage):
-            break
-        tool_name = getattr(msg, "name", "") or ""
-        raw_content = msg.content if isinstance(msg.content, str) else ""
-        content = _resolve_tool_postprocess_content(raw_content)
-        try:
-            parsed = json.loads(content)
-        except (json.JSONDecodeError, TypeError):
-            parsed = None
-        success = _tool_result_success(parsed, content)
-        new_tool_history.append(_summarize_tool_result(tool_name, content, _ts))
+    try:
+        # Only look at the most recent tool messages (from last tool call batch)
+        for msg in reversed(state["messages"]):
+            if not isinstance(msg, ToolMessage):
+                break
+            tool_name = getattr(msg, "name", "") or ""
+            raw_content = msg.content if isinstance(msg.content, str) else ""
+            content = _resolve_tool_postprocess_content(raw_content)
+            try:
+                parsed = json.loads(content)
+            except (json.JSONDecodeError, TypeError):
+                parsed = None
+            success = _tool_result_success(parsed, content)
+            new_tool_history.append(_summarize_tool_result(tool_name, content, _ts))
 
-        if tool_name in _STRATEGIC_ANALYSIS_TOOLS and success:
-            analysis_complete_for_patching = True
+            if tool_name in _STRATEGIC_ANALYSIS_TOOLS and success:
+                analysis_complete_for_patching = True
 
-        if tool_name in _PLAN_REQUIRED_PATCH_TOOLS and success and not (
-            tool_name == "smart_entity_patch" and isinstance(parsed, dict) and str(parsed.get("mode", "preview") or "preview").strip().lower() != "auto"
-        ) and not (
-            tool_name == "patch_api_response_flow" and isinstance(parsed, dict) and bool(parsed.get("dry_run"))
-        ):
+            if tool_name in _PLAN_REQUIRED_PATCH_TOOLS and success and not (
+                tool_name == "smart_entity_patch" and isinstance(parsed, dict) and str(parsed.get("mode", "preview") or "preview").strip().lower() != "auto"
+            ) and not (
+                tool_name == "patch_api_response_flow" and isinstance(parsed, dict) and bool(parsed.get("dry_run"))
+            ):
+                prebuild_validation_ready = False
+                runtime_validation_ready = False
+
+            if tool_name == "smart_entity_patch" and isinstance(parsed, dict) and success:
+                mode = str(parsed.get("mode", "") or "").strip().lower()
+                semantic_plan = parsed.get("semantic_plan") if isinstance(parsed.get("semantic_plan"), dict) else {}
+                if mode == "preview" and (
+                    parsed.get("patches_preview")
+                    or semantic_plan.get("execution_order")
+                    or semantic_plan.get("preferred_first_action")
+                ):
+                    analysis_complete_for_patching = True
+                    patch_plan_ready = True
+            elif tool_name == "patch_api_response_flow" and isinstance(parsed, dict) and success:
+                analysis_complete_for_patching = True
+                if parsed.get("selected_strategy") or parsed.get("validation") or parsed.get("files_modified") or parsed.get("patches_applied"):
+                    patch_plan_ready = True
+            elif tool_name in {"preview_smali_patch", "preview_text_patch"} and isinstance(parsed, dict) and success:
+                patch_plan_ready = True
+            elif tool_name == "validate_patch_pipeline":
+                prebuild_validation_ready = _validation_pipeline_passed(parsed)
+            elif tool_name == "generate_runtime_validation_plan":
+                runtime_validation_ready = bool(success and isinstance(parsed, dict) and parsed.get("scenarios"))
+
+            # Extract vulnerability findings
+            if tool_name in ("scan_vulnerabilities", "detect_protections"):
+                try:
+                    data = json.loads(content)
+                    if isinstance(data, dict) and data.get("findings"):
+                        for f in data["findings"][:30]:
+                            new_findings.append({
+                                "tool": tool_name,
+                                "id": f.get("id", ""),
+                                "name": f.get("name", ""),
+                                "severity": f.get("severity", ""),
+                                "file": f.get("file", ""),
+                                "category": f.get("category", ""),
+                            })
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
+            # Extract unified_scan findings with enriched fields
+            if tool_name == "unified_scan":
+                try:
+                    data = json.loads(content)
+                    if isinstance(data, dict) and data.get("findings"):
+                        for f in data["findings"][:50]:
+                            new_findings.append({
+                                "tool": tool_name,
+                                "id": f.get("id", ""),
+                                "rule_id": f.get("rule_id", ""),
+                                "severity": f.get("severity", ""),
+                                "category": f.get("category", ""),
+                                "title": f.get("title", ""),
+                                "cwe": f.get("cwe", ""),
+                                "class": f.get("class", ""),
+                                "method": f.get("method", ""),
+                                "exploitability": f.get("exploitability", ""),
+                                "confidence_score": f.get("confidence_score", 0.0),
+                                "risk_score": f.get("risk_score", 0.0),
+                                "evidence_strength": f.get("evidence_strength", "single"),
+                                "validation_state": f.get("validation_state", "pending"),
+                                "threat_level": f.get("threat_level", "basic"),
+                                "auto_patchable": f.get("auto_patchable", False),
+                            })
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
+            # Extract app package scope from identify_app_packages
+            if tool_name == "identify_app_packages":
+                try:
+                    data = json.loads(content)
+                    if isinstance(data, dict):
+                        app_pkgs = data.get("app_packages") or data.get("target_packages") or []
+                        excluded = data.get("excluded_packages") or data.get("third_party_packages") or []
+                        if app_pkgs:
+                            updates["target_packages"] = app_pkgs
+                        if excluded:
+                            updates["excluded_packages"] = excluded
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
+            # ── Patch registry: record every patch attempt ──────────────
+            if tool_name in _PATCH_TOOLS:
+                try:
+                    data = json.loads(content)
+                    if not isinstance(data, dict):
+                        continue
+                except (json.JSONDecodeError, KeyError):
+                    continue
+
+                if tool_name == "apply_smali_patch":
+                # Legacy patch_results extraction (keep for backwards compat)
+                    new_patches.append({
+                        "success": data.get("success", False),
+                        "target_file": data.get("target_file", ""),
+                        "steps_applied": data.get("steps_applied", 0),
+                        "errors": data.get("errors", []),
+                    })
+                    # Rich registry entry
+                    new_registry_entries.append({
+                        "id": len(state.get("patch_registry") or []) + len(new_registry_entries) + 1,
+                        "tool": tool_name,
+                        "target": data.get("target_file", ""),
+                        "pattern": data.get("diff_text", "")[:300] or "(no diff)",
+                        "steps_applied": data.get("steps_applied", 0),
+                        "steps_total": data.get("steps_total", 0),
+                        "tool_success": data.get("success", False),
+                        "status": "applied" if data.get("success") else "failed",
+                        "errors": data.get("errors", [])[:3],
+                        "remediates": data.get("remediates", []),
+                        "user_feedback": "",
+                        "timestamp": _ts,
+                    })
+
+                elif tool_name == "auto_patch_bypass":
+                # auto_patch_bypass returns per-category stats
+                    categories = data.get("categories_applied") or []
+                    total_applied = data.get("total_patches_applied", 0)
+                    patched_files = data.get("patched_files") or []
+                    success = data.get("success", False) and total_applied > 0
+                    new_registry_entries.append({
+                        "id": len(state.get("patch_registry") or []) + len(new_registry_entries) + 1,
+                        "tool": tool_name,
+                        "target": f"{len(patched_files)} files",
+                        "pattern": f"categories={','.join(str(c) for c in categories[:6])}; {total_applied} patches",
+                        "steps_applied": total_applied,
+                        "steps_total": total_applied,
+                        "tool_success": success,
+                        "status": "applied" if success else "failed",
+                        "errors": data.get("errors", [])[:3],
+                        "remediates": data.get("remediates", []),
+                        "user_feedback": "",
+                        "timestamp": _ts,
+                    })
+
+                elif tool_name == "patch_flutter_ssl":
+                    new_registry_entries.append({
+                        "id": len(state.get("patch_registry") or []) + len(new_registry_entries) + 1,
+                        "tool": tool_name,
+                        "target": "libflutter.so",
+                        "pattern": "binary ssl_verify_peer_cert patch",
+                        "steps_applied": data.get("patches_applied", 0),
+                        "steps_total": data.get("patches_applied", 0),
+                        "tool_success": data.get("success", False),
+                        "status": "applied" if data.get("success") else "failed",
+                        "errors": data.get("errors", [])[:3] if data.get("errors") else [],
+                        "remediates": data.get("remediates", []),
+                        "user_feedback": "",
+                        "timestamp": _ts,
+                    })
+
+                elif tool_name == "inject_network_security_config":
+                    new_registry_entries.append({
+                        "id": len(state.get("patch_registry") or []) + len(new_registry_entries) + 1,
+                        "tool": tool_name,
+                        "target": "res/xml/network_security_config.xml",
+                        "pattern": "inject permissive NSC (trust all certs)",
+                        "steps_applied": len(data.get("changes_made") or []),
+                        "steps_total": len(data.get("changes_made") or []),
+                        "tool_success": data.get("success", False),
+                        "status": "applied" if data.get("success") else "failed",
+                        "errors": [],
+                        "remediates": data.get("remediates", []),
+                        "user_feedback": "",
+                        "timestamp": _ts,
+                    })
+
+                elif tool_name == "patch_manifest_security":
+                    changes = data.get("changes_made") or []
+                    new_registry_entries.append({
+                        "id": len(state.get("patch_registry") or []) + len(new_registry_entries) + 1,
+                        "tool": tool_name,
+                        "target": "AndroidManifest.xml",
+                        "pattern": f"{len(changes)} manifest changes",
+                        "steps_applied": len(changes),
+                        "steps_total": len(changes),
+                        "tool_success": data.get("success", False),
+                        "status": "applied" if data.get("success") else "failed",
+                        "errors": data.get("warnings", [])[:3],
+                        "remediates": data.get("remediates", []),
+                        "user_feedback": "",
+                        "timestamp": _ts,
+                    })
+
+                elif tool_name == "rename_package_identity":
+                    changes = data.get("changes_applied") or []
+                    new_registry_entries.append({
+                        "id": len(state.get("patch_registry") or []) + len(new_registry_entries) + 1,
+                        "tool": tool_name,
+                        "target": f"{data.get('old_package', '')} -> {data.get('new_package', '')}",
+                        "pattern": f"package identity rewrite; {len(changes)} manifest updates",
+                        "steps_applied": len(changes),
+                        "steps_total": len(changes),
+                        "tool_success": data.get("success", False),
+                        "status": "applied" if data.get("success") else "failed",
+                        "errors": data.get("errors", [])[:3] if isinstance(data.get("errors"), list) else [],
+                        "remediates": data.get("remediates", []),
+                        "user_feedback": "",
+                        "timestamp": _ts,
+                    })
+
+                elif tool_name == "remove_ads":
+                    total_applied = data.get("total_patches_applied", 0)
+                    new_registry_entries.append({
+                        "id": len(state.get("patch_registry") or []) + len(new_registry_entries) + 1,
+                        "tool": tool_name,
+                        "target": f"{len(data.get('patched_files') or [])} files",
+                        "pattern": f"ads_removal+license_bypass; {total_applied} patches",
+                        "steps_applied": total_applied,
+                        "steps_total": total_applied,
+                        "tool_success": data.get("success", False) and total_applied > 0,
+                        "status": "applied" if (data.get("success", False) and total_applied > 0) else "failed",
+                        "errors": data.get("errors", [])[:3],
+                        "remediates": data.get("remediates", []),
+                        "user_feedback": "",
+                        "timestamp": _ts,
+                    })
+
+                elif tool_name == "patch_api_response_flow":
+                    total_applied = int(data.get("patches_applied", 0) or 0)
+                    new_registry_entries.append({
+                        "id": len(state.get("patch_registry") or []) + len(new_registry_entries) + 1,
+                        "tool": tool_name,
+                        "target": data.get("target_class", data.get("target_file", "response-flow")),
+                        "pattern": f"response-flow override; {total_applied} patch units",
+                        "steps_applied": total_applied,
+                        "steps_total": total_applied,
+                        "tool_success": data.get("success", False),
+                        "status": "applied" if data.get("success") else "failed",
+                        "errors": data.get("errors", [])[:3],
+                        "remediates": data.get("remediates", []),
+                        "user_feedback": "",
+                        "timestamp": _ts,
+                    })
+
+                elif tool_name == "inject_runtime_override_layer":
+                    rules_applied = int(data.get("rules_applied", 0) or 0)
+                    new_registry_entries.append({
+                        "id": len(state.get("patch_registry") or []) + len(new_registry_entries) + 1,
+                        "tool": tool_name,
+                        "target": data.get("helper_file", "runtime override layer"),
+                        "pattern": f"runtime override layer; {rules_applied} rules",
+                        "steps_applied": rules_applied,
+                        "steps_total": rules_applied,
+                        "tool_success": data.get("success", False),
+                        "status": "applied" if data.get("success") else "failed",
+                        "errors": data.get("errors", [])[:3],
+                        "remediates": data.get("remediates", []),
+                        "user_feedback": "",
+                        "timestamp": _ts,
+                    })
+
+            # Auto-build code graph + index after decompilation completes
+            if tool_name == "apktool_decompile":
+                try:
+                    progress_manager.update_task(
+                        postprocess_task_id,
+                        progress_pct=20,
+                        detail="Building graph and index after decompilation",
+                    )
+                    _auto_build_graph_and_index()
+                    updates["graph_ready"] = True
+                    # Inject a visible message so the agent KNOWS graph is ready
+                    from apk_agent.agent.execution_context import get_runtime_slot
+
+                    g = get_runtime_slot("code_graph")
+                    idx = get_runtime_slot("code_index")
+                    graph_info = ""
+                    if g:
+                        graph_info += f"{g.number_of_nodes()} nodes, {g.number_of_edges()} edges"
+                    if idx and isinstance(idx, dict) and "stats" in idx:
+                        s = idx["stats"]
+                        graph_info += f", {s.get('total_classes', '?')} classes, {s.get('total_methods', '?')} methods indexed"
+                    notify_msg = HumanMessage(content=(
+                        f"[SYSTEM] ⚡ Code graph + index built successfully ({graph_info}). "
+                        "You MUST now use graph tools (graph_callers, graph_callees, graph_security_scan, "
+                        "graph_find_path, graph_class_info, index_lookup_*) instead of slow search tools. "
+                        "They are 100x faster and give better results."
+                    ))
+                    # Append notification to messages via state update
+                    updates.setdefault("messages", []).append(notify_msg)
+                except Exception as e:
+                    logger.error(f"Auto graph/index build FAILED: {e}")
+                    updates["graph_ready"] = False
+
+        if new_findings:
+            existing = list(state.get("findings") or [])
+            existing.extend(new_findings)
+            updates["findings"] = existing
+        if new_patches:
+            existing = list(state.get("patch_results") or [])
+            existing.extend(new_patches)
+            updates["patch_results"] = existing
+        if new_registry_entries:
+            existing = list(state.get("patch_registry") or [])
+            existing.extend(new_registry_entries)
+            updates["patch_registry"] = existing
+        if new_tool_history:
+            existing = list(state.get("tool_history") or [])
+            existing.extend(reversed(new_tool_history))
+            updates["tool_history"] = existing[-60:]
+
+        execution_advisory = _build_execution_advisory_message(state)
+        if execution_advisory is not None:
+            updates.setdefault("messages", []).append(execution_advisory)
+
+        progress_manager.update_task(
+            postprocess_task_id,
+            progress_pct=90,
+            detail="Persisting task plan, scratchpad, and validation flags",
+        )
+
+        # Sync working memory from module-level storage into durable state
+        updates["scratchpad"] = _get_scratchpad()
+        synced_task_plan = _get_task_plan()
+        updates["task_plan"] = synced_task_plan
+
+        planning_started = bool(synced_task_plan)
+        if not planning_started:
+            analysis_complete_for_patching = False
+            patch_plan_ready = False
             prebuild_validation_ready = False
             runtime_validation_ready = False
-
-        if tool_name == "smart_entity_patch" and isinstance(parsed, dict) and success:
-            mode = str(parsed.get("mode", "") or "").strip().lower()
-            semantic_plan = parsed.get("semantic_plan") if isinstance(parsed.get("semantic_plan"), dict) else {}
-            if mode == "preview" and (
-                parsed.get("patches_preview")
-                or semantic_plan.get("execution_order")
-                or semantic_plan.get("preferred_first_action")
-            ):
-                analysis_complete_for_patching = True
-                patch_plan_ready = True
-        elif tool_name == "patch_api_response_flow" and isinstance(parsed, dict) and success:
+        elif patch_plan_ready:
             analysis_complete_for_patching = True
-            if parsed.get("selected_strategy") or parsed.get("validation") or parsed.get("files_modified") or parsed.get("patches_applied"):
-                patch_plan_ready = True
-        elif tool_name in {"preview_smali_patch", "preview_text_patch"} and isinstance(parsed, dict) and success:
-            patch_plan_ready = True
-        elif tool_name == "validate_patch_pipeline":
-            prebuild_validation_ready = _validation_pipeline_passed(parsed)
-        elif tool_name == "generate_runtime_validation_plan":
-            runtime_validation_ready = bool(success and isinstance(parsed, dict) and parsed.get("scenarios"))
 
-        # Extract vulnerability findings
-        if tool_name in ("scan_vulnerabilities", "detect_protections"):
-            try:
-                data = json.loads(content)
-                if isinstance(data, dict) and data.get("findings"):
-                    for f in data["findings"][:30]:
-                        new_findings.append({
-                            "tool": tool_name,
-                            "id": f.get("id", ""),
-                            "name": f.get("name", ""),
-                            "severity": f.get("severity", ""),
-                            "file": f.get("file", ""),
-                            "category": f.get("category", ""),
-                        })
-            except (json.JSONDecodeError, KeyError):
-                pass
+        updates["planning_started"] = planning_started
+        updates["analysis_complete_for_patching"] = analysis_complete_for_patching
+        updates["patch_plan_ready"] = patch_plan_ready
+        updates["prebuild_validation_ready"] = prebuild_validation_ready
+        updates["runtime_validation_ready"] = runtime_validation_ready
 
-        # Extract unified_scan findings with enriched fields
-        if tool_name == "unified_scan":
-            try:
-                data = json.loads(content)
-                if isinstance(data, dict) and data.get("findings"):
-                    for f in data["findings"][:50]:
-                        new_findings.append({
-                            "tool": tool_name,
-                            "id": f.get("id", ""),
-                            "rule_id": f.get("rule_id", ""),
-                            "severity": f.get("severity", ""),
-                            "category": f.get("category", ""),
-                            "title": f.get("title", ""),
-                            "cwe": f.get("cwe", ""),
-                            "class": f.get("class", ""),
-                            "method": f.get("method", ""),
-                            "exploitability": f.get("exploitability", ""),
-                            "confidence_score": f.get("confidence_score", 0.0),
-                            "risk_score": f.get("risk_score", 0.0),
-                            "evidence_strength": f.get("evidence_strength", "single"),
-                            "validation_state": f.get("validation_state", "pending"),
-                            "threat_level": f.get("threat_level", "basic"),
-                            "auto_patchable": f.get("auto_patchable", False),
-                        })
-            except (json.JSONDecodeError, KeyError):
-                pass
-
-        # Extract app package scope from identify_app_packages
-        if tool_name == "identify_app_packages":
-            try:
-                data = json.loads(content)
-                if isinstance(data, dict):
-                    app_pkgs = data.get("app_packages") or data.get("target_packages") or []
-                    excluded = data.get("excluded_packages") or data.get("third_party_packages") or []
-                    if app_pkgs:
-                        updates["target_packages"] = app_pkgs
-                    if excluded:
-                        updates["excluded_packages"] = excluded
-            except (json.JSONDecodeError, KeyError):
-                pass
-
-        # ── Patch registry: record every patch attempt ──────────────
-        if tool_name in _PATCH_TOOLS:
-            try:
-                data = json.loads(content)
-                if not isinstance(data, dict):
-                    continue
-            except (json.JSONDecodeError, KeyError):
-                continue
-
-            if tool_name == "apply_smali_patch":
-                # Legacy patch_results extraction (keep for backwards compat)
-                new_patches.append({
-                    "success": data.get("success", False),
-                    "target_file": data.get("target_file", ""),
-                    "steps_applied": data.get("steps_applied", 0),
-                    "errors": data.get("errors", []),
-                })
-                # Rich registry entry
-                new_registry_entries.append({
-                    "id": len(state.get("patch_registry") or []) + len(new_registry_entries) + 1,
-                    "tool": tool_name,
-                    "target": data.get("target_file", ""),
-                    "pattern": data.get("diff_text", "")[:300] or "(no diff)",
-                    "steps_applied": data.get("steps_applied", 0),
-                    "steps_total": data.get("steps_total", 0),
-                    "tool_success": data.get("success", False),
-                    "status": "applied" if data.get("success") else "failed",
-                    "errors": data.get("errors", [])[:3],
-                    "remediates": data.get("remediates", []),
-                    "user_feedback": "",
-                    "timestamp": _ts,
-                })
-
-            elif tool_name == "auto_patch_bypass":
-                # auto_patch_bypass returns per-category stats
-                categories = data.get("categories_applied") or []
-                total_applied = data.get("total_patches_applied", 0)
-                patched_files = data.get("patched_files") or []
-                per_cat = data.get("per_category_stats") or {}
-                success = data.get("success", False) and total_applied > 0
-                new_registry_entries.append({
-                    "id": len(state.get("patch_registry") or []) + len(new_registry_entries) + 1,
-                    "tool": tool_name,
-                    "target": f"{len(patched_files)} files",
-                    "pattern": f"categories={','.join(str(c) for c in categories[:6])}; {total_applied} patches",
-                    "steps_applied": total_applied,
-                    "steps_total": total_applied,
-                    "tool_success": success,
-                    "status": "applied" if success else "failed",
-                    "errors": data.get("errors", [])[:3],
-                    "remediates": data.get("remediates", []),
-                    "user_feedback": "",
-                    "timestamp": _ts,
-                })
-
-            elif tool_name == "patch_flutter_ssl":
-                new_registry_entries.append({
-                    "id": len(state.get("patch_registry") or []) + len(new_registry_entries) + 1,
-                    "tool": tool_name,
-                    "target": "libflutter.so",
-                    "pattern": "binary ssl_verify_peer_cert patch",
-                    "steps_applied": data.get("patches_applied", 0),
-                    "steps_total": data.get("patches_applied", 0),
-                    "tool_success": data.get("success", False),
-                    "status": "applied" if data.get("success") else "failed",
-                    "errors": data.get("errors", [])[:3] if data.get("errors") else [],
-                    "remediates": data.get("remediates", []),
-                    "user_feedback": "",
-                    "timestamp": _ts,
-                })
-
-            elif tool_name == "inject_network_security_config":
-                new_registry_entries.append({
-                    "id": len(state.get("patch_registry") or []) + len(new_registry_entries) + 1,
-                    "tool": tool_name,
-                    "target": "res/xml/network_security_config.xml",
-                    "pattern": "inject permissive NSC (trust all certs)",
-                    "steps_applied": len(data.get("changes_made") or []),
-                    "steps_total": len(data.get("changes_made") or []),
-                    "tool_success": data.get("success", False),
-                    "status": "applied" if data.get("success") else "failed",
-                    "errors": [],
-                    "remediates": data.get("remediates", []),
-                    "user_feedback": "",
-                    "timestamp": _ts,
-                })
-
-            elif tool_name == "patch_manifest_security":
-                changes = data.get("changes_made") or []
-                new_registry_entries.append({
-                    "id": len(state.get("patch_registry") or []) + len(new_registry_entries) + 1,
-                    "tool": tool_name,
-                    "target": "AndroidManifest.xml",
-                    "pattern": f"{len(changes)} manifest changes",
-                    "steps_applied": len(changes),
-                    "steps_total": len(changes),
-                    "tool_success": data.get("success", False),
-                    "status": "applied" if data.get("success") else "failed",
-                    "errors": data.get("warnings", [])[:3],
-                    "remediates": data.get("remediates", []),
-                    "user_feedback": "",
-                    "timestamp": _ts,
-                })
-
-            elif tool_name == "rename_package_identity":
-                changes = data.get("changes_applied") or []
-                new_registry_entries.append({
-                    "id": len(state.get("patch_registry") or []) + len(new_registry_entries) + 1,
-                    "tool": tool_name,
-                    "target": f"{data.get('old_package', '')} -> {data.get('new_package', '')}",
-                    "pattern": f"package identity rewrite; {len(changes)} manifest updates",
-                    "steps_applied": len(changes),
-                    "steps_total": len(changes),
-                    "tool_success": data.get("success", False),
-                    "status": "applied" if data.get("success") else "failed",
-                    "errors": data.get("errors", [])[:3] if isinstance(data.get("errors"), list) else [],
-                    "remediates": data.get("remediates", []),
-                    "user_feedback": "",
-                    "timestamp": _ts,
-                })
-
-            elif tool_name == "remove_ads":
-                total_applied = data.get("total_patches_applied", 0)
-                new_registry_entries.append({
-                    "id": len(state.get("patch_registry") or []) + len(new_registry_entries) + 1,
-                    "tool": tool_name,
-                    "target": f"{len(data.get('patched_files') or [])} files",
-                    "pattern": f"ads_removal+license_bypass; {total_applied} patches",
-                    "steps_applied": total_applied,
-                    "steps_total": total_applied,
-                    "tool_success": data.get("success", False) and total_applied > 0,
-                    "status": "applied" if (data.get("success", False) and total_applied > 0) else "failed",
-                    "errors": data.get("errors", [])[:3],
-                    "remediates": data.get("remediates", []),
-                    "user_feedback": "",
-                    "timestamp": _ts,
-                })
-
-            elif tool_name == "patch_api_response_flow":
-                total_applied = int(data.get("patches_applied", 0) or 0)
-                new_registry_entries.append({
-                    "id": len(state.get("patch_registry") or []) + len(new_registry_entries) + 1,
-                    "tool": tool_name,
-                    "target": data.get("target_class", data.get("target_file", "response-flow")),
-                    "pattern": f"response-flow override; {total_applied} patch units",
-                    "steps_applied": total_applied,
-                    "steps_total": total_applied,
-                    "tool_success": data.get("success", False),
-                    "status": "applied" if data.get("success") else "failed",
-                    "errors": data.get("errors", [])[:3],
-                    "remediates": data.get("remediates", []),
-                    "user_feedback": "",
-                    "timestamp": _ts,
-                })
-
-            elif tool_name == "inject_runtime_override_layer":
-                rules_applied = int(data.get("rules_applied", 0) or 0)
-                new_registry_entries.append({
-                    "id": len(state.get("patch_registry") or []) + len(new_registry_entries) + 1,
-                    "tool": tool_name,
-                    "target": data.get("helper_file", "runtime override layer"),
-                    "pattern": f"runtime override layer; {rules_applied} rules",
-                    "steps_applied": rules_applied,
-                    "steps_total": rules_applied,
-                    "tool_success": data.get("success", False),
-                    "status": "applied" if data.get("success") else "failed",
-                    "errors": data.get("errors", [])[:3],
-                    "remediates": data.get("remediates", []),
-                    "user_feedback": "",
-                    "timestamp": _ts,
-                })
-
-        # Auto-build code graph + index after decompilation completes
-        if tool_name == "apktool_decompile":
-            try:
-                _auto_build_graph_and_index()
-                updates["graph_ready"] = True
-                # Inject a visible message so the agent KNOWS graph is ready
-                from apk_agent.agent.execution_context import get_runtime_slot
-
-                g = get_runtime_slot("code_graph")
-                idx = get_runtime_slot("code_index")
-                graph_info = ""
-                if g:
-                    graph_info += f"{g.number_of_nodes()} nodes, {g.number_of_edges()} edges"
-                if idx and isinstance(idx, dict) and "stats" in idx:
-                    s = idx["stats"]
-                    graph_info += f", {s.get('total_classes', '?')} classes, {s.get('total_methods', '?')} methods indexed"
-                notify_msg = HumanMessage(content=(
-                    f"[SYSTEM] ⚡ Code graph + index built successfully ({graph_info}). "
-                    "You MUST now use graph tools (graph_callers, graph_callees, graph_security_scan, "
-                    "graph_find_path, graph_class_info, index_lookup_*) instead of slow search tools. "
-                    "They are 100x faster and give better results."
-                ))
-                # Append notification to messages via state update
-                updates.setdefault("messages", []).append(notify_msg)
-            except Exception as e:
-                logger.error(f"Auto graph/index build FAILED: {e}")
-                updates["graph_ready"] = False
-
-    if new_findings:
-        existing = list(state.get("findings") or [])
-        existing.extend(new_findings)
-        updates["findings"] = existing
-    if new_patches:
-        existing = list(state.get("patch_results") or [])
-        existing.extend(new_patches)
-        updates["patch_results"] = existing
-    if new_registry_entries:
-        existing = list(state.get("patch_registry") or [])
-        existing.extend(new_registry_entries)
-        updates["patch_registry"] = existing
-    if new_tool_history:
-        existing = list(state.get("tool_history") or [])
-        existing.extend(reversed(new_tool_history))
-        updates["tool_history"] = existing[-60:]
-
-    execution_advisory = _build_execution_advisory_message(state)
-    if execution_advisory is not None:
-        updates.setdefault("messages", []).append(execution_advisory)
-
-    # Sync working memory from module-level storage into durable state
-    updates["scratchpad"] = _get_scratchpad()
-    synced_task_plan = _get_task_plan()
-    updates["task_plan"] = synced_task_plan
-
-    planning_started = bool(synced_task_plan)
-    if not planning_started:
-        analysis_complete_for_patching = False
-        patch_plan_ready = False
-        prebuild_validation_ready = False
-        runtime_validation_ready = False
-    elif patch_plan_ready:
-        analysis_complete_for_patching = True
-
-    updates["planning_started"] = planning_started
-    updates["analysis_complete_for_patching"] = analysis_complete_for_patching
-    updates["patch_plan_ready"] = patch_plan_ready
-    updates["prebuild_validation_ready"] = prebuild_validation_ready
-    updates["runtime_validation_ready"] = runtime_validation_ready
-
-    return updates
+        progress_manager.complete_task(postprocess_task_id, success=True)
+        return updates
+    except Exception as exc:
+        progress_manager.complete_task(postprocess_task_id, success=False, error=str(exc))
+        raise
+    finally:
+        set_current_task(previous_task_id)
 
 
 # ---------------------------------------------------------------------------

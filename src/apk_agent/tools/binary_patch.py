@@ -15,6 +15,21 @@ _PRINTABLE_MIN = 32
 _PRINTABLE_MAX = 126
 _DEX_SUFFIXES = {".dex", ".cdex"}
 _TEXTLIKE_SUFFIXES = {".bundle", ".jsbundle"}
+_UNSUPPORTED_BINARY_ARTIFACT_SUFFIXES = {
+    ".keystore",
+    ".jks",
+    ".bks",
+    ".p12",
+    ".pfx",
+    ".pkcs12",
+    ".pem",
+    ".cer",
+    ".crt",
+    ".der",
+    ".key",
+    ".rsa",
+}
+_UNSUPPORTED_BINARY_ARTIFACT_FILENAMES = {"debug.keystore"}
 
 _CATEGORY_PATTERNS: dict[str, re.Pattern[str]] = {
     "url": re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE),
@@ -26,6 +41,27 @@ _CATEGORY_PATTERNS: dict[str, re.Pattern[str]] = {
     "class_descriptor": re.compile(r"^L[\w/$-]+;$"),
     "java_package": re.compile(r"^(?:[A-Za-z_]\w*\.){2,}[A-Za-z_]\w*$"),
 }
+
+
+def is_unsupported_binary_artifact(path: str | Path) -> bool:
+    target = Path(path)
+    return (
+        target.name.lower() in _UNSUPPORTED_BINARY_ARTIFACT_FILENAMES
+        or target.suffix.lower() in _UNSUPPORTED_BINARY_ARTIFACT_SUFFIXES
+    )
+
+
+def describe_unsupported_binary_artifact(
+    path: str | Path,
+    *,
+    supported_targets_hint: str,
+) -> str:
+    target = Path(path)
+    return (
+        f"Unsupported target for binary tooling: {target.name}. "
+        "This looks like a keystore/certificate/private-key artifact, not an app-owned patch target. "
+        f"{supported_targets_hint}"
+    )
 
 
 def _is_printable(byte_value: int) -> bool:
@@ -101,6 +137,8 @@ def _iter_directory_targets(path: Path) -> Iterable[Path]:
     for candidate in sorted(path.rglob("*")):
         if not candidate.is_file():
             continue
+        if is_unsupported_binary_artifact(candidate):
+            continue
         yield candidate
 
 
@@ -133,6 +171,20 @@ def search_binary_strings(
             query_re = re.compile(re.escape(query), re.IGNORECASE)
 
     category_set = {c.strip().lower() for c in (categories or []) if c.strip()}
+    if path.is_file() and is_unsupported_binary_artifact(path):
+        return {
+            "success": False,
+            "path": str(path),
+            "file_type": path.suffix.lower(),
+            "error": describe_unsupported_binary_artifact(
+                path,
+                supported_targets_hint=(
+                    "Use this tool on app binaries such as `.so`, `.dex`, `.bundle`, `.jsbundle`, "
+                    "or app-owned binary assets under `lib/` and `assets/`."
+                ),
+            ),
+        }
+
     if path.is_dir():
         matches: list[dict] = []
         total_strings = 0
@@ -259,6 +311,20 @@ def patch_binary_strings(
     path = Path(file_path)
     if not path.is_file():
         return {"success": False, "error": f"File not found: {path}"}
+
+    if is_unsupported_binary_artifact(path):
+        return {
+            "success": False,
+            "path": str(path),
+            "file_type": path.suffix.lower(),
+            "error": describe_unsupported_binary_artifact(
+                path,
+                supported_targets_hint=(
+                    "Use this tool on app binaries such as `.so`, `.dex`, `.bundle`, `.jsbundle`, "
+                    "or app-owned binary assets under `lib/` and `assets/`."
+                ),
+            ),
+        }
 
     if not replacements:
         return {"success": False, "error": "No replacements provided."}

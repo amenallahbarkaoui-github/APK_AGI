@@ -33,10 +33,60 @@ def _extract_verified_signature_schemes(verify_output: str) -> tuple[list[str], 
     return schemes, scheme_details
 
 
+def _validate_keystore(
+    keystore_path: Path,
+    *,
+    keystore_password: str = "android",
+    key_alias: str = "androiddebugkey",
+) -> tuple[bool, str]:
+    if not keystore_path.is_file():
+        return False, "Keystore file does not exist."
+    try:
+        if keystore_path.stat().st_size <= 0:
+            return False, "Keystore file is empty."
+    except OSError as exc:
+        return False, str(exc)
+
+    cmd = [
+        "keytool",
+        "-list",
+        "-v",
+        "-keystore", str(keystore_path),
+        "-storepass", keystore_password,
+        "-alias", key_alias,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
+    except OSError as exc:
+        return False, str(exc)
+
+    if result.returncode == 0:
+        return True, ""
+
+    details = (result.stderr or result.stdout or "keytool list failed").strip()
+    return False, details[:500]
+
+
 def _ensure_debug_keystore(keystore_path: Path) -> None:
-    """Generate a debug keystore if it doesn't exist."""
-    if keystore_path.is_file():
+    """Generate a usable debug keystore when the default one is missing or corrupt."""
+    is_valid, validation_error = _validate_keystore(keystore_path)
+    if is_valid:
         return
+
+    if keystore_path.exists():
+        corrupt_backup = keystore_path.with_suffix(f"{keystore_path.suffix}.corrupt")
+        try:
+            corrupt_backup.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            keystore_path.replace(corrupt_backup)
+        except OSError:
+            try:
+                keystore_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     keystore_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         "keytool",
@@ -51,7 +101,18 @@ def _ensure_debug_keystore(keystore_path: Path) -> None:
         "-validity", "10000",
         "-dname", "CN=Debug,O=Android,C=US",
     ]
-    subprocess.run(cmd, capture_output=True, timeout=30, check=False)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
+    except OSError as exc:
+        raise RuntimeError(f"Failed to create debug keystore: {exc}") from exc
+
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout or validation_error or "keytool genkeypair failed").strip()
+        raise RuntimeError(f"Failed to create debug keystore: {details[:500]}")
+
+    is_valid, validation_error = _validate_keystore(keystore_path)
+    if not is_valid:
+        raise RuntimeError(f"Generated debug keystore is still invalid: {validation_error}")
 
 
 def sign_apk(
@@ -74,7 +135,16 @@ def sign_apk(
 
     if not keystore_path:
         keystore_path = unsigned_apk.parent / "debug.keystore"
-        _ensure_debug_keystore(keystore_path)
+        try:
+            _ensure_debug_keystore(keystore_path)
+        except RuntimeError as exc:
+            return ToolResult(
+                success=False,
+                exit_code=-12,
+                stdout="",
+                stderr=str(exc),
+                command="sign_apk()",
+            )
     keystore_path = Path(keystore_path)
 
     signer_name = Path(signer_bin).stem.lower()
