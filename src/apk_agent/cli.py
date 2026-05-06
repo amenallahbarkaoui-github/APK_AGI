@@ -958,6 +958,7 @@ def _run_agent_turn(graph, graph_config: dict, user_input: str, project: Project
 
         while True:
             interrupt_info = None
+            saw_stream_event = False
             token_tracker.set_agent_phase("waiting for model")
             live_bar.update()
 
@@ -976,6 +977,7 @@ def _run_agent_turn(graph, graph_config: dict, user_input: str, project: Project
                     )
 
                 for event in events:
+                    saw_stream_event = True
                     try:
                         result = _process_stream_event(event, graph, graph_config, auto_mode=auto_mode)
                         error_count = 0
@@ -990,14 +992,14 @@ def _run_agent_turn(graph, graph_config: dict, user_input: str, project: Project
                             break
 
             except OSError as oe:
-                if getattr(oe, 'winerror', 0) == 32:
+                if getattr(oe, 'winerror', 0) == 32 and not saw_stream_event:
                     print_warning(f"File lock during checkpoint — retrying: {oe}")
                     import time as _t; _t.sleep(0.5)
                     continue  # retry the same stream_input
                 raise
             except Exception as stream_err:
                 _transient = is_retryable_api_error(stream_err)
-                if _transient and error_count < max_consecutive_errors:
+                if _transient and error_count < max_consecutive_errors and not saw_stream_event:
                     error_count += 1
                     _wait = error_count * 5
                     print_warning(
@@ -1043,28 +1045,8 @@ def _run_agent_turn(graph, graph_config: dict, user_input: str, project: Project
                                 else:
                                     content = ""
 
-                                # If the last AI message only called tools
-                                # (no text), the agent clearly isn't done —
-                                # it just returned tool_calls with no text.
-                                has_tool_calls = bool(last_ai.tool_calls)
-
-                                # Detect if the agent is truly done (final report,
-                                # explicit completion, or empty response WITH
-                                # no pending tool calls)
-                                is_done = (
-                                    (not content and not has_tool_calls)
-                                    or any(phrase in content for phrase in [
-                                        "task is complete", "task complete",
-                                        "all done", "analysis complete",
-                                        "report has been generated", "report generated",
-                                        "final report", "work is complete",
-                                        "successfully completed", "all patches applied",
-                                        "patched apk", "signed apk",
-                                        "here is the final", "here's the final",
-                                        "summary of all", "completed successfully",
-                                    ])
-                                )
-                                if not is_done:
+                                task_plan = (ckpt.values or {}).get("task_plan", [])
+                                if _should_auto_continue_after_turn(last_ai, task_plan):
                                     auto_continue_count += 1
                                     console.print(
                                         f"[dim]⚡ Auto-mode: continuing "
@@ -1349,6 +1331,49 @@ def _run_orchestrator_turn(user_input: str, project, config) -> None:
             traceback.print_exc()
 
 
+def _extract_ai_text_content(raw: object) -> str:
+    """Coerce AIMessage content into plain text for control-flow checks."""
+    if isinstance(raw, str):
+        return raw.strip().lower()
+    if isinstance(raw, list):
+        parts = []
+        for blk in raw:
+            if isinstance(blk, str):
+                parts.append(blk)
+            elif isinstance(blk, dict) and blk.get("type") == "text":
+                parts.append(blk.get("text", ""))
+        return " ".join(parts).strip().lower()
+    return ""
+
+
+def _should_auto_continue_after_turn(last_ai: AIMessage, task_plan: list[dict] | None = None) -> bool:
+    """Return True only when auto-mode clearly needs another turn."""
+    content = _extract_ai_text_content(last_ai.content)
+    if last_ai.tool_calls:
+        return True
+    if not content:
+        return False
+
+    pending_statuses = {"pending", "in_progress", "in-progress", "not-started", "not_started"}
+    has_pending_plan = any(
+        str(item.get("status", "")).strip().lower() in pending_statuses
+        for item in (task_plan or [])
+    )
+    if not has_pending_plan:
+        return False
+
+    is_announcing = any(phrase in content for phrase in [
+        "let me", "i'll ", "i will", "i'm going to", "phase ", "step ",
+        "first,", "next,", "now i", "starting", "let's ", "i need to",
+        "going to ", "begin by", "start by", "proceed to", "kick off",
+    ])
+    is_follow_up_prompt = any(phrase in content for phrase in [
+        "what should i do next", "should i continue", "do you want me to",
+        "would you like me to", "shall i", "?",
+    ])
+    return is_announcing or is_follow_up_prompt
+
+
 def _process_stream_event(event: dict, graph, graph_config: dict, *, auto_mode: bool = False) -> dict | None:
     """Process a single stream event from the LangGraph agent.
 
@@ -1469,13 +1494,14 @@ def _process_stream_event(event: dict, graph, graph_config: dict, *, auto_mode: 
                 if isinstance(msg, ToolMessage):
                     live_bar.update()
                     # Better success detection
-                    content_start = msg.content[:100].lower()
+                    tool_content = _extract_ai_text_content(msg.content)
+                    content_start = tool_content[:100].lower()
                     success = (
                         '"success": false' not in content_start
                         and "❌" not in content_start
                         and '"error"' not in content_start[:50]
                     )
-                    print_tool_output(msg.name or "tool", msg.content, success=success)
+                    print_tool_output(msg.name or "tool", tool_content, success=success)
 
                     # Show task plan whenever it changes
                     if msg.name in ("update_task_plan", "mark_task_done", "edit_task_plan"):

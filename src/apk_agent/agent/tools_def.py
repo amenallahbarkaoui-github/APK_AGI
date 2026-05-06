@@ -445,26 +445,45 @@ def _safe_call(func, tool_name: str, *args, _cache_hint: str = "", **kwargs) -> 
     timeout_seconds = _tool_timeout_seconds(tool_name)
 
     try:
-        # Run tool with a timeout to prevent infinite hangs
+        # Run tool with a timeout to prevent the caller from blocking forever.
+        # A daemon worker lets the turn continue even if the tool ignores the timeout.
         run_context = copy_context()
+        result_holder: dict[str, str] = {}
+        worker_exception: BaseException | None = None
+        finished = threading.Event()
 
         def _run_in_worker():
             # report_progress() uses thread-local task binding, so the worker
             # thread must register the current tool task before executing.
-            set_current_task(task_id)
-            return func(*args, **kwargs)
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(run_context.run, _run_in_worker)
+            nonlocal worker_exception
             try:
-                result = future.result(timeout=timeout_seconds)
-            except concurrent.futures.TimeoutError:
-                progress_manager.complete_task(task_id, success=False, error="Tool execution timed out")
-                return json.dumps({
-                    "success": False,
-                    "error": f"Tool '{tool_name}' timed out after {timeout_seconds}s.",
-                    "recovery_hint": "The tool took too long. Try a more targeted approach or smaller scope.",
-                })
+                set_current_task(task_id)
+                result_holder["result"] = func(*args, **kwargs)
+            except BaseException as exc:  # propagate the original failure on the caller thread
+                worker_exception = exc
+            finally:
+                finished.set()
+
+        worker = threading.Thread(
+            target=run_context.run,
+            args=(_run_in_worker,),
+            name=f"apk-agent-tool-{tool_name}",
+            daemon=True,
+        )
+        worker.start()
+
+        if not finished.wait(timeout_seconds):
+            progress_manager.complete_task(task_id, success=False, error="Tool execution timed out")
+            return json.dumps({
+                "success": False,
+                "error": f"Tool '{tool_name}' timed out after {timeout_seconds}s.",
+                "recovery_hint": "The tool took too long. Try a more targeted approach or smaller scope.",
+            })
+
+        if worker_exception is not None:
+            raise worker_exception
+
+        result = result_holder.get("result", "")
         # Preserve full oversized results on disk and give the LLM a compact reference.
         result = _materialize_tool_output(tool_name, result)
         progress_manager.complete_task(task_id, success=True)
@@ -1113,7 +1132,7 @@ def zipalign_apk_tool() -> str:
 
 @tool
 def sign_apk() -> str:
-    """Sign the rebuilt APK to produce a final installable patched-signed.apk.
+    """Sign the rebuilt APK and, for XAPK projects, rebuild the final XAPK bundle.
     Run this after apktool_build (and optionally zipalign_apk_tool) succeeds.
 
     When to use: LAST step in the build pipeline (after apktool_build → zipalign_apk_tool).
@@ -1121,14 +1140,14 @@ def sign_apk() -> str:
     latest unsigned build if the aligned copy is missing or stale. Produces a
     verified v1+v2+v3 signature before reporting success.
 
-    Returns: Text summary with success/failure status and path to the signed APK
-    (outputs/patched-signed.apk).
+    Returns: Text summary with success/failure status and path to the signed APK,
+    or the rebuilt XAPK bundle when the original input was an XAPK.
     """
     from apk_agent.tools.base import ToolResult
     from apk_agent.tools.cert_analyzer import analyze_certificate as _analyze_certificate
     from apk_agent.tools.signer import sign_apk as _sign
     from apk_agent.tools.zipalign import verify_alignment, zipalign
-    from apk_agent.workspace import validate_apk
+    from apk_agent.workspace import get_final_artifact_path, package_signed_output, validate_apk
 
     aligned = Path(_project.workspace_path) / "outputs" / "patched-aligned.apk"
     unsigned = Path(_project.workspace_path) / "outputs" / "patched-unsigned.apk"
@@ -1248,11 +1267,67 @@ def sign_apk() -> str:
             + json.dumps(cert_info, ensure_ascii=False, indent=2)[:5000]
         )
 
+    xapk_note = ""
+    if str(getattr(_project, "source_type", "apk") or "apk").lower() == "xapk":
+        try:
+            final_artifact = package_signed_output(_project, signed_path)
+        except Exception as exc:
+            failure = ToolResult(
+                success=False,
+                exit_code=-9,
+                stdout="",
+                stderr=f"Signed base APK was created, but rebuilding the final XAPK bundle failed: {exc}",
+                command="sign_apk()",
+                artifacts={
+                    "signed_apk": str(signed_path),
+                    "expected_xapk": str(get_final_artifact_path(_project)),
+                },
+            )
+            return (
+                alignment_note
+                + failure.to_llm_str()
+                + "\n\n--- certificate analysis ---\n"
+                + json.dumps(cert_info, ensure_ascii=False, indent=2)[:5000]
+            )
+
+        xapk_errors = validate_apk(final_artifact, _config.max_apk_size_mb)
+        if xapk_errors:
+            failure = ToolResult(
+                success=False,
+                exit_code=-10,
+                stdout="",
+                stderr="Final signed XAPK failed structural checks.",
+                command="sign_apk()",
+                artifacts={
+                    "signed_apk": str(signed_path),
+                    "signed_xapk": str(final_artifact),
+                    "xapk_structure_errors": xapk_errors,
+                },
+            )
+            return (
+                alignment_note
+                + failure.to_llm_str()
+                + "\n\n--- certificate analysis ---\n"
+                + json.dumps(cert_info, ensure_ascii=False, indent=2)[:5000]
+            )
+
+        xapk_note = (
+            "\n\n--- xapk bundle ---\n"
+            + json.dumps({
+                "success": True,
+                "signed_apk": str(signed_path),
+                "final_artifact": str(final_artifact),
+                "split_apks": list(getattr(_project, "xapk_split_apk_entries", []) or []),
+                "obb_files": list(getattr(_project, "xapk_obb_entries", []) or []),
+            }, ensure_ascii=False, indent=2)[:5000]
+        )
+
     return (
         alignment_note
         + result.to_llm_str()
         + "\n\n--- certificate analysis ---\n"
         + json.dumps(cert_info, ensure_ascii=False, indent=2)[:5000]
+        + xapk_note
     )
 
 
@@ -6683,6 +6758,194 @@ def search_binary_strings(
 
 
 @tool
+def analyze_dart_aot(file_path: str) -> str:
+    """Fingerprint a Flutter/Dart AOT native library such as libapp.so.
+
+    This tool does not reconstruct Dart symbols. It verifies ELF/arch support,
+    checks for Flutter/Dart markers, and identifies likely code/data ranges to
+    inspect before planning bounded native patches.
+
+    Args:
+        file_path: Absolute path or project-relative path to a native library,
+            typically `lib/arm64-v8a/libapp.so`.
+
+    Returns: JSON with support_level, arch, ELF section names, string hint
+    counts, candidate_snapshot_ranges, and notes about analysis confidence.
+    """
+    from apk_agent.tools.dart_aot import analyze_dart_aot as _analyze
+
+    def _run():
+        p = _resolve_project_path(file_path)
+        result = _analyze(p)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:20000]
+
+    return _safe_call(_run, "analyze_dart_aot", _cache_hint=str(file_path))
+
+
+@tool
+def build_dart_aot_index(file_path: str) -> str:
+    """Build a searchable Dart AOT anchor index for a Flutter native library.
+
+    The index stores printable strings, hint-matched anchors, ELF sections, and
+    fingerprint metadata in the project's outputs directory.
+
+    Args:
+        file_path: Absolute or project-relative path to `libapp.so` or another
+            target native library.
+
+    Returns: JSON with stats and an `output_file` pointing to the saved index.
+    """
+    from apk_agent.tools.dart_aot import build_dart_aot_index as _build
+
+    def _run():
+        p = _resolve_project_path(file_path)
+        output = _project.outputs_dir / "dart_aot_index.json"
+        result = _build(p, output_path=output)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:20000]
+
+    return _safe_call(_run, "build_dart_aot_index", _cache_hint=str(file_path))
+
+
+@tool
+def locate_dart_aot_candidates(
+    file_path: str,
+    query: str = "",
+    anchors_json: str = "[]",
+    index_file: str = "",
+    window_bytes: int = 4096,
+    max_matches: int = 25,
+) -> str:
+    """Locate candidate Dart AOT patch regions using string anchors and hints.
+
+    Use this after `build_dart_aot_index()` or directly on a `libapp.so` path.
+    The tool returns bounded windows/offsets rather than pretending to recover
+    full Dart symbols.
+
+    Args:
+        file_path: Target library path. Used when index_file is empty.
+        query: Free-form search text such as `wallet,purchase,paywall`.
+        anchors_json: JSON array of exact string anchors to match.
+        index_file: Optional saved index file from build_dart_aot_index.
+        window_bytes: Nearby window to report around a matched anchor.
+        max_matches: Max returned candidate regions.
+
+    Returns: JSON with candidate offsets, confidence, nearby strings, and a
+    suggested patch kind.
+    """
+    from apk_agent.tools.dart_aot import locate_dart_aot_candidates as _locate
+
+    def _run():
+        try:
+            anchors = json.loads(anchors_json)
+        except json.JSONDecodeError as exc:
+            return json.dumps({"success": False, "error": f"Invalid anchors_json: {exc}"})
+
+        if anchors and not isinstance(anchors, list):
+            return json.dumps({"success": False, "error": "anchors_json must decode to a JSON array."})
+
+        source = _resolve_project_path(index_file) if index_file.strip() else _resolve_project_path(file_path)
+        result = _locate(
+            source,
+            query=query,
+            anchors=[str(item) for item in (anchors or [])],
+            window_bytes=window_bytes,
+            max_matches=max_matches,
+        )
+        return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
+
+    return _safe_call(
+        _run,
+        "locate_dart_aot_candidates",
+        _cache_hint=f"{file_path}:{index_file}:{query}:{anchors_json}:{window_bytes}:{max_matches}",
+    )
+
+
+
+@tool
+def preview_dart_aot_patch(file_path: str, patch_plan_json: str) -> str:
+    '''Preview a byte-level patch on a Dart AOT binary without writing to disk.
+
+    Args:
+        file_path: Target library path inside the project.
+        patch_plan_json: JSON object with 'offset', 'replace_hex', and 'expected_original_hex'.
+
+    Returns: JSON describing the planned patch sizes, hex differences, and safety notes.
+    '''
+    from apk_agent.tools.dart_aot import preview_dart_aot_patch as _preview
+    import json
+    
+    def _run():
+        try:
+            plan = json.loads(patch_plan_json)
+        except Exception as e:
+            return json.dumps({"success": False, "error": str(e)})
+        
+        result = _preview(_resolve_project_path(file_path), plan)
+        return json.dumps(result, indent=2)
+    return _safe_call(_run, "preview_dart_aot_patch", _cache_hint=f"{file_path}:{patch_plan_json}")
+
+@tool
+def apply_dart_aot_patch(file_path: str, patch_plan_json: str) -> str:
+    '''Apply a byte-level patch to a Dart AOT binary and record it to the patch journal.
+
+    Args:
+        file_path: Target library path inside the project.
+        patch_plan_json: JSON object with 'offset', 'replace_hex', and optionally 'description'.
+
+    Returns: JSON indicating success and backup details.
+    '''
+    from apk_agent.tools.dart_aot import apply_dart_aot_patch as _apply
+    import json
+    
+    def _run():
+        try:
+            plan = json.loads(patch_plan_json)
+        except Exception as e:
+            return json.dumps({"success": False, "error": str(e)})
+            
+        real_path = _resolve_project_path(file_path)
+        backup_dir = _project.patch_diffs_dir
+        result = _apply(real_path, plan, backup_dir=backup_dir)
+        
+        if result.get("success"):
+            # Try to log to the global journal
+            try:
+                _patch_journal.append({
+                    "target_file": str(file_path),
+                    "description": plan.get("description", "Dart AOT binary patch"),
+                    "steps_applied": 1,
+                    "steps_total": 1,
+                    "diff_text": f"OFFSET: {result.get('offset_hex')} \nORIGINAL: {result.get('original_hex')}\nREPLACE:  {result.get('replace_hex')}",
+                    "tool": "apply_dart_aot_patch",
+                    "errors": []
+                })
+            except Exception:
+                pass
+                
+        return json.dumps(result, indent=2)
+    return _safe_call(_run, "apply_dart_aot_patch")
+
+@tool
+def validate_dart_aot_patch(file_path: str, offset: int, expected_hex: str) -> str:
+    '''Check if exact bytes are present at an offset in a file. Use this post-patch.
+
+    Args:
+        file_path: Path to the modified library.
+        offset: The integer offset in the binary.
+        expected_hex: Hex string of bytes that should be there.
+
+    Returns: JSON indicating validation success or mismatch.
+    '''
+    from apk_agent.tools.dart_aot import validate_dart_aot_patch as _valid
+    import json
+    
+    def _run():
+        result = _valid(_resolve_project_path(file_path), offset=offset, expected_hex=expected_hex)
+        return json.dumps(result, indent=2)
+    return _safe_call(_run, "validate_dart_aot_patch", _cache_hint=f"{file_path}:{offset}:{expected_hex}")
+
+
+@tool
 def patch_binary_strings(file_path: str, replacements_json: str) -> str:
     """Patch embedded strings in `.so`, `.dex`, `.bundle`, and similar files.
 
@@ -10761,11 +11024,14 @@ def inject_runtime_menu_scaffold(
 ) -> str:
         """Inject a first-pass runtime mod-menu scaffold into the current APK project.
 
-        The first implementation generates an in-app overlay panel attached to the
-        foreground Activity. Each button can trigger one of these runtime action kinds:
+        The current implementation generates a draggable floating menu attached to the
+        foreground Activity or a system overlay service, depending on overlay_mode.
+        Controls can be buttons, toggles, or sliders, and each control can trigger one
+        of these runtime action kinds:
             - shared_pref
             - static_field
             - invoke_static
+            - dispatcher
 
         Example spec_json:
             {
@@ -10782,6 +11048,24 @@ def inject_runtime_menu_scaffold(
                         "persist_on_resume": true
                     },
                     {
+                        "id": "premium_toggle",
+                        "label": "Premium Toggle",
+                        "ui_kind": "toggle",
+                        "kind": "dispatcher",
+                        "method_descriptor": "Lcom/example/Hooks;->setPremiumEnabled(Landroid/content/Context;Z)V",
+                        "persist_on_resume": true
+                    },
+                    {
+                        "id": "speed_slider",
+                        "label": "Speed Level",
+                        "ui_kind": "slider",
+                        "kind": "dispatcher",
+                        "method_descriptor": "Lcom/example/Hooks;->setSpeedLevel(Landroid/content/Context;I)V",
+                        "min_value": 1,
+                        "max_value": 5,
+                        "initial_value": 3
+                    },
+                    {
                         "label": "Call Premium Hook",
                         "kind": "invoke_static",
                         "method_descriptor": "Lcom/example/Hooks;->enableVip(Landroid/content/Context;)V"
@@ -10790,13 +11074,15 @@ def inject_runtime_menu_scaffold(
             }
 
         Notes:
-        - This first slice creates real helper classes and startup bootstrap code.
-        - The generated menu is inside the app window itself, so no overlay permission
+        - The scaffold creates real helper classes, drag listeners, dispatcher bindings,
+            and startup bootstrap code.
+        - `kind="dispatcher"` binds buttons/toggles/sliders directly to static runtime
+            hook methods.
+        - The generated menu is inside the app window itself in `in_app` mode, so no overlay permission
             is required for overlay_mode='in_app'.
-        - If overlay_mode='system_overlay' or 'hybrid' is requested, the tool now
-            returns explicit Tier B requirements/warnings and still falls back to the
-            in-app scaffold until a full WindowManager service implementation exists.
-        - Persistent actions are re-applied on later resumes/attaches until the
+        - If overlay_mode='system_overlay' or 'hybrid' is requested, the tool generates
+            a real WindowManager overlay service and explicit Tier B requirements/warnings.
+        - Persistent actions and control states are re-applied on later resumes/attaches until the
             generated reset button is pressed.
         """
         from apk_agent.tools.runtime_menu import inject_runtime_menu_scaffold as _inject_runtime_menu_scaffold
@@ -10820,7 +11106,8 @@ def inject_runtime_menu_scaffold(
                                 "success": True,
                                 "target_file": result.get("files_modified", ["runtime menu scaffold"])[0],
                                 "description": (
-                                        f"Injected runtime menu scaffold ({result.get('overlay_mode', overlay_mode)}) "
+                            f"Injected runtime menu scaffold requested={result.get('requested_overlay_mode', overlay_mode)} "
+                            f"effective={result.get('effective_overlay_mode', overlay_mode)} "
                                         f"with {result.get('user_buttons', 0)} user buttons"
                                 ),
                                 "steps_applied": len(result.get("files_modified", [])),
@@ -10864,16 +11151,17 @@ def configure_runtime_menu_manifest(
                         add_overlay_permission=add_overlay_permission,
                         require_foreground_service=require_foreground_service,
                 )
-                if result.get("success") and result.get("permissions_added"):
+                if result.get("success") and (result.get("permissions_added") or result.get("components_added")):
                         _patch_journal.append({
                                 "success": True,
                                 "target_file": result.get("manifest_file", "AndroidManifest.xml"),
                                 "description": (
-                                        f"Configured runtime menu manifest ({result.get('overlay_mode', overlay_mode)}) "
-                                        f"with permissions: {', '.join(result.get('permissions_added', []))}"
+                            f"Configured runtime menu manifest requested={result.get('requested_overlay_mode', overlay_mode)} "
+                            f"effective={result.get('effective_overlay_mode', overlay_mode)} "
+                            f"with permissions/components: {', '.join(result.get('permissions_added', []) + result.get('components_added', []))}"
                                 ),
-                                "steps_applied": len(result.get("permissions_added", [])),
-                                "steps_total": len(result.get("permissions_added", [])),
+                        "steps_applied": len(result.get("permissions_added", [])) + len(result.get("components_added", [])),
+                        "steps_total": len(result.get("permissions_added", [])) + len(result.get("components_added", [])),
                                 "errors": [],
                                 "tool": "configure_runtime_menu_manifest",
                         })
@@ -11087,6 +11375,12 @@ ALL_TOOLS = [
     search_native_code,
     search_dynamic_loaders,
     search_binary_strings,
+    analyze_dart_aot,
+    build_dart_aot_index,
+    locate_dart_aot_candidates,
+    preview_dart_aot_patch,
+    apply_dart_aot_patch,
+    validate_dart_aot_patch,
     patch_binary_strings,
     # File operations
     read_file,

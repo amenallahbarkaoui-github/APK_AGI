@@ -254,6 +254,7 @@ def agent_node(state: AgentState) -> dict:
                     "- Entry/recovery: find_entry_points, map_hierarchy, analyze_shared_prefs, extract_native_strings, scan_assets_secrets\n"
                     "- Validation: validate_patch, diff_patched_file, validate_patch_pipeline, generate_runtime_validation_plan\n"
                     "- Architecture recovery: map_semantic_architecture, recover_hidden_state_model, profile_guard_and_revalidation_surface, find_enforcement_surfaces, semantic_method_slice\n"
+                    "- Flutter/Dart AOT: analyze_dart_aot, build_dart_aot_index, locate_dart_aot_candidates for libapp.so anchor recovery before bounded native patching\n"
                     "- Runtime/response control: patch_api_response_flow, inject_runtime_override_layer, inject_runtime_menu_scaffold, configure_runtime_menu_manifest\n"
                     "- Working memory: update_scratchpad (save any free-form hypothesis, suspicious class, state field, or server-overwrite note for later turns)\n"
                     "- Text/resource/binary patching: apply_text_patch, preview_text_patch, patch_binary_hex, find_resource_colors, find_resource_styles, replace_resource_colors, list_resource_drawables\n"
@@ -818,6 +819,7 @@ def human_review_node(state: AgentState) -> dict:
     elif response_lower in ("no", "n", "skip"):
         # User rejected → create fake tool responses saying "skipped by user"
         rejection_messages = []
+        passthrough_calls = []
         for tc in last_msg.tool_calls:
             if tc["name"] == "apply_smali_patch":
                 rejection_messages.append(
@@ -828,8 +830,16 @@ def human_review_node(state: AgentState) -> dict:
                     )
                 )
             else:
-                # Non-patch tools still go through
-                pass
+                passthrough_calls.append(tc)
+        if passthrough_calls:
+            last_msg.tool_calls = passthrough_calls
+            ak_tcs = last_msg.additional_kwargs.get("tool_calls")
+            if ak_tcs is not None:
+                passthrough_ids = {tc.get("id") for tc in passthrough_calls}
+                last_msg.additional_kwargs["tool_calls"] = [
+                    tc for tc in ak_tcs if tc.get("id") in passthrough_ids
+                ]
+            return {"messages": rejection_messages, "human_feedback": "approved"}
         # Also add a human message explaining
         rejection_messages.append(
             HumanMessage(content=f"User chose to skip the proposed patches. Reason: {human_response}")

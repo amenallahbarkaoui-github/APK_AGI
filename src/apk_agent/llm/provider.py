@@ -251,6 +251,7 @@ def get_llm(
     temperature: float = 1.0,
     *,
     capture_reasoning: bool = True,
+    enable_thinking: bool | None = None,
 ) -> ChatOpenAI:
     """Return a ChatOpenAI model pointed at the configured API.
 
@@ -274,9 +275,10 @@ def get_llm(
         )
 
     model_supports_thinking = _model_supports_thinking(config.model_name)
+    thinking_enabled = model_supports_thinking if enable_thinking is None else bool(enable_thinking and model_supports_thinking)
 
     http_client = _PatchedHttpClient(timeout=httpx.Timeout(10.0, read=300.0))
-    http_client._enable_thinking = model_supports_thinking and capture_reasoning
+    http_client._enable_thinking = thinking_enabled
     http_client._capture_reasoning = capture_reasoning
 
     max_tokens = _recommended_max_output_tokens(config.model_name, config.context_window)

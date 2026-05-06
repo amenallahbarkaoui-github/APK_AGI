@@ -36,7 +36,7 @@ from apk_agent.session import (
     save_session_meta,
     update_active_session,
 )
-from apk_agent.workspace import Project, ProjectManager
+from apk_agent.workspace import Project, ProjectManager, get_final_artifact_path
 
 logger = logging.getLogger("apk_agent.telegram")
 
@@ -1148,13 +1148,8 @@ class TelegramBotService:
             self.api.download_file(telegram_file["file_path"], download_path)
 
             if existing_project:
-                # Import into the existing active project instead of creating new
-                import shutil
-                dest = Path(existing_project.workspace_path) / "input" / "original.apk"
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(str(download_path), str(dest))
-                project = existing_project
-                self._set_status(chat_id, state, "APK added to existing project", f"Linked to active project {project.id[:12]}.", record_event=f"APK added to project {project.id[:12]}")
+                project = self.pm.import_package(existing_project, download_path, self.config.max_apk_size_mb)
+                self._set_status(chat_id, state, "Package added to existing project", f"Linked to active project {project.id[:12]}.", record_event=f"Package added to project {project.id[:12]}")
             else:
                 self._set_status(chat_id, state, "Importing APK into workspace", f"Creating project from {file_name}.", record_event="Importing APK into workspace")
                 project = self.pm.create_project(download_path, self.config.max_apk_size_mb)
@@ -1799,64 +1794,65 @@ class TelegramBotService:
             logger.debug("Failed to send report: %s", exc)
 
     def _send_final_artifact_if_ready(self, chat_id: int, project: Project, state: TelegramChatState) -> None:
-        signed_apk = Path(project.workspace_path) / "outputs" / "patched-signed.apk"
-        if not signed_apk.is_file():
+        final_artifact = get_final_artifact_path(project)
+        artifact_label = "XAPK" if final_artifact.suffix.lower() == ".xapk" else "APK"
+        if not final_artifact.is_file():
             self._set_status(
                 chat_id,
                 state,
                 "Task completed",
-                "No final signed APK was found in outputs/patched-signed.apk.",
+                f"No final signed {artifact_label} was found in {final_artifact}.",
                 record_event="No signed artifact produced",
             )
             return
 
-        stat = signed_apk.stat()
-        if signed_apk.resolve().as_posix() == state.last_artifact_path and stat.st_mtime <= state.last_artifact_mtime:
+        stat = final_artifact.stat()
+        if final_artifact.resolve().as_posix() == state.last_artifact_path and stat.st_mtime <= state.last_artifact_mtime:
             self._set_status(
                 chat_id,
                 state,
                 "Done",
-                f"Final APK already sent earlier: {signed_apk.name}",
-                record_event=f"Artifact already sent: {signed_apk.name}",
+                f"Final artifact already sent earlier: {final_artifact.name}",
+                record_event=f"Artifact already sent: {final_artifact.name}",
             )
             return
 
         if stat.st_size > _MAX_SENDABLE_DOCUMENT_BYTES:
             self._send_message(
                 chat_id,
-                "Final signed APK is ready, but Telegram refused to send files larger than 49 MB.\n"
-                f"Local path: {signed_apk}",
+                f"Final signed {artifact_label} is ready, but Telegram refused to send files larger than 49 MB.\n"
+                f"Local path: {final_artifact}",
             )
             self._set_status(
                 chat_id,
                 state,
                 "Final artifact ready locally",
-                f"Telegram send limit exceeded. Local path: {signed_apk}",
-                record_event=f"Signed APK ready locally: {signed_apk.name}",
+                f"Telegram send limit exceeded. Local path: {final_artifact}",
+                record_event=f"Signed artifact ready locally: {final_artifact.name}",
             )
         else:
             self._send_chat_action(chat_id, "upload_document")
             self._set_status(
                 chat_id,
                 state,
-                "Uploading final APK",
-                f"Sending {signed_apk.name} back to Telegram.",
-                record_event=f"Uploading {signed_apk.name}",
+                f"Uploading final {artifact_label}",
+                f"Sending {final_artifact.name} back to Telegram.",
+                record_event=f"Uploading {final_artifact.name}",
             )
             self.api.send_document(
                 chat_id,
-                signed_apk,
-                caption=f"Final patched APK for project {project.id}",
+                final_artifact,
+                caption=f"Final patched {artifact_label} for project {project.id}",
             )
             self._set_status(
                 chat_id,
                 state,
                 "Done",
-                f"Final patched APK sent successfully: {signed_apk.name}",
-                record_event=f"Final APK sent: {signed_apk.name}",
+                f"Final patched {artifact_label} sent successfully: {final_artifact.name}",
+                record_event=f"Final artifact sent: {final_artifact.name}",
             )
 
-        state.last_artifact_path = signed_apk.resolve().as_posix()
+        state.last_artifact_path = final_artifact.resolve().as_posix()
         state.last_artifact_mtime = stat.st_mtime
         self.state_store.save_chat(chat_id, state)
 

@@ -1,4 +1,4 @@
-"""APK signing utilities — apksigner / uber-apk-signer / jarsigner."""
+"""APK signing utilities - apksigner / uber-apk-signer / jarsigner."""
 
 from __future__ import annotations
 
@@ -15,6 +15,8 @@ _APKSIGNER_VERIFY_SCHEME_RE = re.compile(
     r"Verified using\s+(?P<scheme>v\d+(?:\.\d+)?)\s+scheme(?:\s*\([^)]*\))?:\s*(?P<verified>true|false)",
     re.IGNORECASE,
 )
+
+_REQUIRED_SIGNATURE_SCHEMES = ("v1", "v2", "v3")
 
 
 def _extract_verified_signature_schemes(verify_output: str) -> tuple[list[str], dict[str, bool]]:
@@ -70,7 +72,6 @@ def sign_apk(
     output_apk = Path(output_apk).resolve()
     output_apk.parent.mkdir(parents=True, exist_ok=True)
 
-    # Ensure keystore
     if not keystore_path:
         keystore_path = unsigned_apk.parent / "debug.keystore"
         _ensure_debug_keystore(keystore_path)
@@ -84,7 +85,6 @@ def sign_apk(
         pass
 
     if "uber" in signer_name or signer_name.endswith(".jar"):
-        # uber-apk-signer
         cmd = [
             "java", "-jar", str(signer_bin),
             "--apks", str(unsigned_apk),
@@ -95,7 +95,6 @@ def sign_apk(
             "-o", str(output_apk.parent),
         ]
     elif "jarsigner" in signer_name:
-        # jarsigner (legacy)
         shutil.copy2(str(unsigned_apk), str(output_apk))
         cmd = [
             signer_bin,
@@ -109,7 +108,6 @@ def sign_apk(
             key_alias,
         ]
     else:
-        # apksigner (Android SDK)
         cmd = [
             signer_bin, "sign",
             "--ks", str(keystore_path),
@@ -159,15 +157,38 @@ def sign_apk(
             except OSError:
                 pass
             return result
+
         verify_output = "\n".join(
             chunk for chunk in [verify_result.stdout, verify_result.stderr] if chunk
         )
         verified_schemes, scheme_details = _extract_verified_signature_schemes(verify_output)
+        if scheme_details:
+            result.artifacts["signature_scheme_details"] = scheme_details
+
+        missing_required_schemes = [
+            scheme for scheme in _REQUIRED_SIGNATURE_SCHEMES
+            if not scheme_details.get(scheme, False)
+        ]
+        if missing_required_schemes:
+            result.success = False
+            result.exit_code = -4
+            result.artifacts["signature_verified"] = False
+            result.artifacts["missing_signature_schemes"] = ",".join(missing_required_schemes)
+            result.stderr = (
+                (result.stderr + "\n" if result.stderr else "")
+                + "Signature verification failed: required schemes missing or unverified: "
+                + ", ".join(missing_required_schemes)
+                + ". Refusing to report success because Android installability may depend on the full v1/v2/v3 set."
+            )
+            try:
+                final_apk.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return result
+
         result.artifacts["signature_verified"] = True
         if verified_schemes:
             result.artifacts["signature_schemes"] = ",".join(verified_schemes)
-        if scheme_details:
-            result.artifacts["signature_scheme_details"] = scheme_details
 
     result.artifacts["signed_apk"] = str(final_apk)
     return result

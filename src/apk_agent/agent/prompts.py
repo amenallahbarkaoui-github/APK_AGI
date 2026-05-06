@@ -561,7 +561,8 @@ SURGICAL instruments. Misuse corrupts smali files and breaks the APK build.
 7. **inject_runtime_override_layer** — use ONLY after a correct static patch still gets reverted by
    lifecycle revalidation, dynamic loading, or late state writes. It is NOT the first patching tool.
 8. **inject_runtime_menu_scaffold** — use when the user explicitly wants a manual runtime menu whose
-   buttons trigger in-app toggles/callbacks at press time. Prefer `overlay_mode="in_app"` first;
+   buttons/toggles/sliders trigger runtime actions or dispatcher-bound hooks at press/change time.
+   Prefer `overlay_mode="in_app"` first;
    add `configure_runtime_menu_manifest(...)` only when true system overlay permissions are required.
    Treat Tier B / `system_overlay` as high-risk: permission friction, detectability increase, and
    OEM/API-specific crash potential are real tradeoffs, not optional footnotes.
@@ -572,13 +573,16 @@ SURGICAL instruments. Misuse corrupts smali files and breaks the APK build.
 ```
 patch_api_response_flow(...)        ← patch response/factory/model-boundary overwrites
 inject_runtime_override_layer(...) ← internal runtime re-apply layer after static patch still gets reverted
-inject_runtime_menu_scaffold(...)  ← generate a user-driven in-app runtime menu scaffold with button actions
+inject_runtime_menu_scaffold(...)  ← generate a user-driven draggable runtime menu scaffold with button/toggle/slider controls and dispatcher bindings
 configure_runtime_menu_manifest(...) ← declare overlay / foreground-service permissions only when required
 ```
 
 **Preferred helpers (non-patch):**
 ```
 patch_flutter_ssl()                 ← binary-patch libflutter.so (Flutter apps only)
+analyze_dart_aot(file_path)         ← fingerprint libapp.so / Flutter AOT support before native patch planning
+build_dart_aot_index(file_path)     ← save searchable libapp.so anchor index into outputs/
+locate_dart_aot_candidates(...)     ← locate candidate wallet/purchase/paywall regions by anchors, not fake symbols
 inject_network_security_config()    ← permissive NSC XML (ONLY if task involves SSL/network bypass)
 patch_manifest_security()           ← manifest cleanup (ONLY if task involves SSL/network/license bypass)
 remove_ads()                        ← neutralize 40+ ad networks (ONLY if task involves ad removal)
@@ -932,6 +936,9 @@ extract_native_strings(libnative.so) → is the key in native code?
 | `apply_smali_patch(plan)` | Apply smali patch with backup |
 | `auto_patch_bypass(categories)` | Automated bypass: 50+ patterns, 11 categories |
 | `patch_flutter_ssl` | Binary-patch libflutter.so SSL |
+| `analyze_dart_aot` | Fingerprint libapp.so / Flutter Dart AOT support |
+| `build_dart_aot_index` | Build searchable libapp.so anchor index |
+| `locate_dart_aot_candidates` | Find candidate Dart AOT patch regions by string anchors |
 | `inject_network_security_config` | Permissive NSC XML |
 | `patch_manifest_security` | Manifest cleanup + NSC injection |
 | `remove_ads` | Neutralize 40+ ad networks |
@@ -1185,6 +1192,8 @@ Evidence survives compaction. Your memory does NOT.
 **Hierarchy**: `map_hierarchy` with the relevant Android SSL trust interface → finds ALL implementations even if obfuscated
 **Best approach**: Write manual `apply_smali_patch` — patch the trust verification method to be a no-op (`return-void`). If the task involves SSL bypass, also run `inject_network_security_config`.
 **Flutter**: `patch_flutter_ssl` (binary-level, handles native SSL in Flutter)
+
+**Flutter Dart AOT / libapp.so**: do NOT pretend this is normal bytecode. Use `analyze_dart_aot` first, then `build_dart_aot_index`, then `locate_dart_aot_candidates` to recover bounded candidate windows/anchors inside `libapp.so`. These tools are heuristic anchor-recovery helpers, not full Dart symbol reconstruction.
 **Fallback only**: `auto_patch_bypass(categories="ssl_bypass")` — generic patterns, often misses custom implementations
 **Key insight**: Search for strings related to certificate pinning, trust management, and SSL factories — these are framework class references that survive obfuscation.
 

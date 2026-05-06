@@ -38,6 +38,35 @@ logger = logging.getLogger("apk_agent.orchestrator")
 _MAX_CONTENT_BLOCKS = 5
 
 
+def _message_content_to_text(content: Any) -> str:
+    """Coerce str-or-block message payloads into plain text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                block_type = block.get("type", "")
+                if block_type == "text":
+                    parts.append(block.get("text", ""))
+                elif block_type in ("thinking", "reasoning"):
+                    parts.append(block.get("thinking") or block.get("text") or "")
+        return "\n".join(part for part in parts if part and str(part).strip())
+    return str(content or "")
+
+
+def _project_scope_key(project: Project) -> str:
+    project_id = str(getattr(project, "id", "") or "").strip()
+    if project_id:
+        return project_id
+    workspace_path = str(getattr(project, "workspace_path", "") or "").strip()
+    if workspace_path:
+        return workspace_path
+    return "__default__"
+
+
 # ---------------------------------------------------------------------------
 # Message sanitizer — fix API-breaking message patterns
 # ---------------------------------------------------------------------------
@@ -611,8 +640,8 @@ class Orchestrator:
     """
 
     # Class-level storage for results across turns so follow-up questions work
-    _previous_results: list[dict] = []
-    _conversation_history: list[dict] = []  # [{"role":"user","content":...}, ...]
+    _previous_results_by_project: dict[str, list[dict]] = {}
+    _conversation_history_by_project: dict[str, list[dict]] = {}
 
     def __init__(self, config: AppConfig, project: Project, max_parallel: int = 3):
         self.config = config
@@ -621,13 +650,23 @@ class Orchestrator:
         self.progress = progress_manager
         self.results: list[dict] = []
 
+    def _scope_key(self) -> str:
+        return _project_scope_key(self.project)
+
+    def _previous_results(self) -> list[dict]:
+        return Orchestrator._previous_results_by_project.setdefault(self._scope_key(), [])
+
+    def _conversation_history(self) -> list[dict]:
+        return Orchestrator._conversation_history_by_project.setdefault(self._scope_key(), [])
+
     def route_message(self, user_input: str) -> str:
         """Classify user input: 'dispatch' (needs sub-agents) or 'chat' (conversational).
 
         Returns 'dispatch' or 'chat'.
         """
         # If no previous results, always dispatch (nothing to chat about)
-        if not Orchestrator._previous_results:
+        previous_results = self._previous_results()
+        if not previous_results:
             return "dispatch"
 
         llm = get_llm(self.config, temperature=0.0, capture_reasoning=False)
@@ -644,14 +683,14 @@ class Orchestrator:
             "'explain the crypto issue', 'show me the results', 'what is AES?', "
             "'which classes are vulnerable?').\n\n"
             f"Previous analysis agents used: "
-            f"{', '.join(r.get('role', '?') for r in Orchestrator._previous_results)}\n\n"
+            f"{', '.join(r.get('role', '?') for r in previous_results)}\n\n"
             f"User message: {user_input}\n\n"
             "Reply with ONLY one word: DISPATCH or CHAT"
         )
         try:
             response = llm.invoke([HumanMessage(content=route_prompt)])
-            answer = response.content.strip().upper()
-            if "CHAT" in answer:
+            answer = _message_content_to_text(response.content).strip().upper()
+            if answer.startswith("CHAT"):
                 return "chat"
         except Exception as e:
             logger.warning("Route classification failed: %s — defaulting to dispatch", e)
@@ -661,10 +700,12 @@ class Orchestrator:
     def chat(self, user_input: str) -> str:
         """Answer conversationally using previous results as context."""
         llm = get_llm(self.config, temperature=1.0, capture_reasoning=False)
+        previous_results = self._previous_results()
+        conversation_history = self._conversation_history()
 
         # Build context from previous results
         context_parts = []
-        for r in Orchestrator._previous_results:
+        for r in previous_results:
             result_text = r.get("result", "")
             role = r.get("role", "unknown")
             if len(result_text) > 4000:
@@ -673,7 +714,7 @@ class Orchestrator:
 
         # Build conversation history
         history_msgs = []
-        for entry in Orchestrator._conversation_history[-6:]:  # last 6 turns
+        for entry in conversation_history[-6:]:  # last 6 turns
             if entry["role"] == "user":
                 history_msgs.append(f"User: {entry['content']}")
             else:
@@ -696,23 +737,14 @@ class Orchestrator:
         )
         try:
             response = llm.invoke([HumanMessage(content=chat_prompt)])
-            content = response.content
-            if isinstance(content, list):
-                parts = []
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        parts.append(block.get("text", ""))
-                    elif isinstance(block, str):
-                        parts.append(block)
-                content = "\n".join(parts)
-            answer = content.strip() if isinstance(content, str) else str(content)
+            answer = _message_content_to_text(response.content).strip()
         except Exception as e:
             logger.error("Chat failed: %s", e)
             answer = f"Error generating response: {e}"
 
         # Update conversation history
-        Orchestrator._conversation_history.append({"role": "user", "content": user_input})
-        Orchestrator._conversation_history.append({"role": "assistant", "content": answer})
+        conversation_history.append({"role": "user", "content": user_input})
+        conversation_history.append({"role": "assistant", "content": answer})
 
         return answer
 
@@ -781,11 +813,12 @@ class Orchestrator:
 
         self.results = results
         # Store results at class level so follow-up messages can reference them
-        Orchestrator._previous_results = results
-        Orchestrator._conversation_history.append(
+        Orchestrator._previous_results_by_project[self._scope_key()] = list(results)
+        conversation_history = self._conversation_history()
+        conversation_history.append(
             {"role": "user", "content": user_task}
         )
-        Orchestrator._conversation_history.append(
+        conversation_history.append(
             {"role": "assistant", "content": f"[Dispatched {len(results)} sub-agents]"}
         )
         return results
@@ -824,7 +857,7 @@ Rules:
 Return ONLY the JSON, no markdown formatting."""
 
         response = llm.invoke([HumanMessage(content=plan_prompt)])
-        content = response.content.strip()
+        content = _message_content_to_text(response.content).strip()
 
         # Parse the plan
         try:
