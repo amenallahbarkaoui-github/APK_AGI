@@ -14,7 +14,7 @@ import threading
 import concurrent.futures
 from contextvars import copy_context
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from langchain_core.tools import tool
 
@@ -48,6 +48,7 @@ _CACHEABLE_TOOLS = frozenset({
     "aapt2_dump", "parse_manifest", "directory_overview",
     "find_string_decryption_patterns",
     "search_interceptors", "search_native_code", "search_dynamic_loaders",
+    "analyze_native_re_core", "plan_native_patch_targets", "route_reverse_engineering_workflow",
     "refine_search", "smart_search",
     "graph_callers", "graph_callees", "graph_class_info",
     "graph_find_path", "graph_security_scan", "graph_stats",
@@ -7021,8 +7022,62 @@ def analyze_native_libs() -> str:
 
     def _run():
         result = _analyze(_project.apktool_dir)
-        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
+        return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
     return _safe_call(_run, "analyze_native_libs")
+
+
+@tool
+def analyze_native_re_core(file_path: str) -> str:
+    """Deep ELF/JNI analysis for one native library.
+
+    This native reverse-engineering core parses ELF sections, symbol tables,
+    imported/exported functions, DT_NEEDED dependencies, JNI exports,
+    heuristic function boundaries, and ranked patch targets.
+    """
+    from apk_agent.tools.native_re_core import analyze_native_binary as _analyze
+
+    def _run():
+        result = _analyze(_resolve_project_path(file_path))
+        return json.dumps(result, ensure_ascii=False, indent=2)[:30000]
+
+    return _safe_call(_run, "analyze_native_re_core", _cache_hint=str(file_path))
+
+
+@tool
+def plan_native_patch_targets(file_path: str, focus_hint: str = "", max_results: int = 12) -> str:
+    """Rank concrete native patch targets for a library before editing bytes."""
+    from apk_agent.tools.native_re_core import plan_native_patch_targets as _plan
+
+    def _run():
+        result = _plan(_resolve_project_path(file_path), focus_hint=focus_hint, max_results=max_results)
+        return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
+
+    return _safe_call(
+        _run,
+        "plan_native_patch_targets",
+        _cache_hint=f"{file_path}:{focus_hint}:{max_results}",
+    )
+
+
+@tool
+def route_reverse_engineering_workflow(objective: str = "", focus_hint: str = "") -> str:
+    """Classify the current app and return the best RE workflow/tool route."""
+    from apk_agent.tools.orchestration_router import route_reverse_engineering_workflow as _route
+
+    def _run():
+        result = _route(
+            _project.apktool_dir,
+            jadx_dir=getattr(_project, "jadx_dir", None),
+            objective=objective,
+            focus_hint=focus_hint,
+        )
+        return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
+
+    return _safe_call(
+        _run,
+        "route_reverse_engineering_workflow",
+        _cache_hint=f"{objective}:{focus_hint}",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -11016,6 +11071,193 @@ def plan_runtime_hooks(focus_hint: str = "", class_name: str = "", max_results: 
 
 
 @tool
+def plan_runtime_menu_workflow(
+    focus_hint: str = "",
+    class_name: str = "",
+    overlay_mode: str = "in_app",
+    max_results: int = 6,
+    start_collapsed: bool = True,
+) -> str:
+    """Plan a step-by-step runtime-menu workflow for the current APK project.
+
+    This is a non-injecting orchestration helper for the agent. It keeps the
+    runtime-menu flow explicit and staged instead of collapsing everything into
+    one action.
+
+    The returned JSON includes:
+    - `tool_chain`: the recommended ordered tool sequence
+    - `spec_json`: the current floating-menu draft when hook planning succeeds
+    - `binding_hints` / `unsupported_bindings`: any hook targets that still need manual follow-up
+    - `recommended_next_tool` / `recommended_next_args`: the immediate next step
+    """
+    from apk_agent.tools.behavior_engine import plan_runtime_hooks as _plan_runtime_hooks
+    from apk_agent.tools.runtime_menu import build_runtime_menu_spec_from_hook_plan as _build_runtime_menu_spec_from_hook_plan
+
+    def _step(num: int, tool_name: str, purpose: str, args: dict[str, Any], *, when: str = "") -> dict[str, Any]:
+        item = {
+            "step": num,
+            "tool": tool_name,
+            "purpose": purpose,
+            "args": args,
+        }
+        if when:
+            item["when"] = when
+        return item
+
+    def _run():
+        overlay_requires_manifest = overlay_mode in {"system_overlay", "hybrid"}
+        tool_chain = [
+            _step(
+                1,
+                "plan_runtime_hooks",
+                "Identify runtime revalidation points and candidate hook methods before building the menu.",
+                {
+                    "focus_hint": focus_hint,
+                    "class_name": class_name,
+                    "max_results": max_results,
+                },
+            ),
+            _step(
+                2,
+                "draft_runtime_menu_from_hooks",
+                "Draft the floating menu spec from runtime-hook candidates and resolve supported static bindings.",
+                {
+                    "focus_hint": focus_hint,
+                    "class_name": class_name,
+                    "overlay_mode": overlay_mode,
+                    "max_results": max_results,
+                    "start_collapsed": start_collapsed,
+                },
+            ),
+            _step(
+                3,
+                "inject_runtime_menu_scaffold",
+                "Generate the actual draggable runtime menu inside the APK using the draft spec_json.",
+                {
+                    "spec_json": "<use top-level spec_json from this tool result>",
+                    "overlay_mode": overlay_mode,
+                    "reapply_on_resume": True,
+                },
+            ),
+            _step(
+                4,
+                "configure_runtime_menu_manifest",
+                "Declare overlay/service permissions only when the chosen mode really needs them.",
+                {
+                    "overlay_mode": overlay_mode,
+                    "add_overlay_permission": overlay_requires_manifest,
+                    "require_foreground_service": overlay_mode == "hybrid",
+                },
+                when="Only when overlay_mode is system_overlay or hybrid.",
+            ),
+            _step(
+                5,
+                "generate_runtime_validation_plan",
+                "Prepare a focused post-injection validation checklist for the floating menu and its runtime actions.",
+                {
+                    "task": "runtime menu hooks, floating launcher, and reapply behavior",
+                },
+            ),
+        ]
+
+        pack = _ensure_behavior_graph_pack(auto_build=True, focus_hint=focus_hint or class_name)
+        if pack is None:
+            return json.dumps({
+                "success": True,
+                "workflow_mode": "step_by_step_runtime_menu",
+                "behavior_graph_ready": False,
+                "overlay_mode": overlay_mode,
+                "tool_chain": [
+                    _step(
+                        0,
+                        "build_behavior_graph",
+                        "Build the behavior graph first so runtime hooks and menu drafts can be derived automatically.",
+                        {"focus_hint": focus_hint or class_name},
+                    ),
+                    *tool_chain,
+                ],
+                "recommended_next_tool": "build_behavior_graph",
+                "recommended_next_args": {"focus_hint": focus_hint or class_name},
+                "notes": [
+                    "Behavior graph data is unavailable, so no automatic runtime-menu draft was produced yet.",
+                    "After build_behavior_graph succeeds, rerun this helper to get a resolved spec_json and binding hints.",
+                ],
+            }, ensure_ascii=False, indent=2)[:30000]
+
+        hook_plan = _plan_runtime_hooks(
+            pack,
+            focus_hint=focus_hint,
+            class_name=class_name,
+            max_results=max_results,
+        )
+        draft = _build_runtime_menu_spec_from_hook_plan(
+            hook_plan,
+            title=(f"{class_name} Runtime Hooks" if class_name else "Runtime Hook Menu"),
+            overlay_mode=overlay_mode,
+            start_collapsed=start_collapsed,
+            apktool_dir=_project.apktool_dir,
+        )
+        spec = draft.get("spec") or {}
+        spec_json = draft.get("spec_json", "")
+        buttons = list(spec.get("buttons") or [])
+        unsupported = list(draft.get("unsupported_bindings") or [])
+
+        recommended_next_tool = "inject_runtime_menu_scaffold" if buttons else "draft_runtime_menu_from_hooks"
+        recommended_next_args = {
+            "spec_json": spec_json,
+            "overlay_mode": overlay_mode,
+            "reapply_on_resume": True,
+        } if buttons else {
+            "focus_hint": focus_hint,
+            "class_name": class_name,
+            "overlay_mode": overlay_mode,
+            "max_results": max_results,
+            "start_collapsed": start_collapsed,
+        }
+
+        result = {
+            "success": True,
+            "workflow_mode": "step_by_step_runtime_menu",
+            "behavior_graph_ready": True,
+            "focus_hint": hook_plan.get("focus_hint", focus_hint),
+            "class_name": hook_plan.get("class_name", class_name),
+            "overlay_mode": overlay_mode,
+            "tool_chain": tool_chain,
+            "hook_plan_summary": {
+                "hook_count": len(hook_plan.get("runtime_hooks") or []),
+                "focus_hint": hook_plan.get("focus_hint", focus_hint),
+                "class_name": hook_plan.get("class_name", class_name),
+            },
+            "draft_summary": {
+                "draft_mode": draft.get("draft_mode", ""),
+                "resolved_bindings": int(draft.get("resolved_bindings", 0) or 0),
+                "unsupported_binding_count": len(unsupported),
+                "button_count": len(buttons),
+                "start_collapsed": bool(spec.get("start_collapsed", start_collapsed)),
+                "launcher_label": str(spec.get("launcher_label", "HOOK")),
+            },
+            "spec_json": spec_json,
+            "binding_hints": list(draft.get("binding_hints") or []),
+            "unsupported_bindings": unsupported,
+            "recommended_next_tool": recommended_next_tool,
+            "recommended_next_args": recommended_next_args,
+            "output_path": str(_behavior_graph_path()),
+            "notes": [
+                "This helper is planning-only: it does not inject files or change the manifest.",
+                "Edit or extend spec_json before injection if you want extra manual buttons, sections, or shared_pref/static_field actions.",
+                "Run configure_runtime_menu_manifest only when the final mode actually needs overlay/service permissions.",
+            ],
+        }
+        return json.dumps(result, ensure_ascii=False, indent=2)[:30000]
+
+    return _safe_call(
+        _run,
+        "plan_runtime_menu_workflow",
+        _cache_hint=f"{focus_hint}:{class_name}:{overlay_mode}:{max_results}:{start_collapsed}",
+    )
+
+
+@tool
 def inject_runtime_menu_scaffold(
         spec_json: str,
         overlay_mode: str = "in_app",
@@ -11382,6 +11624,7 @@ ALL_TOOLS = [
     replace_resource_colors,
     list_resource_drawables,
     analyze_native_libs,
+    analyze_native_re_core,
     # Smali deep analysis
     scan_smali_classes,
     analyze_smali_class,
@@ -11428,6 +11671,7 @@ ALL_TOOLS = [
     search_interceptors,
     search_native_code,
     search_dynamic_loaders,
+    route_reverse_engineering_workflow,
     search_binary_strings,
     analyze_dart_aot,
     build_dart_aot_index,
@@ -11436,6 +11680,7 @@ ALL_TOOLS = [
     apply_dart_aot_patch,
     validate_dart_aot_patch,
     patch_binary_strings,
+    plan_native_patch_targets,
     # File operations
     read_file,
     write_file,
@@ -11519,6 +11764,7 @@ ALL_TOOLS = [
     recover_state_transitions,
     map_security_surfaces,
     plan_runtime_hooks,
+    plan_runtime_menu_workflow,
     analyze_network_behavior,
     recover_semantic_symbols,
     draft_runtime_menu_from_hooks,

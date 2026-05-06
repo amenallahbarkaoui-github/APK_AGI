@@ -1151,13 +1151,13 @@ def print_tools_list() -> None:
         name = t.name
         if name in ("apktool_decompile", "jadx_decompile", "dex2jar_convert", "apktool_build", "zipalign_apk_tool", "sign_apk", "aapt2_dump"):
             categories["Decompilation & Build"].append(name)
-        elif name in ("parse_manifest", "identify_app_packages", "analyze_attack_surface", "analyze_network_config", "analyze_native_libs", "analyze_manifest_deep", "score_permissions", "analyze_certificate"):
+        elif name in ("parse_manifest", "identify_app_packages", "analyze_attack_surface", "analyze_network_config", "analyze_native_libs", "analyze_native_re_core", "analyze_manifest_deep", "score_permissions", "analyze_certificate"):
             categories["Manifest & Components"].append(name)
         elif name in ("scan_smali_classes", "analyze_smali_class", "find_string_decryption_patterns", "find_method_xrefs", "analyze_method_deep", "detect_protections", "trace_call_chain", "reconstruct_strings"):
             categories["Smali Analysis"].append(name)
         elif "graph_" in name or "index_" in name or name in ("build_graph_and_index", "build_smali_index", "smali_index_stats", "semantic_method_slice", "find_enforcement_surfaces", "build_behavior_graph", "summarize_behavior_graph", "query_behavior_graph", "recover_state_transitions"):
             categories["Graph & Index"].append(name)
-        elif name in ("context_search", "multi_search", "xref_search", "directory_overview", "refine_search", "batch_read_smali_methods", "smart_search", "extract_strings", "search_in_code", "search_interceptors", "search_native_code", "search_dynamic_loaders"):
+        elif name in ("context_search", "multi_search", "xref_search", "directory_overview", "refine_search", "batch_read_smali_methods", "smart_search", "extract_strings", "search_in_code", "search_interceptors", "search_native_code", "search_dynamic_loaders", "route_reverse_engineering_workflow"):
             categories["Search & Discovery"].append(name)
         elif name in ("scan_vulnerabilities", "list_vuln_patterns", "unified_scan", "analyze_data_flow", "run_taint_analysis", "find_hardcoded_crypto", "scan_cloud_secrets", "generate_runtime_validation_plan", "map_security_surfaces", "analyze_network_behavior"):
             categories["Security & Scanning"].append(name)
@@ -1165,7 +1165,7 @@ def print_tools_list() -> None:
             categories["Premium Bypass"].append(name)
         elif name in ("trace_field_access", "find_class_instantiations", "inject_smali_code", "generate_constructor_override", "inject_startup_hook", "batch_patch_methods", "trace_data_pipeline", "map_ui_gates", "patch_shared_prefs_reads", "identify_server_checks", "plan_runtime_hooks", "recover_semantic_symbols"):
             categories["Deep Tracing & Injection"].append(name)
-        elif name in ("cross_reference_map", "deobfuscate_names", "find_dynamic_checks", "extract_all_urls", "verify_bypass_completeness"):
+        elif name in ("cross_reference_map", "deobfuscate_names", "find_dynamic_checks", "extract_all_urls", "verify_bypass_completeness", "plan_native_patch_targets"):
             categories["SOTA Analysis"].append(name)
         elif name in ("read_file", "write_file", "list_files", "save_evidence", "load_evidence", "search_evidence", "get_evidence_summary", "generate_report"):
             categories["File & Evidence"].append(name)
