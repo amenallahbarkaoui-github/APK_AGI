@@ -552,11 +552,22 @@ class PatchEngine:
 
     def _op_replace_line(self, text: str, step: PatchStep) -> Optional[str]:
         """Replace lines containing the match pattern."""
+        pat = step.match_pattern
+        pat_unesc = _unescape_smali(pat)
+
+        if any(token in pat for token in ("\n", "\r")) or any(token in pat_unesc for token in ("\n", "\r")):
+            m = self._find_pattern(text, pat, step.is_regex)
+            if m is None:
+                return None
+            replacement = step.replacement
+            matched_text = m.group(0)
+            if matched_text.endswith(("\r\n", "\n", "\r")) and not replacement.endswith(("\r\n", "\n", "\r")):
+                replacement += "\n"
+            return text[:m.start()] + replacement + text[m.end():]
+
         lines = text.splitlines(keepends=True)
         found = False
         result_lines = []
-        pat = step.match_pattern
-        pat_unesc = _unescape_smali(pat)
         for line in lines:
             if self._line_matches(line, pat, pat_unesc, step.is_regex):
                 result_lines.append(step.replacement + "\n")

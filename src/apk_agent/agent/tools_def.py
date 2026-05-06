@@ -11375,7 +11375,10 @@ def map_security_surfaces(focus_hint: str = "", class_name: str = "", max_result
 @tool
 def plan_runtime_hooks(focus_hint: str = "", class_name: str = "", max_results: int = 12) -> str:
     """Plan smart runtime hook points for revalidation and hardened flows."""
-    from apk_agent.tools.behavior_engine import plan_runtime_hooks as _plan_runtime_hooks
+    from apk_agent.tools.behavior_engine import (
+        annotate_runtime_hook_plan as _annotate_runtime_hook_plan,
+        plan_runtime_hooks as _plan_runtime_hooks,
+    )
 
     def _run():
         pack = _ensure_behavior_graph_pack(auto_build=True, focus_hint=focus_hint or class_name)
@@ -11387,6 +11390,7 @@ def plan_runtime_hooks(focus_hint: str = "", class_name: str = "", max_results: 
             class_name=class_name,
             max_results=max_results,
         )
+        result = _annotate_runtime_hook_plan(result, smali_index=get_runtime_slot("smali_index"))
         result["output_path"] = str(_behavior_graph_path())
         return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
 
@@ -11417,7 +11421,11 @@ def plan_runtime_menu_workflow(
     - `binding_hints` / `unsupported_bindings`: any hook targets that still need manual follow-up
     - `recommended_next_tool` / `recommended_next_args`: the immediate next step
     """
-    from apk_agent.tools.behavior_engine import plan_runtime_hooks as _plan_runtime_hooks
+    from apk_agent.tools.behavior_engine import (
+        annotate_runtime_hook_plan as _annotate_runtime_hook_plan,
+        plan_runtime_hooks as _plan_runtime_hooks,
+    )
+    from apk_agent.tools.patch_strategy import PatchStrategy
     from apk_agent.tools.runtime_menu import build_runtime_menu_spec_from_hook_plan as _build_runtime_menu_spec_from_hook_plan
 
     def _step(num: int, tool_name: str, purpose: str, args: dict[str, Any], *, when: str = "") -> dict[str, Any]:
@@ -11431,9 +11439,23 @@ def plan_runtime_menu_workflow(
             item["when"] = when
         return item
 
-    def _run():
+    def _filter_hooks(hook_plan: dict[str, Any], allowed: set[str]) -> list[dict[str, Any]]:
+        return [
+            dict(hook)
+            for hook in (hook_plan.get("runtime_hooks") or [])
+            if str(hook.get("strategy_recommendation") or PatchStrategy.RUNTIME_MENU_GOOD_FIT.value) in allowed
+        ]
+
+    def _first_hook_class(hook_plan: dict[str, Any]) -> str:
+        for hook in hook_plan.get("runtime_hooks") or []:
+            class_descriptor = str(hook.get("class") or "").strip()
+            if class_descriptor:
+                return class_descriptor
+        return class_name
+
+    def _chain_for_strategy(strategy_name: str, spec_json: str, class_descriptor: str) -> list[dict[str, Any]]:
         overlay_requires_manifest = overlay_mode in {"system_overlay", "hybrid"}
-        tool_chain = [
+        menu_chain = [
             _step(
                 1,
                 "plan_runtime_hooks",
@@ -11447,7 +11469,7 @@ def plan_runtime_menu_workflow(
             _step(
                 2,
                 "draft_runtime_menu_from_hooks",
-                "Draft the floating menu spec from runtime-hook candidates and resolve supported static bindings.",
+                "Draft the floating menu spec from menu-compatible or hybrid hook candidates.",
                 {
                     "focus_hint": focus_hint,
                     "class_name": class_name,
@@ -11459,9 +11481,9 @@ def plan_runtime_menu_workflow(
             _step(
                 3,
                 "inject_runtime_menu_scaffold",
-                "Generate the actual draggable runtime menu inside the APK using the draft spec_json.",
+                "Generate the draggable runtime menu only after the hook plan confirms menu-suitable bindings.",
                 {
-                    "spec_json": "<use top-level spec_json from this tool result>",
+                    "spec_json": spec_json or "<use top-level spec_json from this tool result>",
                     "overlay_mode": overlay_mode,
                     "reapply_on_resume": True,
                 },
@@ -11469,7 +11491,7 @@ def plan_runtime_menu_workflow(
             _step(
                 4,
                 "configure_runtime_menu_manifest",
-                "Declare overlay/service permissions only when the chosen mode really needs them.",
+                "Declare overlay or service permissions only for overlay-based deployments.",
                 {
                     "overlay_mode": overlay_mode,
                     "add_overlay_permission": overlay_requires_manifest,
@@ -11480,12 +11502,176 @@ def plan_runtime_menu_workflow(
             _step(
                 5,
                 "generate_runtime_validation_plan",
-                "Prepare a focused post-injection validation checklist for the floating menu and its runtime actions.",
-                {
-                    "task": "runtime menu hooks, floating launcher, and reapply behavior",
-                },
+                "Prepare a focused validation checklist for the injected runtime menu and its controls.",
+                {"task": "runtime menu hooks, floating launcher, and reapply behavior"},
             ),
         ]
+
+        if strategy_name == PatchStrategy.RUNTIME_MENU_GOOD_FIT.value:
+            return menu_chain
+        if strategy_name == PatchStrategy.RUNTIME_OVERRIDE_GOOD_FIT.value:
+            return [
+                _step(
+                    1,
+                    "plan_runtime_hooks",
+                    "Confirm which runtime surfaces require reapply or late state correction.",
+                    {
+                        "focus_hint": focus_hint,
+                        "class_name": class_name,
+                        "max_results": max_results,
+                    },
+                ),
+                _step(
+                    2,
+                    "inject_runtime_override_layer",
+                    "Inject the runtime override policy layer before adding any optional UI control plane.",
+                    {
+                        "rules_json": "<build override rules from routing_analysis.runtime_override_candidates>",
+                        "reapply_on_resume": True,
+                    },
+                ),
+                _step(
+                    3,
+                    "generate_runtime_validation_plan",
+                    "Validate override reapply behavior against lifecycle and callback-driven revalidation.",
+                    {"task": "runtime override layer and lifecycle reapply hooks"},
+                ),
+            ]
+        if strategy_name == PatchStrategy.HYBRID_REQUIRED.value:
+            return [
+                _step(
+                    1,
+                    "plan_runtime_hooks",
+                    "Separate menu-friendly controls from hooks that still need a reapply policy engine.",
+                    {
+                        "focus_hint": focus_hint,
+                        "class_name": class_name,
+                        "max_results": max_results,
+                    },
+                ),
+                _step(
+                    2,
+                    "inject_runtime_override_layer",
+                    "Lay down runtime override rules first so menu toggles do not lose against later revalidation.",
+                    {
+                        "rules_json": "<build hybrid override rules from routing_analysis.runtime_override_candidates>",
+                        "reapply_on_resume": True,
+                    },
+                ),
+                _step(
+                    3,
+                    "inject_runtime_menu_scaffold",
+                    "Inject the floating control plane for the subset of hooks that are safe to expose as menu actions.",
+                    {
+                        "spec_json": spec_json or "<use top-level spec_json from this tool result>",
+                        "overlay_mode": overlay_mode,
+                        "reapply_on_resume": True,
+                    },
+                ),
+                _step(
+                    4,
+                    "configure_runtime_menu_manifest",
+                    "Apply overlay or service manifest requirements only when the chosen deployment mode needs them.",
+                    {
+                        "overlay_mode": overlay_mode,
+                        "add_overlay_permission": overlay_requires_manifest,
+                        "require_foreground_service": overlay_mode == "hybrid",
+                    },
+                    when="Only when overlay_mode is system_overlay or hybrid.",
+                ),
+                _step(
+                    5,
+                    "generate_runtime_validation_plan",
+                    "Validate both menu actions and runtime reapply policy behavior together.",
+                    {"task": "hybrid runtime menu plus override policy"},
+                ),
+            ]
+        if strategy_name == PatchStrategy.STATIC_PATCH_ONLY.value:
+            return [
+                _step(
+                    1,
+                    "map_security_surfaces",
+                    "Confirm which writers, constructors, or gates still require static patching.",
+                    {
+                        "focus_hint": focus_hint,
+                        "class_name": class_name,
+                        "max_results": max_results,
+                    },
+                ),
+                _step(
+                    2,
+                    "smart_entity_patch",
+                    "Keep the enforcement path in the static lane when the runtime dispatcher cannot bind it safely.",
+                    {
+                        "class_descriptor": class_descriptor or "<choose resolved enforcement class>",
+                        "mode": "preview",
+                        "planner_context": focus_hint,
+                    },
+                ),
+                _step(
+                    3,
+                    "generate_runtime_validation_plan",
+                    "Validate the static patch path after choosing the final enforcement surface.",
+                    {"task": "static patch path for unresolved runtime hook surfaces"},
+                ),
+            ]
+        return [
+            _step(
+                1,
+                "plan_runtime_hooks",
+                "Confirm that the target really sits behind a dynamic or native boundary.",
+                {
+                    "focus_hint": focus_hint,
+                    "class_name": class_name,
+                    "max_results": max_results,
+                },
+            ),
+            _step(
+                2,
+                "frida_script_generator",
+                "Escalate to an external runtime layer when the in-APK strategy lanes are not sufficient.",
+                {"class_descriptor": class_descriptor or "<choose dynamic/native boundary class>"},
+            ),
+            _step(
+                3,
+                "generate_runtime_validation_plan",
+                "Validate the external runtime instrumentation path separately from the static APK patch.",
+                {"task": "external runtime instrumentation for dynamic or native boundaries"},
+            ),
+        ]
+
+    def _next_step_for_strategy(strategy_name: str, *, buttons: list[dict[str, Any]], spec_json: str, class_descriptor: str) -> tuple[str, dict[str, Any]]:
+        if strategy_name == PatchStrategy.RUNTIME_MENU_GOOD_FIT.value:
+            if buttons:
+                return "inject_runtime_menu_scaffold", {
+                    "spec_json": spec_json,
+                    "overlay_mode": overlay_mode,
+                    "reapply_on_resume": True,
+                }
+            return "draft_runtime_menu_from_hooks", {
+                "focus_hint": focus_hint,
+                "class_name": class_name,
+                "overlay_mode": overlay_mode,
+                "max_results": max_results,
+                "start_collapsed": start_collapsed,
+            }
+        if strategy_name in {PatchStrategy.RUNTIME_OVERRIDE_GOOD_FIT.value, PatchStrategy.HYBRID_REQUIRED.value}:
+            return "inject_runtime_override_layer", {
+                "rules_json": "<build override rules from routing_analysis.runtime_override_candidates>",
+                "reapply_on_resume": True,
+            }
+        if strategy_name == PatchStrategy.STATIC_PATCH_ONLY.value:
+            return "smart_entity_patch", {
+                "class_descriptor": class_descriptor or "<choose resolved enforcement class>",
+                "mode": "preview",
+                "planner_context": focus_hint,
+            }
+        return "frida_script_generator", {
+            "class_descriptor": class_descriptor or "<choose dynamic/native boundary class>",
+        }
+
+    def _run():
+        default_tool_chain = _chain_for_strategy(PatchStrategy.RUNTIME_MENU_GOOD_FIT.value, "", class_name)
 
         pack = _ensure_behavior_graph_pack(auto_build=False, focus_hint=focus_hint or class_name)
         if pack is None:
@@ -11501,7 +11687,7 @@ def plan_runtime_menu_workflow(
                         "Build the behavior graph first so runtime hooks and menu drafts can be derived automatically.",
                         {"focus_hint": focus_hint or class_name},
                     ),
-                    *tool_chain,
+                    *default_tool_chain,
                 ],
                 "recommended_next_tool": "build_behavior_graph",
                 "recommended_next_args": {"focus_hint": focus_hint or class_name},
@@ -11518,30 +11704,71 @@ def plan_runtime_menu_workflow(
             class_name=class_name,
             max_results=max_results,
         )
-        draft = _build_runtime_menu_spec_from_hook_plan(
+        hook_plan = _annotate_runtime_hook_plan(hook_plan, smali_index=get_runtime_slot("smali_index"))
+        routing_summary = dict(hook_plan.get("routing_summary") or {})
+        menu_hooks = _filter_hooks(
             hook_plan,
-            title=(f"{class_name} Runtime Hooks" if class_name else "Runtime Hook Menu"),
-            overlay_mode=overlay_mode,
-            start_collapsed=start_collapsed,
-            apktool_dir=_project.apktool_dir,
+            {
+                PatchStrategy.RUNTIME_MENU_GOOD_FIT.value,
+                PatchStrategy.HYBRID_REQUIRED.value,
+            },
         )
+        runtime_override_hooks = _filter_hooks(
+            hook_plan,
+            {
+                PatchStrategy.RUNTIME_OVERRIDE_GOOD_FIT.value,
+                PatchStrategy.HYBRID_REQUIRED.value,
+            },
+        )
+        static_patch_hooks = _filter_hooks(hook_plan, {PatchStrategy.STATIC_PATCH_ONLY.value})
+        external_hooks = _filter_hooks(hook_plan, {PatchStrategy.NOT_SUITABLE_WITHOUT_EXTERNAL_RUNTIME.value})
+
+        if menu_hooks:
+            draft = _build_runtime_menu_spec_from_hook_plan(
+                {**hook_plan, "runtime_hooks": menu_hooks},
+                title=(f"{class_name} Runtime Hooks" if class_name else "Runtime Hook Menu"),
+                overlay_mode=overlay_mode,
+                start_collapsed=start_collapsed,
+                apktool_dir=_project.apktool_dir,
+            )
+        else:
+            draft = {
+                "success": True,
+                "draft_mode": "no_menu_suitable_hooks",
+                "resolved_bindings": 0,
+                "unsupported_bindings": [],
+                "binding_hints": [],
+                "spec": {
+                    "buttons": [],
+                    "overlay_mode": overlay_mode,
+                    "start_collapsed": start_collapsed,
+                    "launcher_label": "HOOK",
+                },
+                "spec_json": "",
+            }
         spec = draft.get("spec") or {}
         spec_json = draft.get("spec_json", "")
         buttons = list(spec.get("buttons") or [])
         unsupported = list(draft.get("unsupported_bindings") or [])
-
-        recommended_next_tool = "inject_runtime_menu_scaffold" if buttons else "draft_runtime_menu_from_hooks"
-        recommended_next_args = {
-            "spec_json": spec_json,
-            "overlay_mode": overlay_mode,
-            "reapply_on_resume": True,
-        } if buttons else {
-            "focus_hint": focus_hint,
-            "class_name": class_name,
-            "overlay_mode": overlay_mode,
-            "max_results": max_results,
-            "start_collapsed": start_collapsed,
+        class_descriptor = _first_hook_class(hook_plan)
+        recommended_next_strategy = str(
+            routing_summary.get("recommended_next_strategy") or PatchStrategy.RUNTIME_MENU_GOOD_FIT.value
+        )
+        tool_chains_by_strategy = {
+            strategy_name: _chain_for_strategy(strategy_name, spec_json, class_descriptor)
+            for strategy_name, count in (routing_summary.get("counts") or {}).items()
+            if count
         }
+        tool_chain = tool_chains_by_strategy.get(
+            recommended_next_strategy,
+            _chain_for_strategy(recommended_next_strategy, spec_json, class_descriptor),
+        )
+        recommended_next_tool, recommended_next_args = _next_step_for_strategy(
+            recommended_next_strategy,
+            buttons=buttons,
+            spec_json=spec_json,
+            class_descriptor=class_descriptor,
+        )
 
         result = {
             "success": True,
@@ -11551,11 +11778,28 @@ def plan_runtime_menu_workflow(
             "class_name": hook_plan.get("class_name", class_name),
             "overlay_mode": overlay_mode,
             "tool_chain": tool_chain,
+            "tool_chains_by_strategy": tool_chains_by_strategy,
+            "recommended_next_strategy": recommended_next_strategy,
             "hook_plan_summary": {
                 "hook_count": len(hook_plan.get("runtime_hooks") or []),
                 "focus_hint": hook_plan.get("focus_hint", focus_hint),
                 "class_name": hook_plan.get("class_name", class_name),
+                "strategy_counts": routing_summary.get("counts", {}),
             },
+            "routing_analysis": {
+                "recommended_next_strategy": recommended_next_strategy,
+                "strategy_counts": routing_summary.get("counts", {}),
+                "binding_status_counts": routing_summary.get("binding_status_counts", {}),
+                "runtime_menu_candidate_count": routing_summary.get("runtime_menu_candidate_count", len(menu_hooks)),
+                "runtime_override_candidate_count": routing_summary.get("runtime_override_candidate_count", len(runtime_override_hooks)),
+                "static_patch_candidate_count": routing_summary.get("static_patch_candidate_count", len(static_patch_hooks)),
+                "external_runtime_candidate_count": routing_summary.get("external_runtime_candidate_count", len(external_hooks)),
+                "runtime_menu_candidates": menu_hooks,
+                "runtime_override_candidates": runtime_override_hooks,
+                "static_patch_candidates": static_patch_hooks,
+                "external_runtime_candidates": external_hooks,
+            },
+            "strategy_summary": routing_summary,
             "draft_summary": {
                 "draft_mode": draft.get("draft_mode", ""),
                 "resolved_bindings": int(draft.get("resolved_bindings", 0) or 0),
@@ -11572,6 +11816,7 @@ def plan_runtime_menu_workflow(
             "output_path": str(_behavior_graph_path()),
             "notes": [
                 "This helper is planning-only: it does not inject files or change the manifest.",
+                "The floating menu draft now filters to hooks routed as runtime_menu_good_fit or hybrid_required instead of assuming every runtime hook belongs in the menu.",
                 "Edit or extend spec_json before injection if you want extra manual buttons, sections, or shared_pref/static_field actions.",
                 "Run configure_runtime_menu_manifest only when the final mode actually needs overlay/service permissions.",
             ],
@@ -11714,7 +11959,11 @@ def draft_runtime_menu_from_hooks(
         `RuntimeHookBindings`; unresolved hooks remain listed in `binding_hints`.
     - The draft groups hook candidates by runtime strategy section.
     """
-    from apk_agent.tools.behavior_engine import plan_runtime_hooks as _plan_runtime_hooks
+    from apk_agent.tools.behavior_engine import (
+        annotate_runtime_hook_plan as _annotate_runtime_hook_plan,
+        plan_runtime_hooks as _plan_runtime_hooks,
+    )
+    from apk_agent.tools.patch_strategy import PatchStrategy
     from apk_agent.tools.runtime_menu import build_runtime_menu_spec_from_hook_plan as _build_runtime_menu_spec_from_hook_plan
 
     def _run():
@@ -11732,12 +11981,49 @@ def draft_runtime_menu_from_hooks(
             class_name=class_name,
             max_results=max_results,
         )
+        plan = _annotate_runtime_hook_plan(plan, smali_index=get_runtime_slot("smali_index"))
+        menu_hooks = [
+            dict(hook)
+            for hook in (plan.get("runtime_hooks") or [])
+            if str(hook.get("strategy_recommendation") or PatchStrategy.RUNTIME_MENU_GOOD_FIT.value)
+            in {PatchStrategy.RUNTIME_MENU_GOOD_FIT.value, PatchStrategy.HYBRID_REQUIRED.value}
+        ]
+        if not menu_hooks:
+            routing_summary = dict(plan.get("routing_summary") or {})
+            recommended_next_strategy = str(
+                routing_summary.get("recommended_next_strategy") or PatchStrategy.RUNTIME_MENU_GOOD_FIT.value
+            )
+            recommended_next_tool = {
+                PatchStrategy.RUNTIME_OVERRIDE_GOOD_FIT.value: "inject_runtime_override_layer",
+                PatchStrategy.HYBRID_REQUIRED.value: "inject_runtime_override_layer",
+                PatchStrategy.STATIC_PATCH_ONLY.value: "smart_entity_patch",
+                PatchStrategy.NOT_SUITABLE_WITHOUT_EXTERNAL_RUNTIME.value: "frida_script_generator",
+            }.get(recommended_next_strategy, "plan_runtime_menu_workflow")
+            return json.dumps({
+                "success": True,
+                "draft_mode": "no_menu_suitable_hooks",
+                "focus_hint": plan.get("focus_hint", focus_hint),
+                "class_name": plan.get("class_name", class_name),
+                "overlay_mode": overlay_mode,
+                "runtime_hooks": plan.get("runtime_hooks", []),
+                "routing_summary": routing_summary,
+                "recommended_next_strategy": recommended_next_strategy,
+                "recommended_next_tool": recommended_next_tool,
+                "notes": [
+                    "No hook candidates were routed into the floating-menu lane for the current inputs.",
+                    "Use the routing summary to continue through runtime_override, static_patch_only, or external-runtime flows instead of forcing a menu draft.",
+                ],
+            }, ensure_ascii=False, indent=2)[:30000]
         draft = _build_runtime_menu_spec_from_hook_plan(
-            plan,
+            {**plan, "runtime_hooks": menu_hooks},
             title=(f"{class_name} Runtime Hooks" if class_name else "Runtime Hook Menu"),
             overlay_mode=overlay_mode,
             start_collapsed=start_collapsed,
             apktool_dir=_project.apktool_dir,
+        )
+        draft["routing_summary"] = plan.get("routing_summary", {})
+        draft["recommended_next_strategy"] = str(
+            draft["routing_summary"].get("recommended_next_strategy") or PatchStrategy.RUNTIME_MENU_GOOD_FIT.value
         )
         draft["output_path"] = str(_behavior_graph_path())
         return json.dumps(draft, ensure_ascii=False, indent=2)[:30000]

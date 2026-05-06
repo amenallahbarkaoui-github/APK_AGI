@@ -529,30 +529,53 @@ def find_startup_entry(manifest_path: str | Path,
                 "has_onCreate": on_create,
             }
 
-    # 2. Fallback: find launcher Activity
+    launcher_entry = find_launcher_activity_entry(manifest_path, apktool_dir)
+    if launcher_entry.get("success"):
+        return launcher_entry
+
+    return {"success": False, "error": "No Application or launcher Activity found"}
+
+
+def find_launcher_activity_entry(manifest_path: str | Path,
+                                 apktool_dir: str | Path) -> dict:
+    """Find the launcher Activity and report whether it defines onCreate."""
+    import xml.etree.ElementTree as ET
+
+    manifest = Path(manifest_path)
+    apk_dir = Path(apktool_dir)
+    if not manifest.is_file():
+        return {"success": False, "error": "AndroidManifest.xml not found"}
+
+    ns = {"android": "http://schemas.android.com/apk/res/android"}
+    tree = ET.parse(str(manifest))  # noqa: S314
+    root = tree.getroot()
+
     for activity in root.iter("activity"):
         for intent in activity.iter("intent-filter"):
             action = intent.find("action")
             category = intent.find("category")
-            if action is not None and category is not None:
-                a_name = action.get(f"{{{ns['android']}}}name", "")
-                c_name = category.get(f"{{{ns['android']}}}name", "")
-                if ("MAIN" in a_name and "LAUNCHER" in c_name):
-                    act_class = activity.get(f"{{{ns['android']}}}name", "")
-                    if act_class:
-                        smali_rel = act_class.replace(".", "/") + ".smali"
-                        smali_path = _find_smali_file(apk_dir, smali_rel)
-                        if smali_path:
-                            on_create = _check_method_exists(smali_path, "onCreate")
-                            return {
-                                "success": True,
-                                "entry_type": "LauncherActivity",
-                                "class_name": act_class,
-                                "smali_file": str(smali_path),
-                                "has_onCreate": on_create,
-                            }
+            if action is None or category is None:
+                continue
+            a_name = action.get(f"{{{ns['android']}}}name", "")
+            c_name = category.get(f"{{{ns['android']}}}name", "")
+            if "MAIN" not in a_name or "LAUNCHER" not in c_name:
+                continue
+            act_class = activity.get(f"{{{ns['android']}}}name", "")
+            if not act_class:
+                continue
+            smali_rel = act_class.replace(".", "/") + ".smali"
+            smali_path = _find_smali_file(apk_dir, smali_rel)
+            if smali_path:
+                on_create = _check_method_exists(smali_path, "onCreate")
+                return {
+                    "success": True,
+                    "entry_type": "LauncherActivity",
+                    "class_name": act_class,
+                    "smali_file": str(smali_path),
+                    "has_onCreate": on_create,
+                }
 
-    return {"success": False, "error": "No Application or launcher Activity found"}
+    return {"success": False, "error": "No launcher Activity found"}
 
 
 def _find_smali_file(apk_dir: Path, rel_path: str) -> Path | None:

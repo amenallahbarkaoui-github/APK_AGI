@@ -23,6 +23,11 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from apk_agent.tools.patch_strategy import (
+    annotate_runtime_hook_recommendations,
+    summarize_runtime_hook_recommendations,
+)
+
 
 PACK_VERSION = 1
 
@@ -393,6 +398,23 @@ def plan_runtime_hooks(
         "runtime_hooks": matches[:max_results],
         "summary": summarize_behavior_graph(pack).get("summary", {}),
     }
+
+
+def annotate_runtime_hook_plan(
+    hook_plan: dict[str, Any],
+    *,
+    smali_index=None,
+) -> dict[str, Any]:
+    """Attach strategy routing metadata to a runtime hook plan."""
+    if not hook_plan:
+        return {"success": False, "error": "Runtime hook plan is required"}
+
+    hooks = list(hook_plan.get("runtime_hooks") or [])
+    annotated = annotate_runtime_hook_recommendations(hooks, smali_index=smali_index)
+    result = dict(hook_plan)
+    result["runtime_hooks"] = annotated
+    result["routing_summary"] = summarize_runtime_hook_recommendations(annotated)
+    return result
 
 
 def analyze_network_behavior(

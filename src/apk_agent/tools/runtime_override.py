@@ -16,7 +16,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from apk_agent.tools.code_injector import find_startup_entry, inject_code_in_method
+from apk_agent.tools.code_injector import find_launcher_activity_entry, find_startup_entry, inject_code_in_method
 from apk_agent.tools.deep_analysis import validate_smali_syntax
 
 
@@ -86,6 +86,47 @@ def _method_has_bootstrap(smali_file: Path, method_name: str) -> bool:
         if in_method and _BOOTSTRAP_CALL in stripped:
             return True
     return False
+
+
+def _inject_bootstrap_call(
+    target_file: Path,
+    method_name: str,
+    *,
+    apktool_dir: Path,
+    backup_root: Path | None,
+    backed_up: dict[str, str],
+    touched_files: set[str],
+    bootstrap_targets: list[dict[str, Any]],
+    errors: list[str],
+) -> None:
+    if not _method_exists(target_file, method_name):
+        bootstrap_targets.append({
+            "target": str(target_file),
+            "method": method_name,
+            "result": {"success": False, "status": "method_missing"},
+        })
+        return
+
+    _backup_file(target_file, apktool_dir, backup_root, backed_up)
+    if _method_has_bootstrap(target_file, method_name):
+        bootstrap_targets.append({
+            "target": str(target_file),
+            "method": method_name,
+            "result": {"success": True, "status": "already_present"},
+        })
+        return
+
+    code = f"{_BOOTSTRAP_MARKER}\ninvoke-static {{p0}}, {_BOOTSTRAP_CALL}"
+    result = inject_code_in_method(str(target_file), method_name, code, "after_super")
+    bootstrap_targets.append({
+        "target": str(target_file),
+        "method": method_name,
+        "result": result,
+    })
+    if result.get("success"):
+        touched_files.add(str(target_file))
+    else:
+        errors.append(f"{method_name} bootstrap injection failed: {result.get('error', 'unknown error')}")
 
 
 def _shared_pref_rule_lines(rule: dict[str, Any]) -> list[str]:
@@ -289,45 +330,47 @@ def inject_runtime_override_layer(
             if not entry.get("has_onCreate"):
                 errors.append(f"Startup entry has no onCreate: {entry.get('class_name', '')}")
             else:
-                _backup_file(entry_file, apktool_dir, backup_root, backed_up)
-                if not _method_has_bootstrap(entry_file, "onCreate"):
-                    code = f"{_BOOTSTRAP_MARKER}\ninvoke-static {{p0}}, {_BOOTSTRAP_CALL}"
-                    result = inject_code_in_method(str(entry_file), "onCreate", code, "after_super")
-                    bootstrap_targets.append({
-                        "target": str(entry_file),
-                        "method": "onCreate",
-                        "result": result,
-                    })
-                    if result.get("success"):
-                        touched_files.add(str(entry_file))
-                    else:
-                        errors.append(f"Startup bootstrap injection failed: {result.get('error', 'unknown error')}")
-                else:
-                    bootstrap_targets.append({
-                        "target": str(entry_file),
-                        "method": "onCreate",
-                        "result": {"success": True, "status": "already_present"},
-                    })
+                _inject_bootstrap_call(
+                    entry_file,
+                    "onCreate",
+                    apktool_dir=apktool_dir,
+                    backup_root=backup_root,
+                    backed_up=backed_up,
+                    touched_files=touched_files,
+                    bootstrap_targets=bootstrap_targets,
+                    errors=errors,
+                )
 
-                if reapply_on_resume and _method_exists(entry_file, "onResume"):
-                    if not _method_has_bootstrap(entry_file, "onResume"):
-                        code = f"{_BOOTSTRAP_MARKER}\ninvoke-static {{p0}}, {_BOOTSTRAP_CALL}"
-                        result = inject_code_in_method(str(entry_file), "onResume", code, "after_super")
-                        bootstrap_targets.append({
-                            "target": str(entry_file),
-                            "method": "onResume",
-                            "result": result,
-                        })
-                        if result.get("success"):
-                            touched_files.add(str(entry_file))
-                        else:
-                            errors.append(f"Resume bootstrap injection failed: {result.get('error', 'unknown error')}")
-                    else:
-                        bootstrap_targets.append({
-                            "target": str(entry_file),
-                            "method": "onResume",
-                            "result": {"success": True, "status": "already_present"},
-                        })
+                if reapply_on_resume:
+                    lifecycle_targets: list[tuple[Path, str]] = []
+                    if entry.get("entry_type") == "LauncherActivity":
+                        lifecycle_targets.extend((entry_file, method_name) for method_name in ("onStart", "onResume"))
+                    elif _method_exists(entry_file, "onResume"):
+                        lifecycle_targets.append((entry_file, "onResume"))
+
+                    launcher_entry = find_launcher_activity_entry(str(manifest_path), str(apktool_dir))
+                    launcher_file: Path | None = None
+                    if launcher_entry.get("success"):
+                        launcher_file = Path(str(launcher_entry["smali_file"]))
+                        if launcher_file != entry_file:
+                            lifecycle_targets.extend((launcher_file, method_name) for method_name in ("onStart", "onResume"))
+
+                    seen_targets: set[tuple[str, str]] = set()
+                    for target_file, method_name in lifecycle_targets:
+                        key = (str(target_file.resolve()), method_name)
+                        if key in seen_targets:
+                            continue
+                        seen_targets.add(key)
+                        _inject_bootstrap_call(
+                            target_file,
+                            method_name,
+                            apktool_dir=apktool_dir,
+                            backup_root=backup_root,
+                            backed_up=backed_up,
+                            touched_files=touched_files,
+                            bootstrap_targets=bootstrap_targets,
+                            errors=errors,
+                        )
 
         for file_name in sorted(touched_files):
             validation = validate_smali_syntax(Path(file_name))
