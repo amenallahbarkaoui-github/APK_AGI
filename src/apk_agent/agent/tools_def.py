@@ -11042,12 +11042,25 @@ def recover_hidden_state_model(focus_hint: str = "", max_candidates: int = 30) -
     network and serialization boundaries, billing adjacency, and UI consumers.
     """
     from apk_agent.tools.semantic_cache import get_cached_hidden_state_model as _recover
+    from apk_agent.progress import report_progress
 
     def _run():
         idx = _ensure_smali_index()
         if idx is None:
             return json.dumps({"success": False, "error": "No SmaliIndex. Run build_smali_index first."})
-        result = _recover(idx, focus_hint=focus_hint, max_candidates=max_candidates)
+
+        report_progress(20, f"Running hidden-state recovery across {len(idx.classes)} classes")
+
+        def _mapped_progress(pct: float, detail: str = "") -> None:
+            mapped_pct = 20 + (max(0.0, min(100.0, float(pct or 0.0))) * 0.8)
+            report_progress(mapped_pct, detail)
+
+        result = _recover(
+            idx,
+            focus_hint=focus_hint,
+            max_candidates=max_candidates,
+            progress_callback=_mapped_progress,
+        )
         return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
 
     return _safe_call(_run, "recover_hidden_state_model", _cache_hint=f"{focus_hint}:{max_candidates}")

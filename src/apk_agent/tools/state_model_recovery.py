@@ -361,7 +361,7 @@ def _resolve_exact_value_candidates(
     return None, candidates[:5], "literal_candidates_conflict", False
 
 
-def recover_hidden_state_model(index, *, focus_hint: str = "", max_candidates: int = 30) -> dict[str, Any]:
+def recover_hidden_state_model(index, *, focus_hint: str = "", max_candidates: int = 30, progress_callback=None) -> dict[str, Any]:
     """Recover likely state models and high-value hidden fields.
 
     Args:
@@ -374,8 +374,16 @@ def recover_hidden_state_model(index, *, focus_hint: str = "", max_candidates: i
 
     focus_terms = [term.strip().lower() for term in focus_hint.split(",") if term.strip()]
     candidate_models: dict[str, dict[str, Any]] = {}
+    total_classes = len(index.classes)
+    candidate_scan_interval = max(1, total_classes // 12) if total_classes > 0 else 1
 
-    for smali_class in index.classes.values():
+    def _emit_progress(pct: float, detail: str) -> None:
+        if progress_callback is not None:
+            progress_callback(pct, detail)
+
+    _emit_progress(4, f"Scanning {total_classes} classes for candidate state models")
+
+    for class_idx, smali_class in enumerate(index.classes.values(), start=1):
         if _is_third_party_path(smali_class.file_path):
             continue
         score, evidence = _candidate_class_score(smali_class)
@@ -392,11 +400,25 @@ def recover_hidden_state_model(index, *, focus_hint: str = "", max_candidates: i
                 "method_count": len(smali_class.methods),
             }
 
+        if class_idx == total_classes or class_idx % candidate_scan_interval == 0:
+            scan_pct = 4 + (class_idx / max(total_classes, 1)) * 24
+            _emit_progress(
+                scan_pct,
+                f"Model scan: {class_idx}/{total_classes} classes | {len(candidate_models)} candidate models",
+            )
+
     field_candidates: list[dict[str, Any]] = []
     writer_chains: list[dict[str, Any]] = []
     reader_chains: list[dict[str, Any]] = []
+    total_models = len(candidate_models)
 
-    for class_name, model_info in candidate_models.items():
+    if total_models == 0:
+        _emit_progress(92, "No strong candidate state models found; ranking empty result set")
+
+    model_scan_interval = max(1, total_models // 10) if total_models > 0 else 1
+    _emit_progress(30, f"Analyzing fields across {total_models} candidate models")
+
+    for model_idx, (class_name, model_info) in enumerate(candidate_models.items(), start=1):
         smali_class = index.get_class(class_name)
         if smali_class is None:
             continue
@@ -515,11 +537,24 @@ def recover_hidden_state_model(index, *, focus_hint: str = "", max_candidates: i
                     "tags": sample["tags"],
                 })
 
+        if model_idx == total_models or model_idx % model_scan_interval == 0:
+            field_pct = 30 + (model_idx / max(total_models, 1)) * 58
+            _emit_progress(
+                field_pct,
+                f"Field analysis: {model_idx}/{total_models} models | {len(field_candidates)} field candidates",
+            )
+
+    _emit_progress(92, f"Ranking {len(field_candidates)} field candidates across {len(candidate_models)} models")
     field_candidates.sort(key=lambda item: (-item["score"], -item["confidence"], item["class"], item["field"]))
     writer_chains.sort(key=lambda item: (item["class"], item["field"], item["writer"]))
     reader_chains.sort(key=lambda item: (item["class"], item["field"], item["reader"]))
 
     top_semantics = Counter(item["semantic_guess"] for item in field_candidates)
+
+    _emit_progress(
+        100,
+        f"recover_hidden_state_model complete: {len(candidate_models)} models, {len(field_candidates)} field candidates",
+    )
 
     return {
         "success": True,

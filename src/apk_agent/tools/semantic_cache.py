@@ -114,7 +114,7 @@ def get_cached_semantic_architecture(index, *, focus_hint: str = "", max_per_rol
     return cache[key]
 
 
-def get_cached_hidden_state_model(index, *, focus_hint: str = "", max_candidates: int = 30) -> dict[str, Any]:
+def get_cached_hidden_state_model(index, *, focus_hint: str = "", max_candidates: int = 30, progress_callback=None) -> dict[str, Any]:
     if index is None:
         return {"success": False, "error": "SmaliIndex is required"}
 
@@ -126,10 +126,23 @@ def get_cached_hidden_state_model(index, *, focus_hint: str = "", max_candidates
         cached_result = _best_cached_result(cache, index_signature, normalized_focus_hint, int(max_candidates))
         if cached_result is not None:
             cache[key] = _trim_hidden_state_model(cached_result, int(max_candidates))
+    if key in cache:
+        if progress_callback is not None:
+            summary = cache[key].get("summary", {}) if isinstance(cache[key], dict) else {}
+            progress_callback(
+                100,
+                f"Using cached hidden-state model: {summary.get('model_count', 0)} models, {summary.get('field_candidates', 0)} field candidates",
+            )
+        return cache[key]
     if key not in cache:
         from apk_agent.tools.state_model_recovery import recover_hidden_state_model
 
-        cache[key] = recover_hidden_state_model(index, focus_hint=normalized_focus_hint, max_candidates=max_candidates)
+        cache[key] = recover_hidden_state_model(
+            index,
+            focus_hint=normalized_focus_hint,
+            max_candidates=max_candidates,
+            progress_callback=progress_callback,
+        )
     return cache[key]
 
 
