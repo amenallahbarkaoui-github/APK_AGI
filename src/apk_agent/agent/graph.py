@@ -36,7 +36,18 @@ from langgraph.types import interrupt, Command
 
 from apk_agent.agent.prompts import SYSTEM_PROMPT
 from apk_agent.agent.state import AgentState
-from apk_agent.agent.tools_def import ALL_TOOLS, set_tool_context, _get_all_smali_dirs, _project, _get_scratchpad, _get_task_plan
+from apk_agent.agent.tools_def import (
+    ALL_TOOLS,
+    set_tool_context,
+    _get_all_smali_dirs,
+    _project,
+    _get_scratchpad,
+    _get_task_plan,
+    _get_execution_plan,
+    _get_plan_journal,
+    _ensure_execution_plan,
+    _append_plan_journal,
+)
 from apk_agent.compactor import Compactor, count_message_tokens
 from apk_agent.config import AppConfig
 from apk_agent.llm.provider import get_llm, is_quota_exhausted_error, is_retryable_api_error
@@ -257,7 +268,7 @@ def agent_node(state: AgentState) -> dict:
                     "- Architecture recovery: map_semantic_architecture, recover_hidden_state_model, profile_guard_and_revalidation_surface, find_enforcement_surfaces, semantic_method_slice\n"
                     "- Flutter/Dart AOT: analyze_dart_aot, build_dart_aot_index, locate_dart_aot_candidates for libapp.so anchor recovery before bounded native patching\n"
                     "- Routing: route_reverse_engineering_workflow to classify the current app into java/native/flutter/unity/react-native/dynamic-loader workflows before diving in\n"
-                    "- Task planning: update_task_plan, edit_task_plan, mark_task_done to keep a concrete multi-step plan and update it as work progresses\n"
+                    "- Task planning: update_task_plan, update_execution_plan, edit_task_plan, mark_task_done, set_active_plan_task, record_plan_outcome, get_execution_plan_status to keep an adaptive task tree and update it as work progresses\n"
                     "- Runtime/response control: patch_api_response_flow, inject_runtime_override_layer, plan_runtime_menu_workflow, draft_runtime_menu_from_hooks, inject_runtime_menu_scaffold, configure_runtime_menu_manifest\n"
                     "- Runtime menu workflow: plan_runtime_menu_workflow -> draft_runtime_menu_from_hooks -> inject_runtime_menu_scaffold -> configure_runtime_menu_manifest (overlay only)\n"
                     "- Working memory: update_scratchpad (save any free-form hypothesis, suspicious class, state field, or server-overwrite note for later turns)\n"
@@ -331,16 +342,34 @@ def agent_node(state: AgentState) -> dict:
                 f"{_shorten_state_text(entry.get('summary', ''), max_chars=120)}"
             )
 
+    execution_plan = state.get("execution_plan") or {}
+    active_task_path = execution_plan.get("active_task_path") or state.get("active_task_path") or []
+    plan_revision = int(execution_plan.get("revision", state.get("plan_revision", 0)) or 0)
+    if execution_plan.get("tasks"):
+        summary_parts.append(
+            f"🧠 Adaptive Plan: mode={execution_plan.get('mode', 'adaptive')} revision={plan_revision} tasks={len(execution_plan.get('tasks') or [])}"
+        )
+    if active_task_path:
+        summary_parts.append(f"🎯 Active Task Path: {' > '.join(str(part) for part in active_task_path)}")
+
     # Task plan — multi-objective decomposition
     task_plan = state.get("task_plan") or []
     if task_plan:
         summary_parts.append("📋 Task Plan:")
         for t in task_plan[:8]:
             status = t.get("status", "pending")
-            icon = "✅" if status == "done" else "🔄" if status == "in_progress" else "⬜"
+            icon = "✅" if status == "done" else "🔄" if status == "in_progress" else "⛔" if status == "blocked" else "❌" if status == "failed" else "⏭️" if status == "skipped" else "⬜"
             summary_parts.append(f"  {icon} [{t.get('id', '?')}] {_shorten_state_text(t.get('desc', ''), max_chars=110)}")
 
-    planning_started = bool(state.get("planning_started", False) or task_plan)
+    plan_journal = state.get("plan_journal") or []
+    if plan_journal:
+        summary_parts.append("📝 Recent Plan Events:")
+        for entry in plan_journal[-3:]:
+            kind = _shorten_state_text(str(entry.get("kind", "event")), max_chars=24)
+            note = _shorten_state_text(str(entry.get("note", "")), max_chars=96)
+            summary_parts.append(f"  • {kind}: {note}")
+
+    planning_started = bool(state.get("planning_started", False) or task_plan or execution_plan.get("tasks"))
     if planning_started or state.get("patch_plan_ready") or state.get("prebuild_validation_ready") or state.get("runtime_validation_ready"):
         summary_parts.append("🧭 Planning Readiness:")
         summary_parts.append(
@@ -652,7 +681,15 @@ def agent_node(state: AgentState) -> dict:
 
 # Track consecutive text-only (no tool calls) responses for nudge logic
 _MAX_NUDGES = 2  # max times we'll nudge the agent to call tools before allowing __end__
-_TASK_PLAN_TOOL_NAMES = frozenset({"update_task_plan", "edit_task_plan", "mark_task_done"})
+_TASK_PLAN_TOOL_NAMES = frozenset({
+    "update_task_plan",
+    "update_execution_plan",
+    "edit_task_plan",
+    "mark_task_done",
+    "set_active_plan_task",
+    "record_plan_outcome",
+    "get_execution_plan_status",
+})
 _PLAN_REQUIRED_PATCH_TOOLS = frozenset({
     "apply_smali_patch",
     "apply_text_patch",
@@ -755,7 +792,7 @@ def _planning_blockers_for_tool_calls(state: AgentState, tool_calls: list[dict[s
 def _planning_guidance_text(blockers: list[str]) -> str:
     guidance: list[str] = []
     if "task_plan" in blockers:
-        guidance.append("Consider recording a concrete multi-step task plan with update_task_plan.")
+        guidance.append("Consider recording a concrete adaptive task tree with update_execution_plan, or a lightweight flat plan with update_task_plan.")
     if "analysis_complete_for_patching" in blockers:
         guidance.append("Consider running evidence-first analysis such as map_semantic_architecture, recover_hidden_state_model, profile_guard_and_revalidation_surface, or find_enforcement_surfaces.")
     if "patch_plan_ready" in blockers:
@@ -1448,6 +1485,23 @@ def tools_postprocess(state: AgentState) -> dict:
             success = _tool_result_success(parsed, content)
             new_tool_history.append(_summarize_tool_result(tool_name, content, _ts))
 
+            if not success and tool_name not in _TASK_PLAN_TOOL_NAMES:
+                current_execution_plan = _ensure_execution_plan()
+                active_task_id = int(current_execution_plan.get("active_task_id", 0) or 0)
+                if active_task_id > 0:
+                    failure_note = ""
+                    if isinstance(parsed, dict):
+                        failure_note = str(parsed.get("error") or parsed.get("recovery_hint") or "").strip()
+                    if not failure_note:
+                        failure_note = content.strip().splitlines()[0][:220] if content.strip() else "tool execution failed"
+                    current_execution_plan["last_replan_reason"] = f"{tool_name} failed: {failure_note}"[:280]
+                    _append_plan_journal(
+                        "tool_failure",
+                        task_id=active_task_id,
+                        note=f"{tool_name}: {failure_note}"[:280],
+                        details={"tool": tool_name},
+                    )
+
             if tool_name in _STRATEGIC_ANALYSIS_TOOLS and success:
                 analysis_complete_for_patching = True
 
@@ -1772,9 +1826,26 @@ def tools_postprocess(state: AgentState) -> dict:
         # Sync working memory from module-level storage into durable state
         updates["scratchpad"] = _get_scratchpad()
         synced_task_plan = _get_task_plan()
+        execution_plan = _get_execution_plan()
+        plan_journal = _get_plan_journal()
         updates["task_plan"] = synced_task_plan
+        updates["execution_plan"] = execution_plan
+        updates["plan_journal"] = plan_journal
+        updates["active_task_id"] = int(execution_plan.get("active_task_id", 0) or 0)
+        updates["active_task_path"] = list(execution_plan.get("active_task_path") or [])
+        updates["plan_revision"] = int(execution_plan.get("revision", 0) or 0)
+        updates["plan_mode"] = str(execution_plan.get("mode", "adaptive") or "adaptive")
+        updates["last_replan_reason"] = str(execution_plan.get("last_replan_reason") or "")
+        updates["execution_plan_summary"] = {
+            "revision": int(execution_plan.get("revision", 0) or 0),
+            "mode": str(execution_plan.get("mode", "adaptive") or "adaptive"),
+            "active_task_id": int(execution_plan.get("active_task_id", 0) or 0),
+            "active_task_path": list(execution_plan.get("active_task_path") or []),
+            "task_count": len(execution_plan.get("tasks") or []),
+            "last_replan_reason": str(execution_plan.get("last_replan_reason") or ""),
+        }
 
-        planning_started = bool(synced_task_plan)
+        planning_started = bool(synced_task_plan or execution_plan.get("tasks"))
         if not planning_started:
             analysis_complete_for_patching = False
             patch_plan_ready = False

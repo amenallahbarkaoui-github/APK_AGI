@@ -436,6 +436,8 @@ def _fallback_trim(
         target_pkgs = agent_state.get("target_packages") or []
         scratchpad = agent_state.get("scratchpad") or {}
         task_plan = agent_state.get("task_plan") or []
+        execution_plan = agent_state.get("execution_plan") or {}
+        plan_journal = agent_state.get("plan_journal") or []
         tool_history = agent_state.get("tool_history") or []
 
         if task:
@@ -497,6 +499,25 @@ def _fallback_trim(
             parts.append("\n## Working Memory (Scratchpad)")
             for k, v in list(scratchpad.items())[:20]:
                 parts.append(f"- **{k}**: {str(v)[:300]}")
+
+        if isinstance(execution_plan, dict) and execution_plan.get("tasks"):
+            parts.append("\n## Adaptive Execution Plan")
+            parts.append(
+                f"- mode={execution_plan.get('mode', 'adaptive')} revision={execution_plan.get('revision', 0)} tasks={len(execution_plan.get('tasks') or [])}"
+            )
+            active_path = execution_plan.get("active_task_path") or []
+            if active_path:
+                parts.append(f"- active path: {' > '.join(str(part) for part in active_path)}")
+            last_replan_reason = str(execution_plan.get("last_replan_reason") or "").strip()
+            if last_replan_reason:
+                parts.append(f"- last replan reason: {last_replan_reason[:240]}")
+
+        if plan_journal:
+            parts.append("\n## Recent Plan Events")
+            for entry in plan_journal[-8:]:
+                parts.append(
+                    f"- {entry.get('kind', 'event')}: {str(entry.get('note', ''))[:220]}"
+                )
 
         if tool_history:
             parts.append("\n## Recent Tool Results")

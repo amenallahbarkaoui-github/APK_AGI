@@ -11,6 +11,7 @@ import json
 import traceback
 import uuid
 import threading
+import time
 import concurrent.futures
 from contextvars import copy_context
 from pathlib import Path
@@ -20,7 +21,9 @@ from langchain_core.tools import tool
 
 from apk_agent.agent.execution_context import (
     CONFIG_PROXY,
+    EXECUTION_PLAN_PROXY,
     PATCH_JOURNAL_PROXY,
+    PLAN_JOURNAL_PROXY,
     PROJECT_PROXY,
     SCRATCHPAD_PROXY,
     TASK_PLAN_PROXY,
@@ -67,6 +70,9 @@ _CACHEABLE_TOOLS = frozenset({
     "plan_runtime_hooks",
     "analyze_network_behavior",
     "recover_semantic_symbols",
+    "analyze_dex_method_pressure",
+    "map_dex_topology",
+    "extract_dependency_graph",
 })
 
 
@@ -87,6 +93,8 @@ def set_tool_context(config, project) -> None:
     )
     _scratchpad.clear()
     _task_plan.clear()
+    _execution_plan.clear()
+    _plan_journal.clear()
     _patch_journal.clear()
 
 
@@ -115,6 +123,8 @@ def invalidate_graph_caches() -> None:
 # ---------------------------------------------------------------------------
 _scratchpad = SCRATCHPAD_PROXY
 _task_plan = TASK_PLAN_PROXY
+_execution_plan = EXECUTION_PLAN_PROXY
+_plan_journal = PLAN_JOURNAL_PROXY
 
 # ---------------------------------------------------------------------------
 # Patch journal — authoritative record of all patch operations this session.
@@ -132,6 +142,23 @@ def _get_scratchpad() -> dict:
 def _get_task_plan() -> list[dict]:
     """Return the current task plan list."""
     return list(get_active_execution_context().task_plan)
+
+
+def _get_execution_plan() -> dict[str, Any]:
+    """Return a snapshot of the current adaptive execution plan."""
+    plan = get_active_execution_context().execution_plan or {}
+    if not plan:
+        return _default_execution_plan()
+    return _clone_jsonable(plan)
+
+
+def _get_plan_journal() -> list[dict[str, Any]]:
+    """Return a snapshot of the planning/replanning journal."""
+    return _clone_jsonable(list(get_active_execution_context().plan_journal))
+
+
+def _clone_jsonable(value: Any) -> Any:
+    return json.loads(json.dumps(value, ensure_ascii=False))
 
 
 _TASK_PLAN_STATUS_ALIASES = {
@@ -153,7 +180,473 @@ _TASK_PLAN_STATUS_ALIASES = {
     "complete": "done",
     "finished": "done",
     "closed": "done",
+    "blocked": "blocked",
+    "on_hold": "blocked",
+    "on-hold": "blocked",
+    "waiting": "blocked",
+    "stuck": "blocked",
+    "failed": "failed",
+    "error": "failed",
+    "errored": "failed",
+    "broken": "failed",
+    "skipped": "skipped",
+    "skip": "skipped",
+    "not_applicable": "skipped",
+    "not-applicable": "skipped",
 }
+
+
+_PLAN_PENDING_STATUSES = {"pending", "in_progress"}
+_PLAN_TERMINAL_STATUSES = {"done", "failed", "skipped"}
+
+
+def _default_execution_plan(mode: str = "adaptive") -> dict[str, Any]:
+    return {
+        "mode": str(mode or "adaptive").strip().lower() or "adaptive",
+        "revision": 0,
+        "tasks": [],
+        "active_task_id": 0,
+        "active_task_path": [],
+        "last_replan_reason": "",
+    }
+
+
+            # New tool definitions
+    
+
+def _ensure_execution_plan(mode: str = "adaptive") -> dict[str, Any]:
+    context = get_active_execution_context()
+    if context.execution_plan:
+        return context.execution_plan
+
+    if context.task_plan:
+        tasks = _normalize_execution_plan_items(list(context.task_plan))
+        context.execution_plan = _default_execution_plan(mode)
+        context.execution_plan["tasks"] = tasks
+        context.execution_plan["revision"] = 1 if tasks else 0
+        _refresh_execution_plan(context.execution_plan)
+        _sync_task_plan_from_execution_plan(context)
+        return context.execution_plan
+
+    context.execution_plan = _default_execution_plan(mode)
+    return context.execution_plan
+
+
+def _coerce_string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [item for item in (str(v).strip() for v in value) if item]
+    if isinstance(value, tuple):
+        return [item for item in (str(v).strip() for v in value) if item]
+    text = str(value or "").strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, list):
+            return [item for item in (str(v).strip() for v in parsed) if item]
+    return [part for part in (chunk.strip() for chunk in text.replace("\n", ",").split(",")) if part]
+
+
+def _coerce_int_list(value: Any) -> list[int]:
+    values = value if isinstance(value, list) else _coerce_string_list(value)
+    result: list[int] = []
+    for item in values:
+        if isinstance(item, int) and item > 0:
+            result.append(item)
+        elif isinstance(item, str) and item.isdigit() and int(item) > 0:
+            result.append(int(item))
+    return result
+
+
+def _coerce_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str) and value.strip().startswith("{"):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
+def _coerce_non_negative_int(value: Any, default: int = 0) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(parsed, 0)
+
+
+def _normalize_execution_plan_items(raw_items: list[Any], *, existing_tasks: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    used_ids: set[int] = set()
+    next_id = 1
+    next_order = 1
+    if existing_tasks:
+        for item in existing_tasks:
+            existing_id = item.get("id")
+            if isinstance(existing_id, int) and existing_id > 0:
+                used_ids.add(existing_id)
+        next_id = max(used_ids, default=0) + 1
+        next_order = max((int(item.get("order", 0) or 0) for item in existing_tasks), default=0) + 1
+
+    normalized_items: list[dict[str, Any]] = []
+
+    def _normalize_nodes(items: list[Any], parent_id: int = 0) -> None:
+        nonlocal next_id, next_order
+
+        for raw in items:
+            children_raw: list[Any] = []
+            selected_tools: list[str] = []
+            tool_args_hint: dict[str, Any] = {}
+            success_criteria: list[str] = []
+            expected_artifacts: list[str] = []
+            notes: list[str] = []
+            dependency_ids: list[int] = []
+            retry_budget = 0
+            attempts = 0
+            failure_policy: Any = ""
+            last_error = ""
+            kind = "task"
+
+            if isinstance(raw, dict):
+                text = str(
+                    raw.get("title")
+                    or raw.get("desc")
+                    or raw.get("text")
+                    or raw.get("label")
+                    or raw.get("task")
+                    or raw.get("name")
+                    or ""
+                ).strip()
+                raw_id = raw.get("id")
+                status = _normalize_task_plan_status(str(raw.get("status", "pending")))
+                child_candidate = raw.get("subtasks") or raw.get("children") or raw.get("tasks") or raw.get("steps") or []
+                children_raw = child_candidate if isinstance(child_candidate, list) else []
+                selected_tools = _coerce_string_list(raw.get("selected_tools") or raw.get("tools") or raw.get("tool_names") or [])
+                tool_args_hint = _coerce_dict(raw.get("tool_args_hint") or raw.get("tool_args") or raw.get("args"))
+                success_criteria = _coerce_string_list(raw.get("success_criteria") or raw.get("acceptance_checks") or raw.get("expected_checks") or [])
+                expected_artifacts = _coerce_string_list(raw.get("expected_artifacts") or raw.get("artifacts") or [])
+                notes = _coerce_string_list(raw.get("notes") or raw.get("note") or [])
+                dependency_ids = _coerce_int_list(raw.get("dependency_ids") or raw.get("dependencies") or [])
+                retry_budget = _coerce_non_negative_int(raw.get("retry_budget"), 0)
+                attempts = _coerce_non_negative_int(raw.get("attempts"), 0)
+                failure_policy = raw.get("failure_policy") or ""
+                last_error = str(raw.get("last_error") or raw.get("failure_reason") or "").strip()
+                kind = str(raw.get("kind") or ("group" if children_raw else "task")).strip().lower() or "task"
+            else:
+                text = str(raw or "").strip()
+                raw_id = None
+                status = "pending"
+
+            if not text:
+                continue
+
+            task_id: int | None = None
+            if isinstance(raw_id, int) and raw_id > 0 and raw_id not in used_ids:
+                task_id = raw_id
+            elif isinstance(raw_id, str) and raw_id.isdigit() and int(raw_id) > 0 and int(raw_id) not in used_ids:
+                task_id = int(raw_id)
+
+            if task_id is None:
+                while next_id in used_ids:
+                    next_id += 1
+                task_id = next_id
+
+            used_ids.add(task_id)
+            next_id = max(next_id, task_id + 1)
+            normalized_items.append({
+                "id": task_id,
+                "parent_id": parent_id,
+                "title": text,
+                "desc": text,
+                "label": text,
+                "task": text,
+                "status": status,
+                "kind": kind,
+                "dependency_ids": dependency_ids,
+                "selected_tools": selected_tools,
+                "tool_args_hint": tool_args_hint,
+                "success_criteria": success_criteria,
+                "expected_artifacts": expected_artifacts,
+                "notes": notes,
+                "retry_budget": retry_budget,
+                "attempts": attempts,
+                "failure_policy": failure_policy,
+                "last_error": last_error,
+                "order": next_order,
+            })
+            next_order += 1
+
+            if children_raw:
+                _normalize_nodes(children_raw, parent_id=task_id)
+
+    _normalize_nodes(raw_items)
+    return normalized_items
+
+
+def _task_children_map(tasks: list[dict[str, Any]]) -> dict[int, list[int]]:
+    children: dict[int, list[int]] = {}
+    for item in tasks:
+        parent_id = int(item.get("parent_id", 0) or 0)
+        if parent_id > 0:
+            children.setdefault(parent_id, []).append(int(item.get("id", 0) or 0))
+    return children
+
+
+def _task_index_by_id(tasks: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    return {
+        int(item.get("id", 0) or 0): item
+        for item in tasks
+        if int(item.get("id", 0) or 0) > 0
+    }
+
+
+def _sorted_execution_tasks(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    return sorted(list(plan.get("tasks") or []), key=lambda item: (int(item.get("order", 0) or 0), int(item.get("id", 0) or 0)))
+
+
+def _task_depth(tasks_by_id: dict[int, dict[str, Any]], task_id: int) -> int:
+    depth = 0
+    current = tasks_by_id.get(task_id)
+    seen: set[int] = set()
+    while current is not None:
+        parent_id = int(current.get("parent_id", 0) or 0)
+        if parent_id <= 0 or parent_id in seen:
+            break
+        seen.add(parent_id)
+        current = tasks_by_id.get(parent_id)
+        depth += 1
+    return depth
+
+
+def _task_path_titles(plan: dict[str, Any], task_id: int) -> list[str]:
+    tasks_by_id = _task_index_by_id(list(plan.get("tasks") or []))
+    path: list[str] = []
+    current = tasks_by_id.get(task_id)
+    seen: set[int] = set()
+    while current is not None:
+        current_id = int(current.get("id", 0) or 0)
+        if current_id in seen:
+            break
+        seen.add(current_id)
+        path.append(str(current.get("title") or current.get("desc") or current.get("task") or ""))
+        parent_id = int(current.get("parent_id", 0) or 0)
+        current = tasks_by_id.get(parent_id)
+    path.reverse()
+    return [part for part in path if part]
+
+
+def _find_execution_task_index(plan: dict[str, Any], *, task_id: int = 0, task_text: str = "") -> int:
+    tasks = list(plan.get("tasks") or [])
+    if task_id > 0:
+        for idx, item in enumerate(tasks):
+            if int(item.get("id", 0) or 0) == task_id:
+                return idx
+
+    needle = str(task_text or "").strip().lower()
+    if needle:
+        for idx, item in enumerate(tasks):
+            haystack = " ".join(
+                [
+                    str(item.get("title", "")),
+                    str(item.get("desc", "")),
+                    str(item.get("task", "")),
+                    " > ".join(_task_path_titles(plan, int(item.get("id", 0) or 0))),
+                ]
+            ).lower()
+            if needle in haystack:
+                return idx
+    return -1
+
+
+def _task_blockers(plan: dict[str, Any], task: dict[str, Any]) -> list[str]:
+    blockers: list[str] = []
+    tasks_by_id = _task_index_by_id(list(plan.get("tasks") or []))
+    for dep_id in _coerce_int_list(task.get("dependency_ids") or []):
+        dep = tasks_by_id.get(dep_id)
+        if dep is None:
+            blockers.append(f"missing_dependency:{dep_id}")
+            continue
+        if str(dep.get("status", "pending")) not in {"done", "skipped"}:
+            blockers.append(f"dependency_not_ready:{dep_id}")
+    return blockers
+
+
+def _next_executable_task(plan: dict[str, Any]) -> dict[str, Any] | None:
+    tasks = _sorted_execution_tasks(plan)
+    children_map = _task_children_map(tasks)
+    for item in tasks:
+        task_id = int(item.get("id", 0) or 0)
+        if task_id in children_map:
+            continue
+        status = str(item.get("status", "pending"))
+        if status not in _PLAN_PENDING_STATUSES:
+            continue
+        if _task_blockers(plan, item):
+            continue
+        return item
+    for item in tasks:
+        status = str(item.get("status", "pending"))
+        if status in _PLAN_PENDING_STATUSES and not _task_blockers(plan, item):
+            return item
+    return None
+
+
+def _propagate_parent_statuses(plan: dict[str, Any]) -> None:
+    tasks = list(plan.get("tasks") or [])
+    children_map = _task_children_map(tasks)
+    tasks_by_id = _task_index_by_id(tasks)
+    for parent_id in sorted(children_map.keys(), key=lambda tid: _task_depth(tasks_by_id, tid), reverse=True):
+        parent = tasks_by_id.get(parent_id)
+        if parent is None:
+            continue
+        child_statuses = [str(tasks_by_id[child_id].get("status", "pending")) for child_id in children_map.get(parent_id, []) if child_id in tasks_by_id]
+        if not child_statuses:
+            continue
+        if all(status in {"done", "skipped"} for status in child_statuses):
+            parent["status"] = "done"
+        elif any(status == "failed" for status in child_statuses):
+            parent["status"] = "failed"
+        elif any(status == "blocked" for status in child_statuses):
+            parent["status"] = "blocked"
+        elif any(status in {"done", "skipped", "in_progress"} for status in child_statuses):
+            parent["status"] = "in_progress"
+        else:
+            parent["status"] = "pending"
+
+
+def _refresh_execution_plan(plan: dict[str, Any], *, preferred_active_task_id: int = 0) -> None:
+    tasks = list(plan.get("tasks") or [])
+    if not tasks:
+        plan["active_task_id"] = 0
+        plan["active_task_path"] = []
+        return
+
+    _propagate_parent_statuses(plan)
+    tasks_by_id = _task_index_by_id(tasks)
+    children_map = _task_children_map(tasks)
+
+    active_task_id = preferred_active_task_id or int(plan.get("active_task_id", 0) or 0)
+    active_task = tasks_by_id.get(active_task_id)
+    if active_task is not None:
+        active_status = str(active_task.get("status", "pending"))
+        if active_status not in _PLAN_PENDING_STATUSES or _task_blockers(plan, active_task):
+            active_task = None
+        elif int(active_task.get("id", 0) or 0) in children_map:
+            active_task = _next_executable_task(plan)
+    if active_task is None:
+        active_task = _next_executable_task(plan)
+
+    if active_task is None:
+        plan["active_task_id"] = 0
+        plan["active_task_path"] = []
+    else:
+        plan["active_task_id"] = int(active_task.get("id", 0) or 0)
+        plan["active_task_path"] = _task_path_titles(plan, int(active_task.get("id", 0) or 0))
+
+
+def _derive_task_plan_from_execution_plan(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    derived: list[dict[str, Any]] = []
+    for item in _sorted_execution_tasks(plan):
+        task_id = int(item.get("id", 0) or 0)
+        text_parts = _task_path_titles(plan, task_id)
+        text = " > ".join(text_parts) if text_parts else str(item.get("title") or item.get("desc") or item.get("task") or "")
+        derived.append({
+            "id": task_id,
+            "desc": text,
+            "label": text,
+            "task": text,
+            "status": str(item.get("status", "pending") or "pending"),
+        })
+    return derived
+
+
+def _sync_task_plan_from_execution_plan(context=None) -> None:
+    ctx = context or get_active_execution_context()
+    plan = ctx.execution_plan or {}
+    derived = _derive_task_plan_from_execution_plan(plan) if plan.get("tasks") else []
+    ctx.task_plan.clear()
+    ctx.task_plan.extend(derived)
+
+
+def _execution_plan_summary(plan: dict[str, Any]) -> dict[str, Any]:
+    tasks = list(plan.get("tasks") or [])
+    children_map = _task_children_map(tasks)
+    leaf_count = sum(1 for item in tasks if int(item.get("id", 0) or 0) not in children_map)
+    next_task = _next_executable_task(plan)
+    return {
+        "revision": int(plan.get("revision", 0) or 0),
+        "mode": str(plan.get("mode", "adaptive") or "adaptive"),
+        "total_tasks": len(tasks),
+        "leaf_tasks": leaf_count,
+        "pending": sum(1 for item in tasks if item.get("status") == "pending"),
+        "in_progress": sum(1 for item in tasks if item.get("status") == "in_progress"),
+        "done": sum(1 for item in tasks if item.get("status") == "done"),
+        "blocked": sum(1 for item in tasks if item.get("status") == "blocked"),
+        "failed": sum(1 for item in tasks if item.get("status") == "failed"),
+        "skipped": sum(1 for item in tasks if item.get("status") == "skipped"),
+        "active_task_id": int(plan.get("active_task_id", 0) or 0),
+        "active_task_path": list(plan.get("active_task_path") or []),
+        "next_executable_task": {
+            "id": int(next_task.get("id", 0) or 0),
+            "title": str(next_task.get("title") or next_task.get("desc") or next_task.get("task") or ""),
+            "path": _task_path_titles(plan, int(next_task.get("id", 0) or 0)),
+            "selected_tools": list(next_task.get("selected_tools") or []),
+            "success_criteria": list(next_task.get("success_criteria") or []),
+            "blockers": _task_blockers(plan, next_task),
+        } if next_task else None,
+        "last_replan_reason": str(plan.get("last_replan_reason") or ""),
+    }
+
+
+def _resequence_execution_tasks(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    for order, item in enumerate(tasks, start=1):
+        item["order"] = order
+    return tasks
+
+
+def _collect_subtree_ids(plan: dict[str, Any], task_id: int) -> set[int]:
+    children_map = _task_children_map(list(plan.get("tasks") or []))
+    collected: set[int] = set()
+    stack = [task_id]
+    while stack:
+        current = stack.pop()
+        if current in collected:
+            continue
+        collected.add(current)
+        stack.extend(children_map.get(current, []))
+    return collected
+
+
+def _insert_tasks(plan: dict[str, Any], new_tasks: list[dict[str, Any]], *, insert_index: int | None = None) -> None:
+    tasks = _sorted_execution_tasks(plan)
+    if insert_index is None:
+        insert_index = len(tasks)
+    insert_index = max(0, min(insert_index, len(tasks)))
+    tasks[insert_index:insert_index] = new_tasks
+    plan["tasks"] = _resequence_execution_tasks(tasks)
+
+
+def _append_plan_journal(kind: str, *, task_id: int = 0, note: str = "", details: dict[str, Any] | None = None) -> None:
+    context = get_active_execution_context()
+    plan = _ensure_execution_plan()
+    entry = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "kind": str(kind or "event").strip().lower() or "event",
+        "task_id": int(task_id or 0),
+        "task_path": _task_path_titles(plan, int(task_id or 0)) if int(task_id or 0) > 0 else [],
+        "note": str(note or ""),
+        "details": dict(details or {}),
+        "plan_revision": int(plan.get("revision", 0) or 0),
+    }
+    context.plan_journal.append(entry)
+    if len(context.plan_journal) > 250:
+        del context.plan_journal[:-250]
 
 
 def _normalize_task_plan_status(value: str) -> str:
@@ -226,6 +719,9 @@ def _task_plan_summary(plan: list[dict]) -> dict[str, int]:
         "pending": sum(1 for item in plan if item.get("status") == "pending"),
         "in_progress": sum(1 for item in plan if item.get("status") == "in_progress"),
         "done": sum(1 for item in plan if item.get("status") == "done"),
+        "blocked": sum(1 for item in plan if item.get("status") == "blocked"),
+        "failed": sum(1 for item in plan if item.get("status") == "failed"),
+        "skipped": sum(1 for item in plan if item.get("status") == "skipped"),
     }
 
 
@@ -313,15 +809,22 @@ def update_task_plan(plan_json: str, mode: str = "replace") -> str:
     mode = str(mode or "replace").strip().lower()
 
     def _run():
-        task_plan = get_active_execution_context().task_plan
+        context = get_active_execution_context()
+        task_plan = context.task_plan
+        execution_plan = _ensure_execution_plan()
 
         if mode == "clear":
             task_plan.clear()
+            context.execution_plan.clear()
+            context.execution_plan.update(_default_execution_plan(execution_plan.get("mode", "adaptive")))
+            context.plan_journal.clear()
             return json.dumps({
                 "success": True,
                 "mode": mode,
                 "task_plan": [],
                 "summary": _task_plan_summary(task_plan),
+                "execution_plan": _get_execution_plan(),
+                "execution_plan_summary": _execution_plan_summary(context.execution_plan),
             }, ensure_ascii=False, indent=2)
 
         try:
@@ -351,26 +854,142 @@ def update_task_plan(plan_json: str, mode: str = "replace") -> str:
             }, ensure_ascii=False, indent=2)
 
         if mode == "replace":
-            task_plan.clear()
-        task_plan.extend(normalized)
+            execution_plan.clear()
+            execution_plan.update(_default_execution_plan(execution_plan.get("mode", "adaptive")))
+            execution_plan["tasks"] = _normalize_execution_plan_items(raw_items)
+        else:
+            execution_plan["tasks"].extend(_normalize_execution_plan_items(raw_items, existing_tasks=list(execution_plan.get("tasks") or [])))
+
+        execution_plan["revision"] = int(execution_plan.get("revision", 0) or 0) + 1
+        _refresh_execution_plan(execution_plan)
+        _sync_task_plan_from_execution_plan(context)
+        _append_plan_journal("task_plan_update", note=f"mode={mode}; {len(normalized)} tasks")
 
         return json.dumps({
             "success": True,
             "mode": mode,
             "task_plan": list(task_plan),
             "summary": _task_plan_summary(task_plan),
+            "execution_plan": _get_execution_plan(),
+            "execution_plan_summary": _execution_plan_summary(execution_plan),
         }, ensure_ascii=False, indent=2)[:16000]
 
     return _safe_call(_run, "update_task_plan")
 
 
 @tool
-def edit_task_plan(task_id: int = 0, task_text: str = "", new_text: str = "", new_status: str = "", delete: bool = False) -> str:
+def update_execution_plan(plan_json: str, mode: str = "replace", plan_mode: str = "adaptive", reason: str = "") -> str:
+    """Create or replace the adaptive hierarchical execution plan.
+
+    The payload may contain nested tasks using `subtasks`, `children`, `tasks`,
+    or `steps`. Each task can also include tool hints, dependencies, success
+    criteria, retry budgets, and failure policy notes.
+    """
+
+    mode = str(mode or "replace").strip().lower()
+    plan_mode = str(plan_mode or "adaptive").strip().lower() or "adaptive"
+
+    def _run():
+        context = get_active_execution_context()
+        execution_plan = _ensure_execution_plan(plan_mode)
+        if mode == "clear":
+            context.execution_plan.clear()
+            context.execution_plan.update(_default_execution_plan(plan_mode))
+            _sync_task_plan_from_execution_plan(context)
+            _append_plan_journal("execution_plan_cleared", note=reason or "manual clear")
+            return json.dumps({
+                "success": True,
+                "mode": mode,
+                "execution_plan": _get_execution_plan(),
+                "execution_plan_summary": _execution_plan_summary(context.execution_plan),
+                "task_plan": _get_task_plan(),
+                "plan_journal": _get_plan_journal()[-8:],
+            }, ensure_ascii=False, indent=2)[:30000]
+
+        try:
+            payload = json.loads(plan_json)
+        except json.JSONDecodeError as exc:
+            return json.dumps({"success": False, "error": f"Invalid JSON: {exc}"}, ensure_ascii=False, indent=2)
+
+        if isinstance(payload, list):
+            raw_items = payload
+            requested_active_id = 0
+        elif isinstance(payload, dict):
+            raw_items = payload.get("execution_plan") or payload.get("plan") or payload.get("tasks") or payload.get("items") or payload.get("task_plan") or []
+            requested_active_id = int(payload.get("active_task_id", 0) or 0)
+            if str(payload.get("plan_mode") or "").strip():
+                plan_mode_local = str(payload.get("plan_mode") or plan_mode).strip().lower()
+            else:
+                plan_mode_local = plan_mode
+            plan_mode_value = plan_mode_local
+        else:
+            raw_items = []
+            requested_active_id = 0
+            plan_mode_value = plan_mode
+
+        if not isinstance(payload, dict):
+            plan_mode_value = plan_mode
+
+        if mode not in {"replace", "append"}:
+            return json.dumps({
+                "success": False,
+                "error": f"Unsupported mode: {mode}",
+                "supported_modes": ["replace", "append", "clear"],
+            }, ensure_ascii=False, indent=2)
+
+        normalized = _normalize_execution_plan_items(
+            raw_items,
+            existing_tasks=list(execution_plan.get("tasks") or []) if mode == "append" else None,
+        )
+        if raw_items and not normalized:
+            return json.dumps({"success": False, "error": "No valid execution-plan items were found."}, ensure_ascii=False, indent=2)
+
+        if mode == "replace":
+            context.execution_plan.clear()
+            context.execution_plan.update(_default_execution_plan(plan_mode_value))
+            context.execution_plan["tasks"] = normalized
+        else:
+            execution_plan["tasks"].extend(normalized)
+            execution_plan["mode"] = plan_mode_value
+
+        current_plan = context.execution_plan if mode == "replace" else execution_plan
+        current_plan["revision"] = int(current_plan.get("revision", 0) or 0) + 1
+        if reason:
+            current_plan["last_replan_reason"] = reason
+        _refresh_execution_plan(current_plan, preferred_active_task_id=requested_active_id)
+        _sync_task_plan_from_execution_plan(context)
+        _append_plan_journal("execution_plan_update", note=reason or f"mode={mode}", details={"mode": mode, "plan_mode": plan_mode_value})
+
+        return json.dumps({
+            "success": True,
+            "mode": mode,
+            "execution_plan": _get_execution_plan(),
+            "execution_plan_summary": _execution_plan_summary(current_plan),
+            "task_plan": _get_task_plan(),
+            "plan_journal": _get_plan_journal()[-8:],
+        }, ensure_ascii=False, indent=2)[:30000]
+
+    return _safe_call(_run, "update_execution_plan")
+
+
+@tool
+def edit_task_plan(
+    task_id: int = 0,
+    task_text: str = "",
+    new_text: str = "",
+    new_status: str = "",
+    delete: bool = False,
+    action: str = "edit",
+    new_desc: str = "",
+    position: int = 0,
+) -> str:
     """Edit or delete one task-plan item by id or matching text."""
 
     def _run():
-        task_plan = get_active_execution_context().task_plan
-        index = _find_task_plan_index(task_plan, task_id=task_id, task_text=task_text)
+        context = get_active_execution_context()
+        execution_plan = _ensure_execution_plan()
+        normalized_action = "remove" if delete else str(action or "edit").strip().lower()
+        index = _find_execution_task_index(execution_plan, task_id=task_id, task_text=task_text)
         if index < 0:
             return json.dumps({
                 "success": False,
@@ -379,32 +998,108 @@ def edit_task_plan(task_id: int = 0, task_text: str = "", new_text: str = "", ne
                 "task_text": task_text,
             }, ensure_ascii=False, indent=2)
 
-        item = dict(task_plan[index])
-        if delete:
-            removed = task_plan.pop(index)
+        tasks = list(execution_plan.get("tasks") or [])
+        item = dict(tasks[index])
+        effective_text = str(new_desc or new_text or "").strip()
+
+        if normalized_action in {"delete", "remove"}:
+            subtree_ids = _collect_subtree_ids(execution_plan, int(item.get("id", 0) or 0))
+            removed = [task for task in tasks if int(task.get("id", 0) or 0) in subtree_ids]
+            tasks = [task for task in tasks if int(task.get("id", 0) or 0) not in subtree_ids]
+            execution_plan["tasks"] = _resequence_execution_tasks(sorted(tasks, key=lambda task: int(task.get("order", 0) or 0)))
+            execution_plan["revision"] = int(execution_plan.get("revision", 0) or 0) + 1
+            _refresh_execution_plan(execution_plan)
+            _sync_task_plan_from_execution_plan(context)
+            _append_plan_journal("task_removed", task_id=int(item.get("id", 0) or 0), note=item.get("title", ""), details={"removed_ids": sorted(subtree_ids)})
             return json.dumps({
                 "success": True,
                 "mode": "delete",
                 "removed": removed,
-                "task_plan": list(task_plan),
-                "summary": _task_plan_summary(task_plan),
+                "task_plan": _get_task_plan(),
+                "summary": _task_plan_summary(_get_task_plan()),
+                "execution_plan": _get_execution_plan(),
+                "execution_plan_summary": _execution_plan_summary(execution_plan),
             }, ensure_ascii=False, indent=2)[:16000]
 
-        if str(new_text or "").strip():
-            text = str(new_text).strip()
+        if normalized_action in {"add_after", "add_child"}:
+            text = effective_text
+            if not text:
+                return json.dumps({"success": False, "error": "new_text or new_desc is required for add actions."}, ensure_ascii=False, indent=2)
+            new_items = _normalize_execution_plan_items([{"desc": text, "status": new_status or "pending"}], existing_tasks=tasks)
+            if not new_items:
+                return json.dumps({"success": False, "error": "Could not create the requested task."}, ensure_ascii=False, indent=2)
+            new_task = new_items[0]
+            new_task["parent_id"] = int(item.get("id", 0) or 0) if normalized_action == "add_child" else int(item.get("parent_id", 0) or 0)
+            ordered_tasks = _sorted_execution_tasks(execution_plan)
+            subtree_ids = _collect_subtree_ids(execution_plan, int(item.get("id", 0) or 0))
+            insert_index = len(ordered_tasks)
+            for pos, ordered in enumerate(ordered_tasks):
+                if int(ordered.get("id", 0) or 0) in subtree_ids:
+                    insert_index = pos + 1
+            _insert_tasks(execution_plan, [new_task], insert_index=insert_index)
+            execution_plan["revision"] = int(execution_plan.get("revision", 0) or 0) + 1
+            if normalized_action == "add_child":
+                item["status"] = "in_progress" if item.get("status") == "pending" else item.get("status")
+            _refresh_execution_plan(execution_plan)
+            _sync_task_plan_from_execution_plan(context)
+            _append_plan_journal(normalized_action, task_id=int(item.get("id", 0) or 0), note=text)
+            return json.dumps({
+                "success": True,
+                "mode": normalized_action,
+                "inserted": new_task,
+                "task_plan": _get_task_plan(),
+                "summary": _task_plan_summary(_get_task_plan()),
+                "execution_plan": _get_execution_plan(),
+                "execution_plan_summary": _execution_plan_summary(execution_plan),
+            }, ensure_ascii=False, indent=2)[:20000]
+
+        if normalized_action == "reorder":
+            ordered_tasks = _sorted_execution_tasks(execution_plan)
+            subtree_ids = _collect_subtree_ids(execution_plan, int(item.get("id", 0) or 0))
+            subtree = [task for task in ordered_tasks if int(task.get("id", 0) or 0) in subtree_ids]
+            remaining = [task for task in ordered_tasks if int(task.get("id", 0) or 0) not in subtree_ids]
+            insert_index = max(0, min((position - 1) if position > 0 else len(remaining), len(remaining)))
+            remaining[insert_index:insert_index] = subtree
+            execution_plan["tasks"] = _resequence_execution_tasks(remaining)
+            execution_plan["revision"] = int(execution_plan.get("revision", 0) or 0) + 1
+            _refresh_execution_plan(execution_plan)
+            _sync_task_plan_from_execution_plan(context)
+            _append_plan_journal("task_reordered", task_id=int(item.get("id", 0) or 0), note=f"position={position}")
+            return json.dumps({
+                "success": True,
+                "mode": "reorder",
+                "updated": dict(item),
+                "task_plan": _get_task_plan(),
+                "summary": _task_plan_summary(_get_task_plan()),
+                "execution_plan": _get_execution_plan(),
+                "execution_plan_summary": _execution_plan_summary(execution_plan),
+            }, ensure_ascii=False, indent=2)[:20000]
+
+        if effective_text:
+            text = effective_text
             item["desc"] = text
             item["label"] = text
             item["task"] = text
+            item["title"] = text
         if str(new_status or "").strip():
             item["status"] = _normalize_task_plan_status(new_status)
 
-        task_plan[index] = item
+        tasks[index] = item
+        execution_plan["tasks"] = tasks
+        execution_plan["revision"] = int(execution_plan.get("revision", 0) or 0) + 1
+        if item.get("status") in {"blocked", "failed"}:
+            execution_plan["last_replan_reason"] = f"{item.get('status')}: {item.get('title', '')}".strip()
+        _refresh_execution_plan(execution_plan, preferred_active_task_id=int(item.get("id", 0) or 0))
+        _sync_task_plan_from_execution_plan(context)
+        _append_plan_journal("task_updated", task_id=int(item.get("id", 0) or 0), note=item.get("status", "pending"))
         return json.dumps({
             "success": True,
             "mode": "edit",
             "updated": item,
-            "task_plan": list(task_plan),
-            "summary": _task_plan_summary(task_plan),
+            "task_plan": _get_task_plan(),
+            "summary": _task_plan_summary(_get_task_plan()),
+            "execution_plan": _get_execution_plan(),
+            "execution_plan_summary": _execution_plan_summary(execution_plan),
         }, ensure_ascii=False, indent=2)[:16000]
 
     return _safe_call(_run, "edit_task_plan")
@@ -415,8 +1110,9 @@ def mark_task_done(task_id: int = 0, task_text: str = "") -> str:
     """Mark one task-plan item as done by id or matching text."""
 
     def _run():
-        task_plan = get_active_execution_context().task_plan
-        index = _find_task_plan_index(task_plan, task_id=task_id, task_text=task_text)
+        context = get_active_execution_context()
+        execution_plan = _ensure_execution_plan()
+        index = _find_execution_task_index(execution_plan, task_id=task_id, task_text=task_text)
         if index < 0:
             return json.dumps({
                 "success": False,
@@ -425,17 +1121,194 @@ def mark_task_done(task_id: int = 0, task_text: str = "") -> str:
                 "task_text": task_text,
             }, ensure_ascii=False, indent=2)
 
-        item = dict(task_plan[index])
+        tasks = list(execution_plan.get("tasks") or [])
+        item = dict(tasks[index])
         item["status"] = "done"
-        task_plan[index] = item
+        tasks[index] = item
+        execution_plan["tasks"] = tasks
+        execution_plan["revision"] = int(execution_plan.get("revision", 0) or 0) + 1
+        _refresh_execution_plan(execution_plan)
+        _sync_task_plan_from_execution_plan(context)
+        _append_plan_journal("task_done", task_id=int(item.get("id", 0) or 0), note=item.get("title", ""))
         return json.dumps({
             "success": True,
             "updated": item,
-            "task_plan": list(task_plan),
-            "summary": _task_plan_summary(task_plan),
+            "task_plan": _get_task_plan(),
+            "summary": _task_plan_summary(_get_task_plan()),
+            "execution_plan": _get_execution_plan(),
+            "execution_plan_summary": _execution_plan_summary(execution_plan),
         }, ensure_ascii=False, indent=2)[:16000]
 
     return _safe_call(_run, "mark_task_done")
+
+
+@tool
+def set_active_plan_task(task_id: int = 0, task_text: str = "") -> str:
+    """Set the currently focused adaptive plan task without constraining future replanning."""
+
+    def _run():
+        context = get_active_execution_context()
+        execution_plan = _ensure_execution_plan()
+        index = _find_execution_task_index(execution_plan, task_id=task_id, task_text=task_text)
+        if index < 0:
+            return json.dumps({
+                "success": False,
+                "error": "Task-plan item not found.",
+                "task_id": task_id,
+                "task_text": task_text,
+            }, ensure_ascii=False, indent=2)
+
+        tasks = list(execution_plan.get("tasks") or [])
+        selected = dict(tasks[index])
+        if str(selected.get("status", "pending")) == "pending":
+            selected["status"] = "in_progress"
+            tasks[index] = selected
+            execution_plan["tasks"] = tasks
+
+        _refresh_execution_plan(execution_plan, preferred_active_task_id=int(selected.get("id", 0) or 0))
+        _sync_task_plan_from_execution_plan(context)
+        _append_plan_journal("active_task_set", task_id=int(selected.get("id", 0) or 0), note=selected.get("title", ""))
+
+        return json.dumps({
+            "success": True,
+            "active_task_id": int(execution_plan.get("active_task_id", 0) or 0),
+            "active_task_path": list(execution_plan.get("active_task_path") or []),
+            "execution_plan_summary": _execution_plan_summary(execution_plan),
+        }, ensure_ascii=False, indent=2)[:16000]
+
+    return _safe_call(_run, "set_active_plan_task")
+
+
+@tool
+def record_plan_outcome(
+    task_id: int = 0,
+    task_text: str = "",
+    status: str = "",
+    note: str = "",
+    failure_kind: str = "",
+    add_tasks_json: str = "",
+    insert_mode: str = "after",
+) -> str:
+    """Record the outcome of a plan task and optionally add follow-up tasks.
+
+    This is the adaptive replanning hook used after failures, discoveries, or
+    branch changes. It updates the task, writes a journal event, and can insert
+    new follow-up tasks after or under the current task.
+    """
+
+    insert_mode = str(insert_mode or "after").strip().lower()
+
+    def _run():
+        context = get_active_execution_context()
+        execution_plan = _ensure_execution_plan()
+        index = _find_execution_task_index(execution_plan, task_id=task_id, task_text=task_text)
+        if index < 0:
+            return json.dumps({
+                "success": False,
+                "error": "Task-plan item not found.",
+                "task_id": task_id,
+                "task_text": task_text,
+            }, ensure_ascii=False, indent=2)
+
+        tasks = list(execution_plan.get("tasks") or [])
+        item = dict(tasks[index])
+        normalized_status = _normalize_task_plan_status(status) if str(status or "").strip() else str(item.get("status", "pending") or "pending")
+        item["status"] = normalized_status
+        if failure_kind or note:
+            item["last_error"] = ": ".join(part for part in [str(failure_kind or "").strip(), str(note or "").strip()] if part)
+        if normalized_status in {"failed", "blocked"}:
+            item["attempts"] = _coerce_non_negative_int(item.get("attempts"), 0) + 1
+            execution_plan["last_replan_reason"] = item.get("last_error") or str(note or failure_kind or item.get("title", ""))
+        tasks[index] = item
+        execution_plan["tasks"] = tasks
+
+        inserted_tasks: list[dict[str, Any]] = []
+        if str(add_tasks_json or "").strip():
+            try:
+                payload = json.loads(add_tasks_json)
+            except json.JSONDecodeError as exc:
+                return json.dumps({"success": False, "error": f"Invalid add_tasks_json: {exc}"}, ensure_ascii=False, indent=2)
+
+            if isinstance(payload, list):
+                raw_items = payload
+            elif isinstance(payload, dict):
+                raw_items = payload.get("tasks") or payload.get("items") or payload.get("task_plan") or []
+            else:
+                raw_items = []
+
+            inserted_tasks = _normalize_execution_plan_items(raw_items, existing_tasks=list(execution_plan.get("tasks") or []))
+            if insert_mode == "child":
+                for new_task in inserted_tasks:
+                    new_task["parent_id"] = int(item.get("id", 0) or 0)
+            elif insert_mode == "after":
+                for new_task in inserted_tasks:
+                    new_task["parent_id"] = int(item.get("parent_id", 0) or 0)
+            ordered_tasks = _sorted_execution_tasks(execution_plan)
+            subtree_ids = _collect_subtree_ids(execution_plan, int(item.get("id", 0) or 0))
+            insert_index = len(ordered_tasks)
+            if insert_mode in {"after", "child"}:
+                for pos, ordered in enumerate(ordered_tasks):
+                    if int(ordered.get("id", 0) or 0) in subtree_ids:
+                        insert_index = pos + 1
+            _insert_tasks(execution_plan, inserted_tasks, insert_index=insert_index if insert_mode != "append" else None)
+
+        execution_plan["revision"] = int(execution_plan.get("revision", 0) or 0) + 1
+        _refresh_execution_plan(execution_plan)
+        _sync_task_plan_from_execution_plan(context)
+        _append_plan_journal(
+            "task_outcome",
+            task_id=int(item.get("id", 0) or 0),
+            note=note or normalized_status,
+            details={
+                "status": normalized_status,
+                "failure_kind": failure_kind,
+                "insert_mode": insert_mode,
+                "inserted_task_count": len(inserted_tasks),
+            },
+        )
+
+        return json.dumps({
+            "success": True,
+            "updated": item,
+            "inserted_tasks": inserted_tasks,
+            "task_plan": _get_task_plan(),
+            "execution_plan": _get_execution_plan(),
+            "execution_plan_summary": _execution_plan_summary(execution_plan),
+            "plan_journal": _get_plan_journal()[-10:],
+        }, ensure_ascii=False, indent=2)[:30000]
+
+    return _safe_call(_run, "record_plan_outcome")
+
+
+@tool
+def get_execution_plan_status(max_tasks: int = 25) -> str:
+    """Return the current adaptive execution-plan status, active path, and recent journal entries."""
+
+    def _run():
+        execution_plan = _ensure_execution_plan()
+        tasks = _sorted_execution_tasks(execution_plan)
+        sample = []
+        for item in tasks[: max(1, int(max_tasks or 25))]:
+            sample.append({
+                "id": int(item.get("id", 0) or 0),
+                "parent_id": int(item.get("parent_id", 0) or 0),
+                "title": str(item.get("title") or item.get("desc") or item.get("task") or ""),
+                "status": str(item.get("status", "pending") or "pending"),
+                "path": _task_path_titles(execution_plan, int(item.get("id", 0) or 0)),
+                "selected_tools": list(item.get("selected_tools") or []),
+                "success_criteria": list(item.get("success_criteria") or []),
+                "blockers": _task_blockers(execution_plan, item),
+            })
+
+        return json.dumps({
+            "success": True,
+            "execution_plan": _get_execution_plan(),
+            "execution_plan_summary": _execution_plan_summary(execution_plan),
+            "task_sample": sample,
+            "plan_journal": _get_plan_journal()[-12:],
+        }, ensure_ascii=False, indent=2)[:30000]
+
+    return _safe_call(_run, "get_execution_plan_status")
 
 
 def _log_file() -> Path:
@@ -11427,6 +12300,8 @@ def plan_runtime_menu_workflow(
     )
     from apk_agent.tools.patch_strategy import PatchStrategy
     from apk_agent.tools.runtime_menu import build_runtime_menu_spec_from_hook_plan as _build_runtime_menu_spec_from_hook_plan
+    from apk_agent.tools.runtime_override import build_runtime_override_rules_from_menu_spec as _build_runtime_override_rules_from_menu_spec
+    from apk_agent.tools.runtime_override import build_runtime_override_rules_from_menu_spec as _build_runtime_override_rules_from_menu_spec
 
     def _step(num: int, tool_name: str, purpose: str, args: dict[str, Any], *, when: str = "") -> dict[str, Any]:
         item = {
@@ -11453,7 +12328,7 @@ def plan_runtime_menu_workflow(
                 return class_descriptor
         return class_name
 
-    def _chain_for_strategy(strategy_name: str, spec_json: str, class_descriptor: str) -> list[dict[str, Any]]:
+    def _chain_for_strategy(strategy_name: str, spec_json: str, override_rules_json: str, class_descriptor: str) -> list[dict[str, Any]]:
         overlay_requires_manifest = overlay_mode in {"system_overlay", "hybrid"}
         menu_chain = [
             _step(
@@ -11526,7 +12401,7 @@ def plan_runtime_menu_workflow(
                     "inject_runtime_override_layer",
                     "Inject the runtime override policy layer before adding any optional UI control plane.",
                     {
-                        "rules_json": "<build override rules from routing_analysis.runtime_override_candidates>",
+                        "rules_json": override_rules_json or "<build override rules from routing_analysis.runtime_override_candidates>",
                         "reapply_on_resume": True,
                     },
                 ),
@@ -11554,7 +12429,7 @@ def plan_runtime_menu_workflow(
                     "inject_runtime_override_layer",
                     "Lay down runtime override rules first so menu toggles do not lose against later revalidation.",
                     {
-                        "rules_json": "<build hybrid override rules from routing_analysis.runtime_override_candidates>",
+                        "rules_json": override_rules_json or "<build hybrid override rules from routing_analysis.runtime_override_candidates>",
                         "reapply_on_resume": True,
                     },
                 ),
@@ -11640,7 +12515,7 @@ def plan_runtime_menu_workflow(
             ),
         ]
 
-    def _next_step_for_strategy(strategy_name: str, *, buttons: list[dict[str, Any]], spec_json: str, class_descriptor: str) -> tuple[str, dict[str, Any]]:
+    def _next_step_for_strategy(strategy_name: str, *, buttons: list[dict[str, Any]], spec_json: str, override_rules_json: str, class_descriptor: str) -> tuple[str, dict[str, Any]]:
         if strategy_name == PatchStrategy.RUNTIME_MENU_GOOD_FIT.value:
             if buttons:
                 return "inject_runtime_menu_scaffold", {
@@ -11657,7 +12532,7 @@ def plan_runtime_menu_workflow(
             }
         if strategy_name in {PatchStrategy.RUNTIME_OVERRIDE_GOOD_FIT.value, PatchStrategy.HYBRID_REQUIRED.value}:
             return "inject_runtime_override_layer", {
-                "rules_json": "<build override rules from routing_analysis.runtime_override_candidates>",
+                "rules_json": override_rules_json or "<build override rules from routing_analysis.runtime_override_candidates>",
                 "reapply_on_resume": True,
             }
         if strategy_name == PatchStrategy.STATIC_PATCH_ONLY.value:
@@ -11671,7 +12546,7 @@ def plan_runtime_menu_workflow(
         }
 
     def _run():
-        default_tool_chain = _chain_for_strategy(PatchStrategy.RUNTIME_MENU_GOOD_FIT.value, "", class_name)
+        default_tool_chain = _chain_for_strategy(PatchStrategy.RUNTIME_MENU_GOOD_FIT.value, "", "", class_name)
 
         pack = _ensure_behavior_graph_pack(auto_build=False, focus_hint=focus_hint or class_name)
         if pack is None:
@@ -11748,6 +12623,8 @@ def plan_runtime_menu_workflow(
             }
         spec = draft.get("spec") or {}
         spec_json = draft.get("spec_json", "")
+        override_rules = _build_runtime_override_rules_from_menu_spec(spec) if spec else []
+        override_rules_json = json.dumps(override_rules, ensure_ascii=False, indent=2) if override_rules else ""
         buttons = list(spec.get("buttons") or [])
         unsupported = list(draft.get("unsupported_bindings") or [])
         class_descriptor = _first_hook_class(hook_plan)
@@ -11755,18 +12632,19 @@ def plan_runtime_menu_workflow(
             routing_summary.get("recommended_next_strategy") or PatchStrategy.RUNTIME_MENU_GOOD_FIT.value
         )
         tool_chains_by_strategy = {
-            strategy_name: _chain_for_strategy(strategy_name, spec_json, class_descriptor)
+            strategy_name: _chain_for_strategy(strategy_name, spec_json, override_rules_json, class_descriptor)
             for strategy_name, count in (routing_summary.get("counts") or {}).items()
             if count
         }
         tool_chain = tool_chains_by_strategy.get(
             recommended_next_strategy,
-            _chain_for_strategy(recommended_next_strategy, spec_json, class_descriptor),
+            _chain_for_strategy(recommended_next_strategy, spec_json, override_rules_json, class_descriptor),
         )
         recommended_next_tool, recommended_next_args = _next_step_for_strategy(
             recommended_next_strategy,
             buttons=buttons,
             spec_json=spec_json,
+            override_rules_json=override_rules_json,
             class_descriptor=class_descriptor,
         )
 
@@ -11780,6 +12658,8 @@ def plan_runtime_menu_workflow(
             "tool_chain": tool_chain,
             "tool_chains_by_strategy": tool_chains_by_strategy,
             "recommended_next_strategy": recommended_next_strategy,
+            "override_rule_count": len(override_rules),
+            "override_rules_json": override_rules_json,
             "hook_plan_summary": {
                 "hook_count": len(hook_plan.get("runtime_hooks") or []),
                 "focus_hint": hook_plan.get("focus_hint", focus_hint),
@@ -11794,6 +12674,7 @@ def plan_runtime_menu_workflow(
                 "runtime_override_candidate_count": routing_summary.get("runtime_override_candidate_count", len(runtime_override_hooks)),
                 "static_patch_candidate_count": routing_summary.get("static_patch_candidate_count", len(static_patch_hooks)),
                 "external_runtime_candidate_count": routing_summary.get("external_runtime_candidate_count", len(external_hooks)),
+                "runtime_override_rules": override_rules,
                 "runtime_menu_candidates": menu_hooks,
                 "runtime_override_candidates": runtime_override_hooks,
                 "static_patch_candidates": static_patch_hooks,
@@ -11817,6 +12698,7 @@ def plan_runtime_menu_workflow(
             "notes": [
                 "This helper is planning-only: it does not inject files or change the manifest.",
                 "The floating menu draft now filters to hooks routed as runtime_menu_good_fit or hybrid_required instead of assuming every runtime hook belongs in the menu.",
+                "When the draft contains persistent menu actions, override_rules_json now contains executable runtime override rules instead of placeholder text.",
                 "Edit or extend spec_json before injection if you want extra manual buttons, sections, or shared_pref/static_field actions.",
                 "Run configure_runtime_menu_manifest only when the final mode actually needs overlay/service permissions.",
             ],
@@ -11891,6 +12773,12 @@ def inject_runtime_menu_scaffold(
         Notes:
         - The scaffold creates real helper classes, drag listeners, dispatcher bindings,
             and startup bootstrap code.
+        - `custom_helper_files` lets you provide raw helper smali source keyed by relative
+            filenames such as `InAppMenuBridge.smali` or `CustomPanel.smali`.
+        - Set `include_default_helpers=false` when you want to inject a fully authored menu
+            implementation instead of the generated helper set; in that mode you must provide
+            `custom_helper_files["InAppMenuBridge.smali"]` with a real
+            `Lapkagi/menu/InAppMenuBridge;->install(Landroid/content/Context;)V` entry point.
         - Top-level `launcher_label` customizes the floating bubble text, and
             `start_collapsed=true` starts from the launcher icon instead of an open panel.
         - Action-level `section` strings insert grouped headers inside the panel.
@@ -12021,6 +12909,9 @@ def draft_runtime_menu_from_hooks(
             start_collapsed=start_collapsed,
             apktool_dir=_project.apktool_dir,
         )
+        override_rules = _build_runtime_override_rules_from_menu_spec(draft.get("spec") or {})
+        draft["override_rule_count"] = len(override_rules)
+        draft["override_rules_json"] = json.dumps(override_rules, ensure_ascii=False, indent=2) if override_rules else ""
         draft["routing_summary"] = plan.get("routing_summary", {})
         draft["recommended_next_strategy"] = str(
             draft["routing_summary"].get("recommended_next_strategy") or PatchStrategy.RUNTIME_MENU_GOOD_FIT.value
@@ -12189,7 +13080,11 @@ def inject_runtime_override_layer(rules_json: str, reapply_on_resume: bool = Fal
 
     Supported rule kinds:
       - shared_pref
+            - shared_pref_state
       - static_field
+            - static_field_state
+            - invoke_static
+            - dispatcher
     """
     from apk_agent.tools.runtime_override import inject_runtime_override_layer as _inject
 
@@ -12300,6 +13195,18 @@ ALL_TOOLS = [
     validate_dart_aot_patch,
     patch_binary_strings,
     plan_native_patch_targets,
+    analyze_dex_method_pressure,
+    map_dex_topology,
+    extract_dependency_graph,
+    resolve_dex_target,
+    plan_dex_injection,
+    emit_smali_helper_bundle,
+    relocate_smali_tree,
+    rewrite_smali_references,
+    validate_dex_integrity,
+    plan_dex_auto_remediation,
+    plan_injection_fallback_strategies,
+    plan_self_healing_build_loop,
     # File operations
     read_file,
     write_file,
@@ -12312,8 +13219,12 @@ ALL_TOOLS = [
     get_evidence_summary,
     # Working memory and planning
     update_task_plan,
+    update_execution_plan,
     edit_task_plan,
     mark_task_done,
+    set_active_plan_task,
+    record_plan_outcome,
+    get_execution_plan_status,
     update_scratchpad,
     # Feature-check mapping
     map_feature_checks,

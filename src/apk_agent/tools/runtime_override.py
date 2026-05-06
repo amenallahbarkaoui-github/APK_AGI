@@ -69,7 +69,7 @@ def build_runtime_override_rules_from_menu_spec(
             continue
 
         if kind == "shared_pref":
-            rule = {
+            rule: dict[str, Any] = {
                 "kind": ("shared_pref" if ui_kind == "button" else "shared_pref_state"),
                 "prefs_name": str(action.get("prefs_name") or action.get("name") or "app_prefs"),
                 "key": str(action.get("key") or ""),
@@ -344,12 +344,8 @@ def _shared_pref_state_rule_lines(rule: dict[str, Any]) -> list[str]:
     lines = _load_state_pref_lines(rule, output_register="v4", state_type=state_type)
     if not lines:
         return []
-    rule_copy = dict(rule)
-    rule_copy.pop("value", None)
-    lines.extend(_shared_pref_rule_lines(rule_copy)[:-1] if False else [])
-    action_lines = _shared_pref_rule_lines(rule_copy | {"value": rule.get("value")})
     # Reuse the existing writer path by feeding the loaded register as the state source.
-    return lines + _shared_pref_rule_lines({**rule_copy, "value": rule.get("value")})[:0] + _shared_pref_rule_lines_stateful(rule_copy, value_register="v4")
+    return lines + _shared_pref_rule_lines_stateful(dict(rule), value_register="v4")
 
 
 def _static_field_rule_lines(rule: dict[str, Any]) -> list[str]:

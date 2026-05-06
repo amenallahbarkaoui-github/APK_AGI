@@ -60,6 +60,13 @@ class AgentState(TypedDict):
 
     # ---- task decomposition ----
     task_plan: list[dict[str, Any]]  # [{id, desc, status: pending|in_progress|done}, ...]
+    execution_plan: dict[str, Any]  # adaptive hierarchical task tree with active path and task metadata
+    plan_journal: list[dict[str, Any]]  # durable planning/replanning event journal
+    active_task_id: int  # currently focused executable task id
+    active_task_path: list[str]  # hierarchical task path for the active task
+    plan_revision: int  # monotonically increasing revision for adaptive plan updates
+    plan_mode: str  # planning policy, e.g. adaptive/observe/warn/enforce
+    last_replan_reason: str  # most recent explicit replanning trigger or failure reason
 
     # ---- planning readiness ----
     planning_started: bool  # True once a concrete task plan exists
