@@ -663,8 +663,9 @@ _TOOL_TIMEOUT_OVERRIDES: dict[str, int | None] = {
     "unified_scan": 1800,
     "analyze_data_flow": 1800,
     "run_taint_analysis": 1800,
-    # These whole-project verification passes can legitimately run for a long time.
+    # These whole-project semantic and verification passes can legitimately run for a long time.
     # `None` disables the timeout completely.
+    "recover_hidden_state_model": None,
     "find_dynamic_checks": None,
     "verify_bypass_completeness": None,
 }
@@ -857,8 +858,10 @@ def _resolve_dir(directory: str | None, default: str = "jadx") -> Path:
                         return test
         return candidate
 
+    path_candidate = Path(d)
+
     # Bare path like "com/psiphon3" or "B2" — check all smali dirs + jadx sources
-    if not Path(directory).is_absolute():
+    if not path_candidate.is_absolute():
         for smali_d in _get_all_smali_dirs():
             test = smali_d / d
             if test.is_dir():
@@ -868,7 +871,7 @@ def _resolve_dir(directory: str | None, default: str = "jadx") -> Path:
         if jadx_sources.is_dir():
             return jadx_sources
 
-    p = Path(directory)
+    p = path_candidate
     if p.is_absolute():
         return _rebase_stale_absolute_path(p)
 

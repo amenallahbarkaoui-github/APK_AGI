@@ -238,16 +238,30 @@ class PatchEngine:
 
     def restore_backup(self, target_file: str) -> dict:
         """Restore a file from its backup (undo all patches)."""
+        target = self._find_target(target_file)
         normalized_target = target_file.replace("\\", "/").lstrip("/")
-        backup_path = self.backup_dir / normalized_target
-        if not backup_path.is_file():
-            legacy_flattened = self.backup_dir / normalized_target.replace("/", "_").replace("\\", "_")
-            if legacy_flattened.is_file():
-                backup_path = legacy_flattened
-        if not backup_path.is_file():
+        backup_candidates: list[Path] = [
+            self.backup_dir / normalized_target,
+            self.backup_dir / normalized_target.replace("/", "_").replace("\\", "_"),
+            self.backup_dir / f"{normalized_target.replace('/', '_').replace('\\', '_')}.bak",
+        ]
+
+        if target is not None:
+            try:
+                resolved_rel = str(target.relative_to(self.apktool_dir)).replace("\\", "/")
+            except ValueError:
+                resolved_rel = ""
+            if resolved_rel:
+                backup_candidates.extend([
+                    self.backup_dir / resolved_rel,
+                    self.backup_dir / resolved_rel.replace("/", "_").replace("\\", "_"),
+                    self.backup_dir / f"{resolved_rel.replace('/', '_').replace('\\', '_')}.bak",
+                ])
+
+        backup_path = next((candidate for candidate in backup_candidates if candidate.is_file()), None)
+        if backup_path is None:
             return {"success": False, "error": f"No backup found for {target_file}"}
 
-        target = self._find_target(target_file)
         if target is None:
             return {"success": False, "error": f"Target file not found: {target_file}"}
 
