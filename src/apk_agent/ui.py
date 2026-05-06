@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Optional
+from typing import Any, Optional
 
 from rich.columns import Columns
 from rich.console import Console, Group
@@ -580,7 +580,7 @@ def print_task_plan(plan: list[dict]) -> None:
     total = len(plan)
     for t in plan:
         tid = str(t.get("id", "?"))
-        desc = t.get("desc", t.get("description", "—"))
+        desc = t.get("desc", t.get("description", t.get("title", t.get("task", "—"))))
         status = t.get("status", "pending")
         icon = status_icons.get(status, f"[dim]{status}[/]")
         if status == "done":
@@ -804,9 +804,65 @@ _TOOL_CATEGORY_ICONS = {
     "Other & Unsorted": "📦",
 }
 
+_PLANNING_TOOL_NAMES = {
+    "update_task_plan",
+    "edit_task_plan",
+    "mark_task_done",
+    "update_scratchpad",
+    "update_execution_plan",
+    "set_active_plan_task",
+    "record_plan_outcome",
+    "get_execution_plan_status",
+}
+
+
+def _plan_progress_snapshot(state: dict[str, Any]) -> dict[str, Any] | None:
+    execution_plan = state.get("execution_plan") or {}
+    execution_tasks = list(execution_plan.get("tasks") or [])
+    if execution_tasks:
+        summary = state.get("execution_plan_summary") or {}
+        done = int(summary.get("done", sum(1 for item in execution_tasks if item.get("status") == "done")) or 0)
+        total = int(summary.get("total_tasks", len(execution_tasks)) or len(execution_tasks))
+        return {
+            "label": "Adaptive Plan",
+            "done": done,
+            "total": total,
+            "active_path": list(
+                summary.get("active_task_path")
+                or execution_plan.get("active_task_path")
+                or state.get("active_task_path")
+                or []
+            ),
+            "revision": int(
+                summary.get("revision")
+                or execution_plan.get("revision")
+                or state.get("plan_revision")
+                or 0
+            ),
+            "mode": str(
+                summary.get("mode")
+                or execution_plan.get("mode")
+                or state.get("plan_mode")
+                or ""
+            ).strip(),
+        }
+
+    task_plan = state.get("task_plan") or []
+    if task_plan:
+        return {
+            "label": "Plan",
+            "done": sum(1 for item in task_plan if item.get("status") == "done"),
+            "total": len(task_plan),
+            "active_path": [],
+            "revision": 0,
+            "mode": "",
+        }
+
+    return None
+
 
 def _categorize_tool_name(name: str) -> str:
-    if name in {"update_task_plan", "edit_task_plan", "mark_task_done", "update_scratchpad"}:
+    if name in _PLANNING_TOOL_NAMES:
         return "Planning & Memory"
     if name in {"apktool_decompile", "jadx_decompile", "dex2jar_convert", "aapt2_dump", "apktool_build", "zipalign_apk_tool", "sign_apk"}:
         return "Decompilation & Build"
@@ -1013,10 +1069,10 @@ def print_dashboard(state: dict | None = None) -> None:
     findings = state.get("findings") or []
     patches = state.get("patch_results") or []
     patch_registry = state.get("patch_registry") or []
-    task_plan = state.get("task_plan") or []
     scratchpad = state.get("scratchpad") or {}
     graph_ready = state.get("graph_ready", False)
     target_pkgs = state.get("target_packages") or []
+    plan_snapshot = _plan_progress_snapshot(state)
 
     # ── Findings summary panel ──
     severity_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
@@ -1068,13 +1124,21 @@ def print_dashboard(state: dict | None = None) -> None:
 
     # ── Progress panel ──
     progress_lines = []
-    if task_plan:
-        done = sum(1 for t in task_plan if t.get("status") == "done")
-        total = len(task_plan)
+    if plan_snapshot:
+        done = int(plan_snapshot["done"])
+        total = int(plan_snapshot["total"])
         bar_w = 20
         filled = int(done / max(total, 1) * bar_w)
         bar = f"[green]{'█' * filled}[/][dim]{'░' * (bar_w - filled)}[/]"
-        progress_lines.append(f"  Plan: [{bar}] {done}/{total}")
+        progress_lines.append(f"  {plan_snapshot['label']}: [{bar}] {done}/{total}")
+        active_path = list(plan_snapshot.get("active_path") or [])
+        if active_path:
+            progress_lines.append(f"  Active: {' > '.join(active_path[:3])}")
+        revision = int(plan_snapshot.get("revision", 0) or 0)
+        mode = str(plan_snapshot.get("mode") or "").strip()
+        if revision > 0:
+            suffix = f" ({mode})" if mode else ""
+            progress_lines.append(f"  Plan rev: {revision}{suffix}")
     if scratchpad:
         progress_lines.append(f"  Scratchpad: {len(scratchpad)} entries")
     if target_pkgs:

@@ -12605,7 +12605,7 @@ def plan_runtime_menu_workflow(
         annotate_runtime_hook_plan as _annotate_runtime_hook_plan,
         plan_runtime_hooks as _plan_runtime_hooks,
     )
-    from apk_agent.tools.patch_strategy import PatchStrategy
+    from apk_agent.tools.patch_strategy import PatchStrategy, finalize_runtime_hook_strategy_recommendation
     from apk_agent.tools.runtime_menu import build_runtime_menu_spec_from_hook_plan as _build_runtime_menu_spec_from_hook_plan
     from apk_agent.tools.runtime_override import build_runtime_override_rules_from_menu_spec as _build_runtime_override_rules_from_menu_spec
     from apk_agent.tools.runtime_override import build_runtime_override_rules_from_menu_spec as _build_runtime_override_rules_from_menu_spec
@@ -12941,8 +12941,9 @@ def plan_runtime_menu_workflow(
         buttons = list(spec.get("buttons") or [])
         unsupported = list(draft.get("unsupported_bindings") or [])
         class_descriptor = _first_hook_class(hook_plan)
-        recommended_next_strategy = str(
-            routing_summary.get("recommended_next_strategy") or PatchStrategy.RUNTIME_MENU_GOOD_FIT.value
+        recommended_next_strategy = finalize_runtime_hook_strategy_recommendation(
+            routing_summary,
+            resolved_menu_bindings=int(draft.get("resolved_bindings", 0) or 0),
         )
         tool_chains_by_strategy = {
             strategy_name: _chain_for_strategy(strategy_name, spec_json, override_rules_json, class_descriptor)
@@ -12984,6 +12985,14 @@ def plan_runtime_menu_workflow(
                 "strategy_counts": routing_summary.get("counts", {}),
                 "binding_status_counts": routing_summary.get("binding_status_counts", {}),
                 "runtime_menu_candidate_count": routing_summary.get("runtime_menu_candidate_count", len(menu_hooks)),
+                "runtime_menu_binding_ready_candidate_count": routing_summary.get(
+                    "runtime_menu_binding_ready_candidate_count",
+                    int(draft.get("resolved_bindings", 0) or 0),
+                ),
+                "runtime_menu_provisional_candidate_count": routing_summary.get(
+                    "runtime_menu_provisional_candidate_count",
+                    0,
+                ),
                 "runtime_override_candidate_count": routing_summary.get("runtime_override_candidate_count", len(runtime_override_hooks)),
                 "static_patch_candidate_count": routing_summary.get("static_patch_candidate_count", len(static_patch_hooks)),
                 "external_runtime_candidate_count": routing_summary.get("external_runtime_candidate_count", len(external_hooks)),
@@ -13011,6 +13020,7 @@ def plan_runtime_menu_workflow(
             "notes": [
                 "This helper is planning-only: it does not inject files or change the manifest.",
                 "The floating menu draft now filters to hooks routed as runtime_menu_good_fit or hybrid_required instead of assuming every runtime hook belongs in the menu.",
+                "Menu is recommended only after routing or the generated draft proves a real binding path; provisional menu hooks otherwise fall back to override or static lanes.",
                 "When the draft contains persistent menu actions, override_rules_json now contains executable runtime override rules instead of placeholder text.",
                 "Edit or extend spec_json before injection if you want extra manual buttons, sections, or shared_pref/static_field actions.",
                 "Run configure_runtime_menu_manifest only when the final mode actually needs overlay/service permissions.",
@@ -13173,8 +13183,9 @@ def draft_runtime_menu_from_hooks(
         annotate_runtime_hook_plan as _annotate_runtime_hook_plan,
         plan_runtime_hooks as _plan_runtime_hooks,
     )
-    from apk_agent.tools.patch_strategy import PatchStrategy
+    from apk_agent.tools.patch_strategy import PatchStrategy, finalize_runtime_hook_strategy_recommendation
     from apk_agent.tools.runtime_menu import build_runtime_menu_spec_from_hook_plan as _build_runtime_menu_spec_from_hook_plan
+    from apk_agent.tools.runtime_override import build_runtime_override_rules_from_menu_spec as _build_runtime_override_rules_from_menu_spec
 
     def _run():
         pack = _ensure_behavior_graph_pack(auto_build=False, focus_hint=focus_hint or class_name)
@@ -13235,9 +13246,40 @@ def draft_runtime_menu_from_hooks(
         draft["override_rule_count"] = len(override_rules)
         draft["override_rules_json"] = json.dumps(override_rules, ensure_ascii=False, indent=2) if override_rules else ""
         draft["routing_summary"] = plan.get("routing_summary", {})
-        draft["recommended_next_strategy"] = str(
-            draft["routing_summary"].get("recommended_next_strategy") or PatchStrategy.RUNTIME_MENU_GOOD_FIT.value
+        draft["recommended_next_strategy"] = finalize_runtime_hook_strategy_recommendation(
+            draft["routing_summary"],
+            resolved_menu_bindings=int(draft.get("resolved_bindings", 0) or 0),
         )
+        if draft["recommended_next_strategy"] == PatchStrategy.RUNTIME_MENU_GOOD_FIT.value:
+            draft["recommended_next_tool"] = "inject_runtime_menu_scaffold"
+            draft["recommended_next_args"] = {
+                "spec_json": draft.get("spec_json", ""),
+                "overlay_mode": overlay_mode,
+                "reapply_on_resume": True,
+                "auto_configure_manifest": overlay_mode in {"system_overlay", "hybrid"},
+                "require_foreground_service": overlay_mode == "hybrid",
+            }
+        elif draft["recommended_next_strategy"] in {
+            PatchStrategy.RUNTIME_OVERRIDE_GOOD_FIT.value,
+            PatchStrategy.HYBRID_REQUIRED.value,
+        }:
+            draft["recommended_next_tool"] = "inject_runtime_override_layer"
+            draft["recommended_next_args"] = {
+                "rules_json": draft["override_rules_json"] or "<build override rules from routing_summary runtime_override candidates>",
+                "reapply_on_resume": True,
+            }
+        elif draft["recommended_next_strategy"] == PatchStrategy.STATIC_PATCH_ONLY.value:
+            draft["recommended_next_tool"] = "smart_entity_patch"
+            draft["recommended_next_args"] = {
+                "class_descriptor": plan.get("class_name", class_name) or "<choose resolved enforcement class>",
+                "mode": "preview",
+                "planner_context": focus_hint,
+            }
+        else:
+            draft["recommended_next_tool"] = "frida_script_generator"
+            draft["recommended_next_args"] = {
+                "class_descriptor": plan.get("class_name", class_name) or "<choose dynamic/native boundary class>",
+            }
         draft["output_path"] = str(_behavior_graph_path())
         return json.dumps(draft, ensure_ascii=False, indent=2)[:30000]
 

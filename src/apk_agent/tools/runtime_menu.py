@@ -3008,7 +3008,11 @@ def inject_runtime_menu_scaffold(
     normalized_spec = _normalize_menu_spec(spec, overlay_mode)
     requested_mode = normalized_spec["overlay_mode"]
     effective_mode = _effective_overlay_mode(requested_mode)
-    requirements = _runtime_menu_requirements(requested_mode)
+    effective_foreground_service = bool(require_foreground_service)
+    requirements = _runtime_menu_requirements(
+        requested_mode,
+        require_foreground_service=effective_foreground_service,
+    )
     has_toggle = "toggle" in normalized_spec["control_types"]
     has_slider = "slider" in normalized_spec["control_types"]
     hook_bindings = [binding for binding in normalized_spec.get("hook_bindings", []) if isinstance(binding, dict)]
@@ -3052,7 +3056,6 @@ def inject_runtime_menu_scaffold(
 
     manifest_auto_configured = False
     manifest_followup_required = requested_mode in {"system_overlay", "hybrid"} and not auto_configure_manifest
-    effective_foreground_service = bool(require_foreground_service or requested_mode == "hybrid")
     manifest_result: dict[str, Any] = {
         "success": True,
         "requested_overlay_mode": requested_mode,
@@ -3093,6 +3096,7 @@ def inject_runtime_menu_scaffold(
                 "The current implementation generates a floating launcher bubble, remembered open/close state, section headers, and direct dispatcher bindings for runtime hooks.",
                 "custom_helper_files can override generated helpers or replace the whole helper set when include_default_helpers=false.",
                 "Overlay-based modes expect manifest/service wiring as part of a successful deployment path.",
+                "Foreground-service wiring stays optional; request it only when the deployment also adds a real notification/startForeground path.",
             ],
         }
 
@@ -3236,6 +3240,7 @@ def inject_runtime_menu_scaffold(
             "Helper classes can be written into a secondary dex root when target_smali_root is set or auto-resolved.",
             "When system_overlay or hybrid is requested, the scaffold generates a real WindowManager overlay service and overlay-permission request flow.",
             "Overlay-based injections now auto-configure manifest permissions/services by default; disable that only when you intentionally want a separate manifest step.",
+            "Foreground-service wiring remains optional and should only be requested when the deployment also adds a real notification/startForeground implementation.",
             "custom_helper_files may override generated menu helpers so the agent can inject fully authored smali menu implementations through this tool.",
         ],
         "errors": errors[:20],

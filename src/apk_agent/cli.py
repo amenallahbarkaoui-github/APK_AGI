@@ -66,6 +66,15 @@ from apk_agent.workspace import Project, ProjectManager
 # ---------------------------------------------------------------------------
 _active_workspace_root: Path | None = None
 _last_session_update: float = 0.0  # monotonic timestamp for throttling
+_PLAN_UPDATE_TOOL_NAMES = {
+    "update_task_plan",
+    "edit_task_plan",
+    "mark_task_done",
+    "update_execution_plan",
+    "set_active_plan_task",
+    "record_plan_outcome",
+    "get_execution_plan_status",
+}
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -596,6 +605,7 @@ def main(apk_path: str | None, verbose: bool, project_id: str | None,
                 patches = ckpt.values.get("patch_results") or []
                 scratchpad = ckpt.values.get("scratchpad") or {}
                 task_plan = ckpt.values.get("task_plan") or []
+                execution_plan_summary = ckpt.values.get("execution_plan_summary") or {}
                 graph_ready = ckpt.values.get("graph_ready", False)
                 target_pkgs = ckpt.values.get("target_packages") or []
 
@@ -610,6 +620,15 @@ def main(apk_path: str | None, verbose: bool, project_id: str | None,
                 if task_plan:
                     done = sum(1 for t in task_plan if t.get("status") == "done")
                     parts.append(f"plan {done}/{len(task_plan)} done")
+                elif execution_plan_summary:
+                    total = int(
+                        execution_plan_summary.get("total_tasks")
+                        or execution_plan_summary.get("task_count")
+                        or 0
+                    )
+                    if total > 0:
+                        done = int(execution_plan_summary.get("done") or 0)
+                        parts.append(f"plan {done}/{total} done")
                 if target_pkgs:
                     parts.append(f"scope: {', '.join(target_pkgs[:3])}")
                 if graph_ready:
@@ -1527,7 +1546,7 @@ def _process_stream_event(event: dict, graph, graph_config: dict, *, auto_mode: 
                     print_tool_output(msg.name or "tool", tool_content, success=success)
 
                     # Show task plan whenever it changes
-                    if msg.name in ("update_task_plan", "mark_task_done", "edit_task_plan"):
+                    if msg.name in _PLAN_UPDATE_TOOL_NAMES:
                         try:
                             from apk_agent.agent.tools_def import _get_task_plan
                             from apk_agent.ui import print_task_plan
