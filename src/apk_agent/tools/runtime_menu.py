@@ -43,7 +43,6 @@ _TOGGLE_DESCRIPTOR = "Lapkagi/menu/MenuToggleCheckedChangeListener;"
 _SLIDER_DESCRIPTOR = "Lapkagi/menu/MenuSliderChangeListener;"
 _PANEL_DRAG_DESCRIPTOR = "Lapkagi/menu/MenuPanelDragTouchListener;"
 _OVERLAY_DRAG_DESCRIPTOR = "Lapkagi/menu/OverlayMenuDragTouchListener;"
-_ATTACH_RUNNABLE_DESCRIPTOR = "Lapkagi/menu/MenuAttachRunnable;"
 _LIFECYCLE_DESCRIPTOR = "Lapkagi/menu/MenuLifecycleCallbacks;"
 _OVERLAY_SERVICE_DESCRIPTOR = "Lapkagi/menu/OverlayMenuService;"
 _OVERLAY_SERVICE_FQCN = "apkagi.menu.OverlayMenuService"
@@ -55,7 +54,6 @@ _RESET_ACTION_LABEL = "Reset Runtime Actions"
 _SUPPORTED_OVERLAY_MODES = {"in_app", "system_overlay", "hybrid"}
 _SUPPORTED_UI_KINDS = {"button", "toggle", "slider"}
 _SUPPORTED_ACTION_KINDS = {"shared_pref", "static_field", "invoke_static", "dispatcher"}
-_DEFAULT_ATTACH_DELAY_MS = 150
 _DIRECT_BINDING_UI_KIND = {
     tuple(): "button",
     ("Landroid/content/Context;",): "button",
@@ -163,25 +161,6 @@ def _backup_file(file_path: Path, apktool_dir: Path, backup_dir: Path | None, ba
         shutil.copy2(file_path, backup_path)
     backed_up[key] = str(backup_path)
     return str(backup_path)
-
-
-def _restore_backup_entry(file_path: Path, backup_path: str) -> None:
-    if backup_path and Path(backup_path).exists():
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(backup_path, file_path)
-        return
-    if file_path.exists():
-        file_path.unlink()
-
-
-def _rollback_runtime_menu_changes(touched_files: set[str], backed_up: dict[str, str]) -> list[str]:
-    restored_files: list[str] = []
-    for file_name in sorted(touched_files):
-        file_path = Path(file_name)
-        backup_path = backed_up.get(str(file_path.resolve()), "")
-        _restore_backup_entry(file_path, backup_path)
-        restored_files.append(str(file_path))
-    return restored_files
 
 
 def _method_has_bootstrap(smali_file: Path, method_name: str) -> bool:
@@ -485,10 +464,7 @@ def _normalize_menu_spec(spec: dict[str, Any], overlay_mode: str) -> dict[str, A
     title = str(spec.get("title") or spec.get("menu_title") or "APK AGI MOD MENU").strip() or "APK AGI MOD MENU"
     launcher_label = str(spec.get("launcher_label") or spec.get("floating_icon_label") or spec.get("bubble_label") or "MOD").strip() or "MOD"
     start_collapsed = bool(spec.get("start_collapsed", True))
-    raw_attach_delay = int(spec.get("delayed_attach_ms", _DEFAULT_ATTACH_DELAY_MS) or 0)
-    delayed_attach_ms = max(0, min(raw_attach_delay, 2000))
     auto_reapply_actions = bool(spec.get("auto_reapply_actions", False))
-    auto_start_overlay = bool(spec.get("auto_start_overlay", False))
     restore_open_state = bool(spec.get("restore_open_state", False))
     target_smali_root = normalize_smali_root_name(
         spec.get("target_smali_root") or spec.get("helper_smali_root") or spec.get("target_dex_root") or "auto"
@@ -523,9 +499,7 @@ def _normalize_menu_spec(spec: dict[str, Any], overlay_mode: str) -> dict[str, A
         "title": title,
         "launcher_label": launcher_label,
         "start_collapsed": start_collapsed,
-        "delayed_attach_ms": delayed_attach_ms,
         "auto_reapply_actions": auto_reapply_actions,
-        "auto_start_overlay": auto_start_overlay,
         "restore_open_state": restore_open_state,
         "target_smali_root": target_smali_root,
         "buttons": normalized_buttons,
@@ -1947,17 +1921,6 @@ def _generate_actions_smali(spec: dict[str, Any]) -> str:
         "    return-object v0",
         ".end method",
         "",
-        ".method public static resolveHookContext(Landroid/content/Context;Landroid/view/View;)Landroid/content/Context;",
-        "    .locals 1",
-        "    if-eqz p1, :apkagi_resolve_hook_fallback",
-        "    invoke-virtual {p1}, Landroid/view/View;->getContext()Landroid/content/Context;",
-        "    move-result-object v0",
-        "    if-eqz v0, :apkagi_resolve_hook_fallback",
-        "    return-object v0",
-        ":apkagi_resolve_hook_fallback",
-        "    return-object p0",
-        ".end method",
-        "",
         ".method private static setEnabled(Landroid/content/Context;Ljava/lang/String;Z)V",
         "    .locals 3",
         "    invoke-static {p0}, Lapkagi/menu/MenuActions;->prefs(Landroid/content/Context;)Landroid/content/SharedPreferences;",
@@ -2247,21 +2210,10 @@ def _generate_click_listener_smali() -> str:
         ".end method",
         "",
         ".method public onClick(Landroid/view/View;)V",
-        "    .locals 3",
+        "    .locals 2",
         "    iget-object v0, p0, Lapkagi/menu/MenuActionClickListener;->appContext:Landroid/content/Context;",
-        "    :apkagi_click_listener_try_start",
-        "    invoke-static {v0, p1}, Lapkagi/menu/MenuActions;->resolveHookContext(Landroid/content/Context;Landroid/view/View;)Landroid/content/Context;",
-        "    move-result-object v1",
-        "    iget-object v2, p0, Lapkagi/menu/MenuActionClickListener;->actionId:Ljava/lang/String;",
-        "    invoke-static {v1, v2}, Lapkagi/menu/MenuActions;->dispatchClick(Landroid/content/Context;Ljava/lang/String;)V",
-        "    :apkagi_click_listener_try_end",
-        "    goto :apkagi_click_listener_done",
-        "    .catch Ljava/lang/Throwable; {:apkagi_click_listener_try_start .. :apkagi_click_listener_try_end} :apkagi_click_listener_catch",
-        ":apkagi_click_listener_catch",
-        "    move-exception v1",
-        '    const-string v2, "Menu action failed"',
-        "    invoke-static {v0, v2}, Lapkagi/menu/MenuActions;->toast(Landroid/content/Context;Ljava/lang/String;)V",
-        ":apkagi_click_listener_done",
+        "    iget-object v1, p0, Lapkagi/menu/MenuActionClickListener;->actionId:Ljava/lang/String;",
+        "    invoke-static {v0, v1}, Lapkagi/menu/MenuActions;->dispatchClick(Landroid/content/Context;Ljava/lang/String;)V",
         "    return-void",
         ".end method",
         "",
@@ -2291,41 +2243,30 @@ def _generate_visibility_listener_smali() -> str:
         ".end method",
         "",
         ".method public onClick(Landroid/view/View;)V",
-        "    .locals 5",
-        "    iget-object v0, p0, Lapkagi/menu/MenuVisibilityClickListener;->appContext:Landroid/content/Context;",
-        "    :apkagi_visibility_try_start",
-        "    iget-object v1, p0, Lapkagi/menu/MenuVisibilityClickListener;->panelView:Landroid/view/View;",
-        "    iget v2, p0, Lapkagi/menu/MenuVisibilityClickListener;->panelVisibility:I",
-        "    invoke-virtual {v1, v2}, Landroid/view/View;->setVisibility(I)V",
-        "    iget-object v1, p0, Lapkagi/menu/MenuVisibilityClickListener;->launcherView:Landroid/view/View;",
-        "    if-eqz v1, :apkagi_visibility_store",
-        "    iget v2, p0, Lapkagi/menu/MenuVisibilityClickListener;->panelVisibility:I",
-        "    if-nez v2, :apkagi_visibility_show_launcher",
-        "    const/16 v2, 0x8",
+        "    .locals 4",
+        "    iget-object v0, p0, Lapkagi/menu/MenuVisibilityClickListener;->panelView:Landroid/view/View;",
+        "    iget v1, p0, Lapkagi/menu/MenuVisibilityClickListener;->panelVisibility:I",
+        "    invoke-virtual {v0, v1}, Landroid/view/View;->setVisibility(I)V",
+        "    iget-object v0, p0, Lapkagi/menu/MenuVisibilityClickListener;->launcherView:Landroid/view/View;",
+        "    if-eqz v0, :apkagi_visibility_store",
+        "    iget v1, p0, Lapkagi/menu/MenuVisibilityClickListener;->panelVisibility:I",
+        "    if-nez v1, :apkagi_visibility_show_launcher",
+        "    const/16 v1, 0x8",
         "    goto :apkagi_visibility_apply_launcher",
         ":apkagi_visibility_show_launcher",
-        "    const/4 v2, 0x0",
+        "    const/4 v1, 0x0",
         ":apkagi_visibility_apply_launcher",
-        "    invoke-virtual {v1, v2}, Landroid/view/View;->setVisibility(I)V",
+        "    invoke-virtual {v0, v1}, Landroid/view/View;->setVisibility(I)V",
         ":apkagi_visibility_store",
-        "    invoke-static {v0, p1}, Lapkagi/menu/MenuActions;->resolveHookContext(Landroid/content/Context;Landroid/view/View;)Landroid/content/Context;",
-        "    move-result-object v1",
-        "    iget v2, p0, Lapkagi/menu/MenuVisibilityClickListener;->panelVisibility:I",
-        "    if-nez v2, :apkagi_visibility_closed",
-        "    const/4 v2, 0x1",
-        "    invoke-static {v1, v2}, Lapkagi/menu/MenuActions;->setMenuOpen(Landroid/content/Context;Z)V",
-        "    goto :apkagi_visibility_try_end",
+        "    iget-object v0, p0, Lapkagi/menu/MenuVisibilityClickListener;->appContext:Landroid/content/Context;",
+        "    iget v1, p0, Lapkagi/menu/MenuVisibilityClickListener;->panelVisibility:I",
+        "    if-nez v1, :apkagi_visibility_closed",
+        "    const/4 v1, 0x1",
+        "    invoke-static {v0, v1}, Lapkagi/menu/MenuActions;->setMenuOpen(Landroid/content/Context;Z)V",
+        "    return-void",
         ":apkagi_visibility_closed",
-        "    const/4 v2, 0x0",
-        "    invoke-static {v1, v2}, Lapkagi/menu/MenuActions;->setMenuOpen(Landroid/content/Context;Z)V",
-        "    :apkagi_visibility_try_end",
-        "    goto :apkagi_visibility_done",
-        "    .catch Ljava/lang/Throwable; {:apkagi_visibility_try_start .. :apkagi_visibility_try_end} :apkagi_visibility_catch",
-        ":apkagi_visibility_catch",
-        "    move-exception v1",
-        '    const-string v2, "Menu visibility update failed"',
-        "    invoke-static {v0, v2}, Lapkagi/menu/MenuActions;->toast(Landroid/content/Context;Ljava/lang/String;)V",
-        ":apkagi_visibility_done",
+        "    const/4 v1, 0x0",
+        "    invoke-static {v0, v1}, Lapkagi/menu/MenuActions;->setMenuOpen(Landroid/content/Context;Z)V",
         "    return-void",
         ".end method",
         "",
@@ -2351,21 +2292,10 @@ def _generate_toggle_listener_smali() -> str:
         ".end method",
         "",
         ".method public onCheckedChanged(Landroid/widget/CompoundButton;Z)V",
-        "    .locals 3",
+        "    .locals 2",
         "    iget-object v0, p0, Lapkagi/menu/MenuToggleCheckedChangeListener;->appContext:Landroid/content/Context;",
-        "    :apkagi_toggle_listener_try_start",
-        "    invoke-static {v0, p1}, Lapkagi/menu/MenuActions;->resolveHookContext(Landroid/content/Context;Landroid/view/View;)Landroid/content/Context;",
-        "    move-result-object v1",
-        "    iget-object v2, p0, Lapkagi/menu/MenuToggleCheckedChangeListener;->actionId:Ljava/lang/String;",
-        "    invoke-static {v1, v2, p2}, Lapkagi/menu/MenuActions;->dispatchToggle(Landroid/content/Context;Ljava/lang/String;Z)V",
-        "    :apkagi_toggle_listener_try_end",
-        "    goto :apkagi_toggle_listener_done",
-        "    .catch Ljava/lang/Throwable; {:apkagi_toggle_listener_try_start .. :apkagi_toggle_listener_try_end} :apkagi_toggle_listener_catch",
-        ":apkagi_toggle_listener_catch",
-        "    move-exception v1",
-        '    const-string v2, "Menu toggle failed"',
-        "    invoke-static {v0, v2}, Lapkagi/menu/MenuActions;->toast(Landroid/content/Context;Ljava/lang/String;)V",
-        ":apkagi_toggle_listener_done",
+        "    iget-object v1, p0, Lapkagi/menu/MenuToggleCheckedChangeListener;->actionId:Ljava/lang/String;",
+        "    invoke-static {v0, v1, p2}, Lapkagi/menu/MenuActions;->dispatchToggle(Landroid/content/Context;Ljava/lang/String;Z)V",
         "    return-void",
         ".end method",
         "",
@@ -2403,25 +2333,14 @@ def _generate_slider_listener_smali() -> str:
         ".end method",
         "",
         ".method public onStopTrackingTouch(Landroid/widget/SeekBar;)V",
-        "    .locals 4",
-        "    iget-object v0, p0, Lapkagi/menu/MenuSliderChangeListener;->appContext:Landroid/content/Context;",
-        "    :apkagi_slider_listener_try_start",
+        "    .locals 3",
         "    invoke-virtual {p1}, Landroid/widget/SeekBar;->getProgress()I",
-        "    move-result v1",
-        "    iget v2, p0, Lapkagi/menu/MenuSliderChangeListener;->minValue:I",
-        "    add-int/2addr v1, v2",
-        "    invoke-static {v0, p1}, Lapkagi/menu/MenuActions;->resolveHookContext(Landroid/content/Context;Landroid/view/View;)Landroid/content/Context;",
-        "    move-result-object v2",
-        "    iget-object v3, p0, Lapkagi/menu/MenuSliderChangeListener;->actionId:Ljava/lang/String;",
-        "    invoke-static {v2, v3, v1}, Lapkagi/menu/MenuActions;->dispatchSlider(Landroid/content/Context;Ljava/lang/String;I)V",
-        "    :apkagi_slider_listener_try_end",
-        "    goto :apkagi_slider_listener_done",
-        "    .catch Ljava/lang/Throwable; {:apkagi_slider_listener_try_start .. :apkagi_slider_listener_try_end} :apkagi_slider_listener_catch",
-        ":apkagi_slider_listener_catch",
-        "    move-exception v1",
-        '    const-string v2, "Menu slider failed"',
-        "    invoke-static {v0, v2}, Lapkagi/menu/MenuActions;->toast(Landroid/content/Context;Ljava/lang/String;)V",
-        ":apkagi_slider_listener_done",
+        "    move-result v0",
+        "    iget v1, p0, Lapkagi/menu/MenuSliderChangeListener;->minValue:I",
+        "    add-int/2addr v0, v1",
+        "    iget-object v1, p0, Lapkagi/menu/MenuSliderChangeListener;->appContext:Landroid/content/Context;",
+        "    iget-object v2, p0, Lapkagi/menu/MenuSliderChangeListener;->actionId:Ljava/lang/String;",
+        "    invoke-static {v1, v2, v0}, Lapkagi/menu/MenuActions;->dispatchSlider(Landroid/content/Context;Ljava/lang/String;I)V",
         "    return-void",
         ".end method",
         "",
@@ -2452,7 +2371,6 @@ def _generate_panel_drag_listener_smali() -> str:
         "",
         ".method public onTouch(Landroid/view/View;Landroid/view/MotionEvent;)Z",
         "    .locals 12",
-        "    :apkagi_drag_try_start",
         "    invoke-virtual {p2}, Landroid/view/MotionEvent;->getAction()I",
         "    move-result v0",
         "    if-nez v0, :apkagi_drag_check_move",
@@ -2545,12 +2463,6 @@ def _generate_panel_drag_listener_smali() -> str:
         ":apkagi_drag_fallthrough",
         "    const/4 v0, 0x0",
         "    return v0",
-        "    :apkagi_drag_try_end",
-        "    .catch Ljava/lang/Throwable; {:apkagi_drag_try_start .. :apkagi_drag_try_end} :apkagi_drag_catch",
-        ":apkagi_drag_catch",
-        "    move-exception v0",
-        "    const/4 v0, 0x0",
-        "    return v0",
         ".end method",
         "",
     ]) + "\n"
@@ -2578,7 +2490,6 @@ def _generate_overlay_drag_listener_smali() -> str:
         "",
         ".method public onTouch(Landroid/view/View;Landroid/view/MotionEvent;)Z",
         "    .locals 8",
-        "    :apkagi_overlay_drag_try_start",
         "    invoke-virtual {p2}, Landroid/view/MotionEvent;->getAction()I",
         "    move-result v0",
         "    if-nez v0, :apkagi_overlay_drag_check_move",
@@ -2626,12 +2537,6 @@ def _generate_overlay_drag_listener_smali() -> str:
         "    const/4 v0, 0x1",
         "    return v0",
         ":apkagi_overlay_drag_fallthrough",
-        "    const/4 v0, 0x0",
-        "    return v0",
-        "    :apkagi_overlay_drag_try_end",
-        "    .catch Ljava/lang/Throwable; {:apkagi_overlay_drag_try_start .. :apkagi_overlay_drag_try_end} :apkagi_overlay_drag_catch",
-        ":apkagi_overlay_drag_catch",
-        "    move-exception v0",
         "    const/4 v0, 0x0",
         "    return v0",
         ".end method",
@@ -2685,32 +2590,6 @@ def _generate_lifecycle_callbacks_smali() -> str:
         "",
         ".method public onActivityDestroyed(Landroid/app/Activity;)V",
         "    .locals 0",
-        "    return-void",
-        ".end method",
-        "",
-    ]) + "\n"
-
-
-def _generate_attach_runnable_smali() -> str:
-    return "\n".join([
-        ".class public final Lapkagi/menu/MenuAttachRunnable;",
-        ".super Ljava/lang/Object;",
-        ".implements Ljava/lang/Runnable;",
-        '.source "MenuAttachRunnable.java"',
-        "",
-        ".field private final activity:Landroid/app/Activity;",
-        "",
-        ".method public constructor <init>(Landroid/app/Activity;)V",
-        "    .locals 0",
-        "    invoke-direct {p0}, Ljava/lang/Object;-><init>()V",
-        "    iput-object p1, p0, Lapkagi/menu/MenuAttachRunnable;->activity:Landroid/app/Activity;",
-        "    return-void",
-        ".end method",
-        "",
-        ".method public run()V",
-        "    .locals 1",
-        "    iget-object v0, p0, Lapkagi/menu/MenuAttachRunnable;->activity:Landroid/app/Activity;",
-        "    invoke-static {v0}, Lapkagi/menu/InAppMenuBridge;->attachNow(Landroid/app/Activity;)V",
         "    return-void",
         ".end method",
         "",
@@ -2807,8 +2686,6 @@ def _generate_bridge_smali(spec: dict[str, Any]) -> str:
     include_in_app = overlay_mode in {"in_app", "hybrid"}
     include_system_overlay = overlay_mode in {"system_overlay", "hybrid"}
     auto_reapply_actions = bool(spec.get("auto_reapply_actions", False))
-    auto_start_overlay = bool(spec.get("auto_start_overlay", False))
-    delayed_attach_ms = max(0, int(spec.get("delayed_attach_ms", _DEFAULT_ATTACH_DELAY_MS) or 0))
     restore_open_state = bool(spec.get("restore_open_state", False))
     widget_lines = _generate_widget_lines(spec, context_register="p0", container_register="v12")
     default_open = "0x0" if bool(spec.get("start_collapsed")) else "0x1"
@@ -2818,17 +2695,14 @@ def _generate_bridge_smali(spec: dict[str, Any]) -> str:
     ]
     if auto_reapply_actions and not include_in_app:
         install_lines.append("    invoke-static {p0}, Lapkagi/menu/MenuActions;->reapplyEnabled(Landroid/content/Context;)V")
-    if include_system_overlay and auto_start_overlay:
+    if include_system_overlay:
         install_lines.append("    invoke-static {p0}, Lapkagi/menu/InAppMenuBridge;->ensureSystemOverlay(Landroid/content/Context;)V")
     if include_in_app:
         install_lines.extend([
             "    instance-of v0, p0, Landroid/app/Application;",
             "    if-eqz v0, :apkagi_install_activity",
-            f"    sget-object v0, Lapkagi/menu/InAppMenuBridge;->lifecycleCallbacks:{_LIFECYCLE_DESCRIPTOR}",
-            "    if-nez v0, :apkagi_install_done",
             "    new-instance v0, Lapkagi/menu/MenuLifecycleCallbacks;",
             "    invoke-direct {v0}, Lapkagi/menu/MenuLifecycleCallbacks;-><init>()V",
-            f"    sput-object v0, Lapkagi/menu/InAppMenuBridge;->lifecycleCallbacks:{_LIFECYCLE_DESCRIPTOR}",
             "    move-object v1, p0",
             "    check-cast v1, Landroid/app/Application;",
             "    invoke-virtual {v1, v0}, Landroid/app/Application;->registerActivityLifecycleCallbacks(Landroid/app/Application$ActivityLifecycleCallbacks;)V",
@@ -2846,8 +2720,6 @@ def _generate_bridge_smali(spec: dict[str, Any]) -> str:
         ".super Ljava/lang/Object;",
         '.source "InAppMenuBridge.java"',
         "",
-        f".field private static lifecycleCallbacks:{_LIFECYCLE_DESCRIPTOR}",
-        "",
         ".method public constructor <init>()V",
         "    .locals 0",
         "    invoke-direct {p0}, Ljava/lang/Object;-><init>()V",
@@ -2863,7 +2735,6 @@ def _generate_bridge_smali(spec: dict[str, Any]) -> str:
         "    .catch Ljava/lang/Throwable; {:apkagi_install_try_start .. :apkagi_install_try_end} :apkagi_install_catch",
         ":apkagi_install_catch",
         "    move-exception v0",
-        "    invoke-static {p0}, Lapkagi/menu/InAppMenuBridge;->rollbackInstall(Landroid/content/Context;)V",
         ":apkagi_install_wrapper_done",
         "    return-void",
         ".end method",
@@ -2875,76 +2746,16 @@ def _generate_bridge_smali(spec: dict[str, Any]) -> str:
         "    return-void",
         ".end method",
         "",
-        ".method private static rollbackInstall(Landroid/content/Context;)V",
-        "    .locals 3",
-        "    if-eqz p0, :apkagi_install_rollback_done",
-        "    instance-of v0, p0, Landroid/app/Application;",
-        "    if-eqz v0, :apkagi_install_rollback_activity",
-        f"    sget-object v1, Lapkagi/menu/InAppMenuBridge;->lifecycleCallbacks:{_LIFECYCLE_DESCRIPTOR}",
-        "    if-eqz v1, :apkagi_install_rollback_activity",
-        "    move-object v2, p0",
-        "    check-cast v2, Landroid/app/Application;",
-        "    invoke-virtual {v2, v1}, Landroid/app/Application;->unregisterActivityLifecycleCallbacks(Landroid/app/Application$ActivityLifecycleCallbacks;)V",
-        "    const/4 v1, 0x0",
-        f"    sput-object v1, Lapkagi/menu/InAppMenuBridge;->lifecycleCallbacks:{_LIFECYCLE_DESCRIPTOR}",
-        ":apkagi_install_rollback_activity",
-        "    instance-of v0, p0, Landroid/app/Activity;",
-        "    if-eqz v0, :apkagi_install_rollback_overlay",
-        "    move-object v1, p0",
-        "    check-cast v1, Landroid/app/Activity;",
-        "    invoke-static {v1}, Lapkagi/menu/InAppMenuBridge;->rollbackAttach(Landroid/app/Activity;)V",
-        ":apkagi_install_rollback_overlay",
-        *(["    invoke-static {p0}, Lapkagi/menu/InAppMenuBridge;->stopOverlayService(Landroid/content/Context;)V"] if include_system_overlay else []),
-        ":apkagi_install_rollback_done",
-        "    return-void",
-        ".end method",
-        "",
         ".method public static attach(Landroid/app/Activity;)V",
         "    .locals 1",
         "    :apkagi_attach_try_start",
-        "    invoke-static {p0}, Lapkagi/menu/InAppMenuBridge;->scheduleAttachUnsafe(Landroid/app/Activity;)V",
+        "    invoke-static {p0}, Lapkagi/menu/InAppMenuBridge;->attachUnsafe(Landroid/app/Activity;)V",
         "    :apkagi_attach_try_end",
         "    goto :apkagi_attach_wrapper_done",
         "    .catch Ljava/lang/Throwable; {:apkagi_attach_try_start .. :apkagi_attach_try_end} :apkagi_attach_catch",
         ":apkagi_attach_catch",
         "    move-exception v0",
-        "    invoke-static {p0}, Lapkagi/menu/InAppMenuBridge;->rollbackAttach(Landroid/app/Activity;)V",
         ":apkagi_attach_wrapper_done",
-        "    return-void",
-        ".end method",
-        "",
-        ".method public static attachNow(Landroid/app/Activity;)V",
-        "    .locals 1",
-        "    :apkagi_attach_now_try_start",
-        "    invoke-static {p0}, Lapkagi/menu/InAppMenuBridge;->attachUnsafe(Landroid/app/Activity;)V",
-        "    :apkagi_attach_now_try_end",
-        "    goto :apkagi_attach_now_done",
-        "    .catch Ljava/lang/Throwable; {:apkagi_attach_now_try_start .. :apkagi_attach_now_try_end} :apkagi_attach_now_catch",
-        ":apkagi_attach_now_catch",
-        "    move-exception v0",
-        "    invoke-static {p0}, Lapkagi/menu/InAppMenuBridge;->rollbackAttach(Landroid/app/Activity;)V",
-        ":apkagi_attach_now_done",
-        "    return-void",
-        ".end method",
-        "",
-        ".method private static scheduleAttachUnsafe(Landroid/app/Activity;)V",
-        "    .locals 4",
-        "    if-eqz p0, :apkagi_schedule_attach_done",
-        "    invoke-virtual {p0}, Landroid/app/Activity;->getWindow()Landroid/view/Window;",
-        "    move-result-object v0",
-        "    if-eqz v0, :apkagi_schedule_attach_done",
-        "    invoke-virtual {v0}, Landroid/view/Window;->getDecorView()Landroid/view/View;",
-        "    move-result-object v0",
-        "    if-eqz v0, :apkagi_schedule_attach_done",
-        f"    new-instance v1, {_ATTACH_RUNNABLE_DESCRIPTOR}",
-        f"    invoke-direct {{v1, p0}}, {_ATTACH_RUNNABLE_DESCRIPTOR}-><init>(Landroid/app/Activity;)V",
-        *([
-            f"    const-wide/16 v2, {hex(delayed_attach_ms)}",
-            "    invoke-virtual {v0, v1, v2, v3}, Landroid/view/View;->postDelayed(Ljava/lang/Runnable;J)Z",
-        ] if delayed_attach_ms > 0 else [
-            "    invoke-virtual {v0, v1}, Landroid/view/View;->post(Ljava/lang/Runnable;)Z",
-        ]),
-        ":apkagi_schedule_attach_done",
         "    return-void",
         ".end method",
         "",
@@ -3059,23 +2870,6 @@ def _generate_bridge_smali(spec: dict[str, Any]) -> str:
         "    return-void",
         ".end method",
         "",
-        ".method private static rollbackAttach(Landroid/app/Activity;)V",
-        "    .locals 4",
-        "    if-eqz p0, :apkagi_rollback_attach_done",
-        "    const v0, 0x1020002",
-        "    invoke-virtual {p0, v0}, Landroid/app/Activity;->findViewById(I)Landroid/view/View;",
-        "    move-result-object v0",
-        "    if-eqz v0, :apkagi_rollback_attach_done",
-        "    check-cast v0, Landroid/view/ViewGroup;",
-        '    const-string v1, "APKAGI_FLOATING_ROOT"',
-        "    invoke-virtual {v0, v1}, Landroid/view/View;->findViewWithTag(Ljava/lang/Object;)Landroid/view/View;",
-        "    move-result-object v2",
-        "    if-eqz v2, :apkagi_rollback_attach_done",
-        "    invoke-virtual {v0, v2}, Landroid/view/ViewGroup;->removeView(Landroid/view/View;)V",
-        ":apkagi_rollback_attach_done",
-        "    return-void",
-        ".end method",
-        "",
     ]
 
     if include_system_overlay:
@@ -3132,32 +2926,7 @@ def _generate_bridge_smali(spec: dict[str, Any]) -> str:
             "    return-void",
             ".end method",
             "",
-            ".method private static stopOverlayService(Landroid/content/Context;)V",
-            "    .locals 3",
-            "    if-eqz p0, :apkagi_stop_overlay_done",
-            "    new-instance v0, Landroid/content/Intent;",
-            "    const-class v1, Lapkagi/menu/OverlayMenuService;",
-            "    invoke-direct {v0, p0, v1}, Landroid/content/Intent;-><init>(Landroid/content/Context;Ljava/lang/Class;)V",
-            "    invoke-virtual {p0, v0}, Landroid/content/Context;->stopService(Landroid/content/Intent;)Z",
-            ":apkagi_stop_overlay_done",
-            "    return-void",
-            ".end method",
-            "",
-            ".method public static ensureSystemOverlay(Landroid/content/Context;)V",
-            "    .locals 1",
-            "    :apkagi_ensure_overlay_try_start",
-            "    invoke-static {p0}, Lapkagi/menu/InAppMenuBridge;->ensureSystemOverlayUnsafe(Landroid/content/Context;)V",
-            "    :apkagi_ensure_overlay_try_end",
-            "    goto :apkagi_ensure_overlay_done",
-            "    .catch Ljava/lang/Throwable; {:apkagi_ensure_overlay_try_start .. :apkagi_ensure_overlay_try_end} :apkagi_ensure_overlay_catch",
-            ":apkagi_ensure_overlay_catch",
-            "    move-exception v0",
-            "    invoke-static {p0}, Lapkagi/menu/InAppMenuBridge;->stopOverlayService(Landroid/content/Context;)V",
-            ":apkagi_ensure_overlay_done",
-            "    return-void",
-            ".end method",
-            "",
-            ".method private static ensureSystemOverlayUnsafe(Landroid/content/Context;)V",
+            ".method private static ensureSystemOverlay(Landroid/content/Context;)V",
             "    .locals 1",
             "    invoke-static {p0}, Lapkagi/menu/InAppMenuBridge;->hasOverlayPermission(Landroid/content/Context;)Z",
             "    move-result v0",
@@ -3177,7 +2946,6 @@ def _generate_bridge_smali(spec: dict[str, Any]) -> str:
 def _generate_overlay_service_smali(spec: dict[str, Any]) -> str:
     widget_lines = _generate_widget_lines(spec, context_register="p1", container_register="v10")
     default_open = "0x0" if bool(spec.get("start_collapsed")) else "0x1"
-    restore_open_state = bool(spec.get("restore_open_state", False))
 
     return "\n".join([
         ".class public Lapkagi/menu/OverlayMenuService;",
@@ -3202,7 +2970,6 @@ def _generate_overlay_service_smali(spec: dict[str, Any]) -> str:
         "",
         ".method public onStartCommand(Landroid/content/Intent;II)I",
         "    .locals 1",
-        "    :apkagi_overlay_start_try_start",
         "    invoke-static {p0}, Lapkagi/menu/InAppMenuBridge;->hasOverlayPermission(Landroid/content/Context;)Z",
         "    move-result v0",
         "    if-eqz v0, :apkagi_overlay_no_permission",
@@ -3212,16 +2979,10 @@ def _generate_overlay_service_smali(spec: dict[str, Any]) -> str:
         ":apkagi_overlay_no_permission",
         "    const/4 v0, 0x2",
         "    return v0",
-        "    :apkagi_overlay_start_try_end",
-        "    .catch Ljava/lang/Throwable; {:apkagi_overlay_start_try_start .. :apkagi_overlay_start_try_end} :apkagi_overlay_start_catch",
-        ":apkagi_overlay_start_catch",
-        "    const/4 v0, 0x2",
-        "    return v0",
         ".end method",
         "",
         ".method public onDestroy()V",
         "    .locals 2",
-        "    :apkagi_overlay_destroy_try_start",
         "    iget-object v0, p0, Lapkagi/menu/OverlayMenuService;->overlayRoot:Landroid/view/View;",
         "    iget-object v1, p0, Lapkagi/menu/OverlayMenuService;->windowManager:Landroid/view/WindowManager;",
         "    if-eqz v0, :apkagi_overlay_destroy_super",
@@ -3232,11 +2993,6 @@ def _generate_overlay_service_smali(spec: dict[str, Any]) -> str:
         "    iput-object v0, p0, Lapkagi/menu/OverlayMenuService;->overlayRoot:Landroid/view/View;",
         "    iput-object v0, p0, Lapkagi/menu/OverlayMenuService;->windowManager:Landroid/view/WindowManager;",
         ":apkagi_overlay_destroy_super",
-        "    invoke-super {p0}, Landroid/app/Service;->onDestroy()V",
-        "    return-void",
-        "    :apkagi_overlay_destroy_try_end",
-        "    .catch Ljava/lang/Throwable; {:apkagi_overlay_destroy_try_start .. :apkagi_overlay_destroy_try_end} :apkagi_overlay_destroy_catch",
-        ":apkagi_overlay_destroy_catch",
         "    invoke-super {p0}, Landroid/app/Service;->onDestroy()V",
         "    return-void",
         ".end method",
@@ -3265,7 +3021,6 @@ def _generate_overlay_service_smali(spec: dict[str, Any]) -> str:
         "",
         ".method public updateOverlayPosition(II)V",
         "    .locals 3",
-        "    :apkagi_overlay_update_try_start",
         "    iget-object v0, p0, Lapkagi/menu/OverlayMenuService;->overlayParams:Landroid/view/WindowManager$LayoutParams;",
         "    iget-object v1, p0, Lapkagi/menu/OverlayMenuService;->windowManager:Landroid/view/WindowManager;",
         "    iget-object v2, p0, Lapkagi/menu/OverlayMenuService;->overlayRoot:Landroid/view/View;",
@@ -3278,15 +3033,10 @@ def _generate_overlay_service_smali(spec: dict[str, Any]) -> str:
         "    invoke-static {p0, p1, p2}, Lapkagi/menu/MenuActions;->rememberMenuPosition(Landroid/content/Context;II)V",
         ":apkagi_overlay_update_done",
         "    return-void",
-        "    :apkagi_overlay_update_try_end",
-        "    .catch Ljava/lang/Throwable; {:apkagi_overlay_update_try_start .. :apkagi_overlay_update_try_end} :apkagi_overlay_update_catch",
-        ":apkagi_overlay_update_catch",
-        "    return-void",
         ".end method",
         "",
         ".method public snapOverlayToEdge()V",
         "    .locals 8",
-        "    :apkagi_overlay_snap_try_start",
         "    iget-object v0, p0, Lapkagi/menu/OverlayMenuService;->overlayParams:Landroid/view/WindowManager$LayoutParams;",
         "    iget-object v1, p0, Lapkagi/menu/OverlayMenuService;->overlayRoot:Landroid/view/View;",
         "    if-eqz v0, :apkagi_overlay_snap_done",
@@ -3312,15 +3062,10 @@ def _generate_overlay_service_smali(spec: dict[str, Any]) -> str:
         "    invoke-virtual {p0, v3, v4}, Lapkagi/menu/OverlayMenuService;->updateOverlayPosition(II)V",
         ":apkagi_overlay_snap_done",
         "    return-void",
-        "    :apkagi_overlay_snap_try_end",
-        "    .catch Ljava/lang/Throwable; {:apkagi_overlay_snap_try_start .. :apkagi_overlay_snap_try_end} :apkagi_overlay_snap_catch",
-        ":apkagi_overlay_snap_catch",
-        "    return-void",
         ".end method",
         "",
         ".method private ensureOverlayShown()V",
         "    .locals 8",
-        "    :apkagi_overlay_ensure_try_start",
         "    iget-object v0, p0, Lapkagi/menu/OverlayMenuService;->overlayRoot:Landroid/view/View;",
         "    if-nez v0, :apkagi_overlay_done",
         '    const-string v0, "window"',
@@ -3364,10 +3109,6 @@ def _generate_overlay_service_smali(spec: dict[str, Any]) -> str:
         "    iput-object v7, p0, Lapkagi/menu/OverlayMenuService;->overlayParams:Landroid/view/WindowManager$LayoutParams;",
         "    invoke-interface {v0, v1, v7}, Landroid/view/WindowManager;->addView(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V",
         ":apkagi_overlay_done",
-        "    return-void",
-        "    :apkagi_overlay_ensure_try_end",
-        "    .catch Ljava/lang/Throwable; {:apkagi_overlay_ensure_try_start .. :apkagi_overlay_ensure_try_end} :apkagi_overlay_ensure_catch",
-        ":apkagi_overlay_ensure_catch",
         "    return-void",
         ".end method",
         "",
@@ -3495,7 +3236,6 @@ def inject_runtime_menu_scaffold(
     if include_default_helpers:
         helper_files = {
             "InAppMenuBridge.smali": _generate_bridge_smali(normalized_spec),
-            "MenuAttachRunnable.smali": _generate_attach_runnable_smali(),
             "MenuLifecycleCallbacks.smali": _generate_lifecycle_callbacks_smali(),
             "MenuActionClickListener.smali": _generate_click_listener_smali(),
             "MenuVisibilityClickListener.smali": _generate_visibility_listener_smali(),
@@ -3554,9 +3294,7 @@ def inject_runtime_menu_scaffold(
             "menu_title": normalized_spec["title"],
             "launcher_label": normalized_spec["launcher_label"],
             "start_collapsed": normalized_spec["start_collapsed"],
-            "delayed_attach_ms": normalized_spec["delayed_attach_ms"],
             "auto_reapply_actions": normalized_spec["auto_reapply_actions"],
-            "auto_start_overlay": normalized_spec["auto_start_overlay"],
             "restore_open_state": normalized_spec["restore_open_state"],
             "actions_generated": [button["id"] for button in normalized_spec["buttons"]],
             "control_types": normalized_spec["control_types"],
@@ -3588,7 +3326,6 @@ def inject_runtime_menu_scaffold(
     validations: list[dict[str, Any]] = []
     errors: list[str] = []
     bootstrap_targets: list[dict[str, Any]] = []
-    rolled_back_files: list[str] = []
 
     try:
         for relative_name, content in helper_files.items():
@@ -3663,9 +3400,6 @@ def inject_runtime_menu_scaffold(
     except Exception as exc:
         errors.append(str(exc))
 
-    if errors:
-        rolled_back_files = _rollback_runtime_menu_changes(touched_files, backed_up)
-
     return {
         "success": len(errors) == 0 and bool(touched_files),
         "requested_overlay_mode": requested_mode,
@@ -3675,9 +3409,7 @@ def inject_runtime_menu_scaffold(
         "menu_title": normalized_spec["title"],
         "launcher_label": normalized_spec["launcher_label"],
         "start_collapsed": normalized_spec["start_collapsed"],
-        "delayed_attach_ms": normalized_spec["delayed_attach_ms"],
         "auto_reapply_actions": normalized_spec["auto_reapply_actions"],
-        "auto_start_overlay": normalized_spec["auto_start_overlay"],
         "restore_open_state": normalized_spec["restore_open_state"],
         "actions_generated": [button["id"] for button in normalized_spec["buttons"]],
         "user_buttons": normalized_spec["user_buttons"],
@@ -3691,7 +3423,6 @@ def inject_runtime_menu_scaffold(
         "manifest_config": manifest_result,
         "helper_classes": [
             _BRIDGE_DESCRIPTOR,
-            _ATTACH_RUNNABLE_DESCRIPTOR,
             _CLICK_DESCRIPTOR,
             _VISIBILITY_DESCRIPTOR,
             _ACTIONS_DESCRIPTOR,
@@ -3704,9 +3435,8 @@ def inject_runtime_menu_scaffold(
             *([_OVERLAY_DRAG_DESCRIPTOR] if requested_mode in {"system_overlay", "hybrid"} else []),
         ],
         "bootstrap_targets": bootstrap_targets,
-        "files_modified": [] if rolled_back_files else sorted(touched_files),
+        "files_modified": sorted(touched_files),
         "rollback_files": list(backed_up.values()),
-        "rolled_back_files": rolled_back_files,
         "validation": validations,
         "recommended_next_tool": (
             "configure_runtime_menu_manifest"
