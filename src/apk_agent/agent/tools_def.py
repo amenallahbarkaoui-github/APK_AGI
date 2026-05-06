@@ -11606,7 +11606,7 @@ def build_smali_index() -> str:
         set_runtime_slot("smali_index", idx)
         out_path = _project_outputs_dir() / "smali_index.pickle"
         save_result = save_smali_idx(idx, out_path)
-        stats = index_stats(idx)
+        stats = index_stats(idx, apktool_dir=getattr(_project, "apktool_dir", None))
         stats["success"] = True
         stats["persisted"] = save_result.get("success", False)
         if not save_result.get("success", True):
@@ -11634,7 +11634,7 @@ def smali_index_stats() -> str:
         idx = _ensure_smali_index()
         if idx is None:
             return json.dumps({"success": False, "error": "No SmaliIndex. Run build_smali_index first."})
-        stats = index_stats(idx)
+        stats = index_stats(idx, apktool_dir=getattr(_project, "apktool_dir", None))
         stats["success"] = True
         return json.dumps(stats, indent=2)
     return _safe_call(_run, "smali_index_stats")

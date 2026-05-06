@@ -18,12 +18,12 @@ import os
 import pickle
 import re
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Any, Sequence
 
 from apk_agent.parallelism import recommended_file_scan_workers
 
@@ -48,7 +48,9 @@ class SmaliInstruction:
     is_field_access: bool = False
     target_class: str = ""              # for invoke-*: callee class  (Lcom/…;)
     target_method: str = ""             # for invoke-*: callee method name
+    target_return_type: str = ""        # for invoke-*: callee return type
     target_field: str = ""              # for *get/*put: field ref
+    target_field_type: str = ""         # for *get/*put: field descriptor
     string_value: str | None = None     # for const-string: the literal
     const_value: str | None = None      # for const/*: the numeric literal
     registers: list[str] = field(default_factory=list)  # all registers used
@@ -108,6 +110,9 @@ class SmaliMethod:
     complexity: int = 0       # branches + try/catch + switches
     category: str = "general" #  crypto / network / ssl_tls / storage / ipc / …
     basic_blocks: list[BasicBlock] = field(default_factory=list)  # CFG blocks
+    liveness_in: list[set[str]] = field(default_factory=list)
+    liveness_out: list[set[str]] = field(default_factory=list)
+    inferred_register_types: list[dict[str, str]] = field(default_factory=list)
 
     def build_cfg(self) -> list[BasicBlock]:
         """Build basic blocks and CFG edges from instructions.
@@ -137,8 +142,20 @@ class SmaliMethod:
                 if i + 1 < len(self.instructions):
                     leaders.add(i + 1)
 
+        for try_catch in self.try_catches:
+            start_idx = self.labels.get(try_catch.start_label)
+            end_idx = self.labels.get(try_catch.end_label)
+            handler_idx = self.labels.get(try_catch.handler_label)
+            if start_idx is not None:
+                leaders.add(start_idx)
+            if end_idx is not None and end_idx < len(self.instructions):
+                leaders.add(end_idx)
+            if handler_idx is not None:
+                leaders.add(handler_idx)
+
         sorted_leaders = sorted(leaders)
         leader_to_block: dict[int, int] = {}
+        instruction_to_block: dict[int, int] = {}
 
         blocks: list[BasicBlock] = []
         for bid, start in enumerate(sorted_leaders):
@@ -147,6 +164,8 @@ class SmaliMethod:
                             is_entry=(bid == 0))
             blocks.append(bb)
             leader_to_block[start] = bid
+            for instr_idx in range(start, end + 1):
+                instruction_to_block[instr_idx] = bid
 
         # Build edges
         for bb in blocks:
@@ -188,8 +207,109 @@ class SmaliMethod:
                     bb.successors.append(succ)
                     blocks[succ].predecessors.append(bb.id)
 
+        for try_catch in self.try_catches:
+            start_idx = self.labels.get(try_catch.start_label)
+            end_idx = self.labels.get(try_catch.end_label)
+            handler_idx = self.labels.get(try_catch.handler_label)
+            if start_idx is None or handler_idx is None:
+                continue
+
+            protected_end = end_idx if end_idx is not None else len(self.instructions)
+            handler_block = instruction_to_block.get(handler_idx)
+            if handler_block is None:
+                continue
+
+            for bb in blocks:
+                if bb.end_idx < start_idx or bb.start_idx >= protected_end:
+                    continue
+                if handler_block not in bb.successors:
+                    bb.successors.append(handler_block)
+                if bb.id not in blocks[handler_block].predecessors:
+                    blocks[handler_block].predecessors.append(bb.id)
+
         self.basic_blocks = blocks
         return blocks
+
+    def build_liveness(self) -> dict[str, list[set[str]]]:
+        """Compute register liveness at every instruction using the CFG."""
+        if not self.instructions:
+            self.liveness_in = []
+            self.liveness_out = []
+            return {"live_in": [], "live_out": []}
+
+        blocks = self.basic_blocks or self.build_cfg()
+        live_in = [set() for _ in self.instructions]
+        live_out = [set() for _ in self.instructions]
+
+        changed = True
+        while changed:
+            changed = False
+            for bb in reversed(blocks):
+                successor_live: set[str] = set()
+                for succ in bb.successors:
+                    successor_live.update(live_in[blocks[succ].start_idx])
+
+                current_live = set(successor_live)
+                for instr_idx in range(bb.end_idx, bb.start_idx - 1, -1):
+                    if current_live != live_out[instr_idx]:
+                        live_out[instr_idx] = set(current_live)
+                        changed = True
+
+                    reads, writes = _instruction_reads_writes(self.instructions[instr_idx])
+                    next_live = (current_live - writes) | reads
+                    if next_live != live_in[instr_idx]:
+                        live_in[instr_idx] = set(next_live)
+                        changed = True
+                    current_live = next_live
+
+        self.liveness_in = live_in
+        self.liveness_out = live_out
+        return {"live_in": live_in, "live_out": live_out}
+
+    def infer_register_types(self, owner_class: str = "") -> list[dict[str, str]]:
+        """Infer coarse register types across the method CFG."""
+        if not self.instructions:
+            self.inferred_register_types = []
+            return []
+
+        blocks = self.basic_blocks or self.build_cfg()
+        inferred = [dict() for _ in self.instructions]
+        block_entry: list[dict[str, str]] = [dict() for _ in blocks]
+        block_exit: list[dict[str, str]] = [dict() for _ in blocks]
+        initial_types = _initial_register_types(self, owner_class)
+
+        changed = True
+        while changed:
+            changed = False
+            for bb in blocks:
+                incoming_states = [block_exit[pred] for pred in bb.predecessors]
+                if bb.is_entry:
+                    incoming_states = [initial_types, *incoming_states]
+
+                entry_state = _merge_register_type_maps(incoming_states) if incoming_states else dict(block_entry[bb.id])
+                if entry_state != block_entry[bb.id]:
+                    block_entry[bb.id] = dict(entry_state)
+                    changed = True
+
+                current_state = dict(entry_state)
+                last_invoke_return = ""
+                for instr_idx in range(bb.start_idx, bb.end_idx + 1):
+                    current_state, last_invoke_return = _apply_type_transfer(
+                        self.instructions[instr_idx],
+                        current_state,
+                        last_invoke_return,
+                    )
+                    snapshot = dict(current_state)
+                    if inferred[instr_idx] != snapshot:
+                        inferred[instr_idx] = snapshot
+                        changed = True
+
+                if current_state != block_exit[bb.id]:
+                    block_exit[bb.id] = dict(current_state)
+                    changed = True
+
+        self.inferred_register_types = inferred
+        return inferred
 
 
 @dataclass
@@ -224,6 +344,8 @@ class SmaliIndex:
         self.methods: dict[str, SmaliMethod] = {}                 # full_sig   → SmaliMethod
         self.string_index: dict[str, list[tuple[str, int]]] = defaultdict(list)  # string → [(file, line), …]
         self.api_callers: dict[str, list[str]] = defaultdict(list)               # callee_sig → [caller_sig, …]
+        self.field_accessors: dict[str, list[str]] = defaultdict(list)           # field_ref  → [method_sig, …]
+        self.call_graph: dict[str, list[str]] = defaultdict(list)                # caller_sig → [callee_sig, …]
         self.class_hierarchy: dict[str, list[str]] = defaultdict(list)           # parent → [children]
         self.interface_implementors: dict[str, list[str]] = defaultdict(list)    # iface → [class, …]
         self.total_files: int = 0
@@ -260,6 +382,10 @@ class SmaliIndex:
                 results.extend(callers)
         return results
 
+    def find_field_accessors(self, field_ref: str) -> list[str]:
+        """Find methods that access a given field reference."""
+        return self.field_accessors.get(field_ref, [])
+
     def get_subclasses(self, class_name: str) -> list[str]:
         return self.class_hierarchy.get(class_name, [])
 
@@ -286,15 +412,20 @@ _RE_METHOD_HDR = re.compile(
 )
 _RE_ANNOTATION = re.compile(r"\.annotation\s+.*?(L[\w/$]+;)")
 _RE_INVOKE = re.compile(r"(L[\w/$]+;)->([\w<>$]+)\(")
+_RE_METHOD_REF = re.compile(r"(L[\w/$]+;)->([\w<>$]+)\((.*?)\)([^\s,}#]+)")
 _RE_CONST_STRING = re.compile(r'const-string(?:/jumbo)?\s+(\w+),\s*"((?:[^"\\]|\\.)*)"')
 _RE_CONST_NUM = re.compile(r"const(?:/4|/16|/high16)?\s+(\w+),\s*(.*?)$")
 _RE_REGISTER = re.compile(r"\b([vp]\d+)\b")
+_RE_REGISTER_RANGE = re.compile(r"\{([vp])(\d+)\s+\.\.\s+([vp])(\d+)\}")
 _RE_TRY_CATCH = re.compile(
     r"\.catch\s+(L[\w/$]+;|\.\.\.)\s+\{(\S+)\s+\.\.\s+(\S+)\}\s+(\S+)"
 )
 _RE_CATCHALL = re.compile(
     r"\.catchall\s+\{(\S+)\s+\.\.\s+(\S+)\}\s+(\S+)"
 )
+_RE_NEW_INSTANCE = re.compile(r"new-instance\s+\w+,\s*(L[\w/$]+;)")
+_RE_NEW_ARRAY = re.compile(r"new-array\s+\w+,\s+\w+,\s*(\[[^\s,}#]+)")
+_RE_CHECK_CAST = re.compile(r"check-cast\s+\w+,\s*(\[[^\s,}#]+|L[\w/$]+;)")
 
 # Opcode classification sets
 _INVOKE_OPCODES = frozenset({
@@ -364,6 +495,221 @@ _CATEGORY_PATTERNS: dict[str, re.Pattern] = {
     ),
 }
 
+_FRAMEWORK_HINTS: dict[str, tuple[str, ...]] = {
+    "okhttp": ("lokhttp3/", "okhttp"),
+    "retrofit": ("lretrofit2/", "retrofit"),
+    "gson": ("gson", "lgson/"),
+    "moshi": ("moshi", "lcom/squareup/moshi/"),
+    "firebase": ("firebase", "lcom/google/firebase/"),
+    "billing": ("billingclient", "launchbillingflow", "lcom/android/billingclient/"),
+    "revenuecat": ("revenuecat",),
+    "qonversion": ("qonversion",),
+    "room": ("androidx/room",),
+    "coroutines": ("kotlinx/coroutines",),
+    "compose": ("androidx/compose", "setcontent"),
+    "react_native": ("reactnative", "reactcontextbasejavamodule", "nativemodule"),
+    "flutter": ("flutter", "io/flutter"),
+    "webview": ("android/webkit/webview", "addjavascriptinterface"),
+    "glide": ("bumptech/glide",),
+    "xposed": ("xposed", "lsposed"),
+}
+
+
+def _expand_register_range(raw: str) -> list[str]:
+    """Expand invoke/range register lists like {v0 .. v3}."""
+    match = _RE_REGISTER_RANGE.search(raw)
+    if not match:
+        return []
+    start_prefix, start_idx, end_prefix, end_idx = match.groups()
+    if start_prefix != end_prefix:
+        return []
+    start = int(start_idx)
+    end = int(end_idx)
+    if end < start:
+        return []
+    return [f"{start_prefix}{idx}" for idx in range(start, end + 1)]
+
+
+def _register_sort_key(register: str) -> tuple[int, int, str]:
+    prefix_weight = 0 if register.startswith("v") else 1
+    try:
+        reg_num = int(register[1:])
+    except ValueError:
+        reg_num = -1
+    return prefix_weight, reg_num, register
+
+
+def _is_reference_descriptor(descriptor: str) -> bool:
+    return descriptor.startswith(("L", "["))
+
+
+def _merge_type_values(left: str, right: str) -> str:
+    if not left:
+        return right
+    if not right or left == right:
+        return left
+    if _is_reference_descriptor(left) and _is_reference_descriptor(right):
+        return "Ljava/lang/Object;"
+    return "unknown"
+
+
+def _merge_register_type_maps(states: list[dict[str, str]]) -> dict[str, str]:
+    merged: dict[str, str] = {}
+    for state in states:
+        for register, reg_type in state.items():
+            merged[register] = _merge_type_values(merged.get(register, ""), reg_type)
+    return merged
+
+
+def _instruction_reads_writes(instr: SmaliInstruction) -> tuple[set[str], set[str]]:
+    """Return coarse read/write register sets for one instruction."""
+    registers = list(dict.fromkeys(instr.registers))
+    if not registers:
+        return set(), set()
+
+    opcode = instr.opcode
+    if instr.is_invoke:
+        return set(registers), set()
+    if opcode in {"move-result", "move-result-wide", "move-result-object", "move-exception"}:
+        return set(), {registers[0]}
+    if opcode.startswith(("move", "array-length")):
+        return set(registers[1:]), {registers[0]}
+    if opcode.startswith("const") or opcode.startswith(("new-instance", "new-array")):
+        return set(registers[1:]), {registers[0]}
+    if opcode == "check-cast":
+        return {registers[0]}, {registers[0]}
+    if instr.is_return or opcode.startswith(("if-", "throw", "monitor-", "filled-new-array")):
+        return set(registers), set()
+
+    if instr.is_field_access:
+        if opcode.startswith(("sget",)):
+            return set(), {registers[0]}
+        if opcode.startswith(("sput",)):
+            return {registers[0]}, set()
+        if opcode.startswith(("iget",)):
+            reads = {registers[1]} if len(registers) > 1 else set()
+            return reads, {registers[0]}
+        if opcode.startswith(("iput",)):
+            reads = {registers[0]}
+            if len(registers) > 1:
+                reads.add(registers[1])
+            return reads, set()
+
+    if opcode.startswith((
+        "add", "sub", "mul", "div", "rem", "and", "or", "xor",
+        "shl", "shr", "ushr", "rsub", "neg", "not", "cmp",
+        "int-to", "long-to", "float-to", "double-to",
+    )):
+        return set(registers[1:]), {registers[0]}
+
+    return set(registers[1:]), {registers[0]}
+
+
+def _initial_register_types(method: SmaliMethod, owner_class: str) -> dict[str, str]:
+    """Seed register types from the method receiver and parameters."""
+    types: dict[str, str] = {}
+    param_slot = 0
+    if "static" not in method.access_flags:
+        types["p0"] = owner_class or "Ljava/lang/Object;"
+        param_slot = 1
+
+    for param in method.param_types:
+        if not param:
+            continue
+        types[f"p{param_slot}"] = param
+        param_slot += 2 if param in {"J", "D"} else 1
+
+    return types
+
+
+def _apply_type_transfer(
+    instr: SmaliInstruction,
+    current_state: dict[str, str],
+    last_invoke_return: str,
+) -> tuple[dict[str, str], str]:
+    """Apply one instruction's coarse type effect to the current state."""
+    next_state = dict(current_state)
+    reads, writes = _instruction_reads_writes(instr)
+    opcode = instr.opcode
+    registers = list(dict.fromkeys(instr.registers))
+    dest = registers[0] if registers else ""
+    next_invoke_return = ""
+
+    if instr.is_invoke:
+        return next_state, instr.target_return_type
+
+    if opcode == "move-exception" and dest:
+        next_state[dest] = "Ljava/lang/Throwable;"
+        return next_state, ""
+    if opcode == "move-result-object" and dest:
+        next_state[dest] = last_invoke_return or "Ljava/lang/Object;"
+        return next_state, ""
+    if opcode == "move-result-wide" and dest:
+        next_state[dest] = last_invoke_return or "J"
+        return next_state, ""
+    if opcode == "move-result" and dest:
+        next_state[dest] = last_invoke_return or "I"
+        return next_state, ""
+    if opcode.startswith("move-object") and len(registers) > 1:
+        next_state[dest] = next_state.get(registers[1], "Ljava/lang/Object;")
+        return next_state, ""
+    if opcode.startswith("move-wide") and len(registers) > 1:
+        next_state[dest] = next_state.get(registers[1], "J")
+        return next_state, ""
+    if opcode.startswith("move") and len(registers) > 1:
+        next_state[dest] = next_state.get(registers[1], "I")
+        return next_state, ""
+    if instr.string_value is not None and dest:
+        next_state[dest] = "Ljava/lang/String;"
+        return next_state, ""
+    if opcode == "const-class" and dest:
+        next_state[dest] = "Ljava/lang/Class;"
+        return next_state, ""
+    if opcode.startswith("const-wide") and dest:
+        next_state[dest] = "J"
+        return next_state, ""
+    if opcode.startswith("const") and dest:
+        next_state[dest] = "I"
+        return next_state, ""
+    if opcode.startswith("new-instance") and dest:
+        match = _RE_NEW_INSTANCE.search(instr.raw)
+        next_state[dest] = match.group(1) if match else "Ljava/lang/Object;"
+        return next_state, ""
+    if opcode.startswith("new-array") and dest:
+        match = _RE_NEW_ARRAY.search(instr.raw)
+        next_state[dest] = match.group(1) if match else "[Ljava/lang/Object;"
+        return next_state, ""
+    if opcode == "check-cast" and dest:
+        match = _RE_CHECK_CAST.search(instr.raw)
+        next_state[dest] = match.group(1) if match else next_state.get(dest, "Ljava/lang/Object;")
+        return next_state, ""
+
+    if instr.is_field_access and dest:
+        if opcode.startswith(("iget-object", "sget-object")):
+            next_state[dest] = instr.target_field_type or "Ljava/lang/Object;"
+        elif opcode.startswith(("iget-wide", "sget-wide")):
+            next_state[dest] = instr.target_field_type or "J"
+        elif opcode.startswith(("iget-boolean", "sget-boolean")):
+            next_state[dest] = "Z"
+        elif opcode.startswith(("iget-byte", "sget-byte")):
+            next_state[dest] = "B"
+        elif opcode.startswith(("iget-char", "sget-char")):
+            next_state[dest] = "C"
+        elif opcode.startswith(("iget-short", "sget-short")):
+            next_state[dest] = "S"
+        elif opcode.startswith(("iget", "sget")):
+            next_state[dest] = instr.target_field_type or "I"
+        return next_state, ""
+
+    if writes:
+        inferred_type = "I"
+        if reads:
+            source_reg = sorted(reads, key=_register_sort_key)[0]
+            inferred_type = next_state.get(source_reg, inferred_type)
+        next_state[dest] = inferred_type
+
+    return next_state, next_invoke_return
+
 
 # ---------------------------------------------------------------------------
 # Instruction parser
@@ -382,7 +728,8 @@ def _parse_instruction(raw_line: str, line_no: int) -> SmaliInstruction | None:
     opcode = parts[0]
     operand_str = parts[1] if len(parts) > 1 else ""
     operands = [o.strip() for o in operand_str.split(",") if o.strip()] if operand_str else []
-    registers = _RE_REGISTER.findall(stripped)
+    range_registers = _expand_register_range(stripped)
+    registers = range_registers or _RE_REGISTER.findall(stripped)
 
     instr = SmaliInstruction(
         opcode=opcode,
@@ -400,16 +747,18 @@ def _parse_instruction(raw_line: str, line_no: int) -> SmaliInstruction | None:
 
     # Extract target for invoke-*
     if instr.is_invoke:
-        m = _RE_INVOKE.search(stripped)
+        m = _RE_METHOD_REF.search(stripped)
         if m:
             instr.target_class = m.group(1)
             instr.target_method = m.group(2)
+            instr.target_return_type = m.group(4)
 
     # Extract field ref for *get/*put
     if instr.is_field_access:
-        m = re.search(r"(L[\w/$]+;)->([\w$]+):", stripped)
+        m = re.search(r"(L[\w/$]+;)->([\w$]+):([^\s,}#]+)", stripped)
         if m:
             instr.target_field = f"{m.group(1)}->{m.group(2)}"
+            instr.target_field_type = m.group(3)
 
     # Extract const-string value
     m = _RE_CONST_STRING.search(stripped)
@@ -669,7 +1018,7 @@ _PARSE_POOL = ThreadPoolExecutor(max_workers=recommended_file_scan_workers())
 
 
 def build_index(
-    smali_dirs: list[str | Path],
+    smali_dirs: Sequence[str | Path],
     progress_callback: Any | None = None,
 ) -> SmaliIndex:
     """Parse all smali files under *smali_dirs* and build a SmaliIndex.
@@ -750,8 +1099,286 @@ def _merge_class(index: SmaliIndex, cls: SmaliClass) -> None:
             index.string_index[s].append((cls.file_path, method.start_line))
 
         # API callers index
-        for api in method.api_calls:
+        for api in dict.fromkeys(method.api_calls):
             index.api_callers[api].append(method.full_signature)
+            index.call_graph[method.full_signature].append(api)
+
+        for field_ref in dict.fromkeys(
+            instr.target_field for instr in method.instructions if instr.target_field
+        ):
+            index.field_accessors[field_ref].append(method.full_signature)
+
+
+def _normalize_loaded_index(index: SmaliIndex) -> SmaliIndex:
+    """Backfill newer SmaliIndex/IR fields for older persisted pickles."""
+    if not hasattr(index, "classes"):
+        index.classes = {}
+    if not hasattr(index, "methods"):
+        index.methods = {}
+    if not hasattr(index, "string_index"):
+        index.string_index = defaultdict(list)
+    if not hasattr(index, "api_callers"):
+        index.api_callers = defaultdict(list)
+    if not hasattr(index, "field_accessors"):
+        index.field_accessors = defaultdict(list)
+    if not hasattr(index, "call_graph"):
+        index.call_graph = defaultdict(list)
+    if not hasattr(index, "class_hierarchy"):
+        index.class_hierarchy = defaultdict(list)
+    if not hasattr(index, "interface_implementors"):
+        index.interface_implementors = defaultdict(list)
+    if not hasattr(index, "total_files"):
+        index.total_files = 0
+    if not hasattr(index, "total_instructions"):
+        index.total_instructions = 0
+    if not hasattr(index, "built_at"):
+        index.built_at = 0.0
+
+    for cls in index.classes.values():
+        if not hasattr(cls, "fields"):
+            cls.fields = []
+        if not hasattr(cls, "methods"):
+            cls.methods = []
+        for method in cls.methods:
+            if not hasattr(method, "basic_blocks"):
+                method.basic_blocks = []
+            if not hasattr(method, "liveness_in"):
+                method.liveness_in = []
+            if not hasattr(method, "liveness_out"):
+                method.liveness_out = []
+            if not hasattr(method, "inferred_register_types"):
+                method.inferred_register_types = []
+            if not hasattr(method, "instructions"):
+                method.instructions = []
+            for instr in method.instructions:
+                if not hasattr(instr, "target_return_type"):
+                    instr.target_return_type = ""
+                if not hasattr(instr, "target_field_type"):
+                    instr.target_field_type = ""
+
+    _rebuild_auxiliary_indices(index)
+    return index
+
+
+def _rebuild_auxiliary_indices(index: SmaliIndex) -> None:
+    """Recompute derived indices from the loaded class/method graph."""
+    classes = getattr(index, "classes", {}) or {}
+    index.methods = {}
+    index.string_index = defaultdict(list)
+    index.api_callers = defaultdict(list)
+    index.field_accessors = defaultdict(list)
+    index.call_graph = defaultdict(list)
+    index.class_hierarchy = defaultdict(list)
+    index.interface_implementors = defaultdict(list)
+
+    total_instructions = 0
+    for cls in classes.values():
+        if cls.super_class:
+            index.class_hierarchy[cls.super_class].append(cls.name)
+        for iface in cls.interfaces:
+            index.interface_implementors[iface].append(cls.name)
+
+        for method in cls.methods:
+            index.methods[method.full_signature] = method
+            total_instructions += len(method.instructions)
+
+            for string_value in method.string_constants:
+                index.string_index[string_value].append((cls.file_path, method.start_line))
+
+            for api in dict.fromkeys(method.api_calls):
+                index.api_callers[api].append(method.full_signature)
+                index.call_graph[method.full_signature].append(api)
+
+            for field_ref in dict.fromkeys(
+                instr.target_field for instr in method.instructions if instr.target_field
+            ):
+                index.field_accessors[field_ref].append(method.full_signature)
+
+    index.total_files = len(classes)
+    index.total_instructions = total_instructions
+
+
+def _class_package(class_name: str) -> str:
+    cleaned = class_name[1:-1] if class_name.startswith("L") and class_name.endswith(";") else class_name
+    if "/" not in cleaned:
+        return ""
+    return cleaned.rsplit("/", 1)[0].replace("/", ".")
+
+
+def _class_simple_name(class_name: str) -> str:
+    cleaned = class_name[1:-1] if class_name.startswith("L") and class_name.endswith(";") else class_name
+    return cleaned.rsplit("/", 1)[-1].rsplit("$", 1)[-1]
+
+
+def _looks_obfuscated_token(token: str, *, allow_special: bool = False) -> bool:
+    if not token:
+        return False
+    if not allow_special and token in {"<init>", "<clinit>"}:
+        return False
+    cleaned = re.sub(r"[^A-Za-z0-9]", "", token)
+    if not cleaned:
+        return False
+    return len(cleaned) <= 2 or bool(re.fullmatch(r"[a-z]{1,3}\d?", cleaned))
+
+
+def _scan_native_files(apktool_dir: str | Path | None) -> tuple[list[str], list[str]]:
+    if not apktool_dir:
+        return [], []
+    apk_root = Path(apktool_dir)
+    lib_dir = apk_root / "lib"
+    if not lib_dir.is_dir():
+        return [], []
+
+    libs: list[str] = []
+    abis: set[str] = set()
+    for so_file in sorted(lib_dir.rglob("*.so")):
+        try:
+            libs.append(str(so_file.relative_to(apk_root)).replace("\\", "/"))
+        except ValueError:
+            libs.append(str(so_file))
+        if so_file.parent != lib_dir:
+            abis.add(so_file.parent.name)
+    return libs, sorted(abis)
+
+
+def _resolve_load_library_name(method: SmaliMethod, invoke_idx: int) -> str:
+    instr = method.instructions[invoke_idx]
+    if not instr.registers:
+        return ""
+    target_reg = instr.registers[0]
+    for prev_idx in range(invoke_idx - 1, -1, -1):
+        prev_instr = method.instructions[prev_idx]
+        reads, writes = _instruction_reads_writes(prev_instr)
+        if target_reg not in writes:
+            continue
+        if prev_instr.string_value is not None:
+            return prev_instr.string_value
+        break
+    return ""
+
+
+def _build_native_summary(index: SmaliIndex, apktool_dir: str | Path | None = None) -> dict[str, Any]:
+    declared_native_methods = sorted(
+        method.full_signature
+        for method in index.methods.values()
+        if "native" in method.access_flags
+    )
+    load_library_calls: list[dict[str, str]] = []
+    load_library_names: set[str] = set()
+    for method in index.methods.values():
+        for idx, instr in enumerate(method.instructions):
+            if not instr.is_invoke:
+                continue
+            if instr.target_class not in {"Ljava/lang/System;", "Ljava/lang/Runtime;"}:
+                continue
+            if instr.target_method not in {"loadLibrary", "load"}:
+                continue
+            library_name = _resolve_load_library_name(method, idx)
+            if library_name:
+                load_library_names.add(library_name)
+            load_library_calls.append({
+                "caller": method.full_signature,
+                "kind": instr.target_method,
+                "library": library_name,
+            })
+
+    native_libraries, native_abis = _scan_native_files(apktool_dir)
+    return {
+        "declared_native_method_count": len(declared_native_methods),
+        "declared_native_methods": declared_native_methods[:40],
+        "load_library_call_count": len(load_library_calls),
+        "load_library_calls": load_library_calls[:30],
+        "load_library_names": sorted(load_library_names),
+        "native_library_count": len(native_libraries),
+        "native_libraries": native_libraries[:50],
+        "native_abis": native_abis,
+    }
+
+
+def _collect_framework_hints(index: SmaliIndex, native_summary: dict[str, Any]) -> list[str]:
+    blobs: list[str] = []
+    for cls in index.classes.values():
+        blobs.append(" ".join([
+            cls.name,
+            cls.super_class,
+            " ".join(cls.interfaces),
+            cls.source_file,
+        ]).lower())
+        for method in cls.methods[:80]:
+            blobs.append(" ".join([
+                method.full_signature,
+                method.category,
+                " ".join(method.api_calls[:40]),
+                " ".join(method.string_constants[:20]),
+            ]).lower())
+
+    for lib_name in native_summary.get("native_libraries", []):
+        blobs.append(str(lib_name).lower())
+    for load_name in native_summary.get("load_library_names", []):
+        blobs.append(str(load_name).lower())
+
+    combined = "\n".join(blobs)
+    hints: list[str] = []
+    for framework, tokens in _FRAMEWORK_HINTS.items():
+        if any(token in combined for token in tokens):
+            hints.append(framework)
+    return sorted(hints)
+
+
+def _build_obfuscation_summary(index: SmaliIndex) -> dict[str, Any]:
+    class_tokens = [_class_simple_name(cls.name) for cls in index.classes.values()]
+    method_tokens = [method.name for method in index.methods.values()]
+    field_tokens = [field.name for cls in index.classes.values() for field in cls.fields]
+
+    obfuscated_classes = [token for token in class_tokens if _looks_obfuscated_token(token, allow_special=True)]
+    obfuscated_methods = [token for token in method_tokens if _looks_obfuscated_token(token)]
+    obfuscated_fields = [token for token in field_tokens if _looks_obfuscated_token(token, allow_special=True)]
+
+    total_symbols = len(class_tokens) + len(method_tokens) + len(field_tokens)
+    obfuscated_symbols = len(obfuscated_classes) + len(obfuscated_methods) + len(obfuscated_fields)
+    obfuscated_pct = int(obfuscated_symbols / max(total_symbols, 1) * 100)
+
+    level = "none"
+    if obfuscated_pct >= 50:
+        level = "heavy"
+    elif obfuscated_pct >= 20:
+        level = "moderate"
+    elif obfuscated_pct >= 5:
+        level = "light"
+
+    return {
+        "level": level,
+        "obfuscated_symbol_pct": obfuscated_pct,
+        "obfuscated_classes": len(obfuscated_classes),
+        "obfuscated_methods": len(obfuscated_methods),
+        "obfuscated_fields": len(obfuscated_fields),
+    }
+
+
+def _build_semantic_summary(index: SmaliIndex, apktool_dir: str | Path | None = None) -> dict[str, Any]:
+    native_summary = _build_native_summary(index, apktool_dir=apktool_dir)
+    framework_hints = _collect_framework_hints(index, native_summary)
+    obfuscation_summary = _build_obfuscation_summary(index)
+
+    package_counts = Counter(
+        package for package in (_class_package(class_name) for class_name in index.classes) if package
+    )
+    total_fields = sum(len(cls.fields) for cls in index.classes.values())
+    call_edge_count = sum(len(dict.fromkeys(callees)) for callees in index.call_graph.values())
+    field_access_edge_count = sum(len(dict.fromkeys(accessors)) for accessors in index.field_accessors.values())
+
+    return {
+        "total_fields": total_fields,
+        "total_call_graph_edges": call_edge_count,
+        "total_field_access_edges": field_access_edge_count,
+        "top_packages": [
+            {"package": package, "class_count": count}
+            for package, count in package_counts.most_common(12)
+        ],
+        "framework_hints": framework_hints,
+        "native_summary": native_summary,
+        "obfuscation_summary": obfuscation_summary,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -800,24 +1427,37 @@ def load_index(index_path: str | Path) -> SmaliIndex | None:
         return None
     try:
         with open(p, "rb") as f:
-            return pickle.load(f)
+            loaded = pickle.load(f)
+            if isinstance(loaded, SmaliIndex):
+                return _normalize_loaded_index(loaded)
+            return None
     except Exception:
         return None
 
 
-def index_stats(index: SmaliIndex) -> dict:
+def index_stats(index: SmaliIndex, *, apktool_dir: str | Path | None = None) -> dict:
     """Return a human-readable stats summary of the index."""
+    index = _normalize_loaded_index(index)
     categories: dict[str, int] = defaultdict(int)
     for m in index.methods.values():
         categories[m.category] += 1
+
+    semantic_summary = _build_semantic_summary(index, apktool_dir=apktool_dir)
 
     return {
         "total_classes": len(index.classes),
         "total_methods": len(index.methods),
         "total_instructions": index.total_instructions,
+        "total_fields": semantic_summary["total_fields"],
         "total_strings": len(index.string_index),
         "total_api_targets": len(index.api_callers),
+        "total_call_graph_edges": semantic_summary["total_call_graph_edges"],
+        "total_field_access_edges": semantic_summary["total_field_access_edges"],
         "method_categories": dict(sorted(categories.items(), key=lambda x: -x[1])),
         "hierarchy_roots": sum(1 for v in index.class_hierarchy.values() if v),
+        "framework_hints": semantic_summary["framework_hints"],
+        "native_summary": semantic_summary["native_summary"],
+        "obfuscation_summary": semantic_summary["obfuscation_summary"],
+        "semantic_summary": semantic_summary,
         "built_at": index.built_at,
     }

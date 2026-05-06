@@ -16,6 +16,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Sequence
 
 from apk_agent.parallelism import recommended_file_scan_workers
 from apk_agent.progress import report_progress
@@ -646,7 +647,7 @@ def batch_read_methods(
 
 def smart_search(
     query: str,
-    base_dirs: list[Path] | None = None,
+    base_dirs: Sequence[str | Path] | None = None,
     search_type: str = "code",
     max_results: int = 30,
     exclude_packages: bool = True,
