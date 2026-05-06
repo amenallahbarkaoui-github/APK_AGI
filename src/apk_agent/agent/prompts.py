@@ -680,6 +680,7 @@ sign_apk            ← sign with debug key (installable)
 `apktool_build()` takes NO arguments. Do NOT invent `/force build`, `force=true`, `rebuild=true`, or `clean=true`.
 The tool already does a force rebuild internally by clearing apktool's build cache and invoking apktool with `--force-all`.
 If `apktool_build()` fails: read the error, check for smali syntax issues with `validate_patch`, fix and retry by calling `apktool_build()` again.
+If the build error mentions `Too many method references`, `DexIndexOverflow`, `method ID not in [0, 0xffff]`, or another unsigned-short overflow, do NOT waste time chasing syntax bugs first. Treat it as DEX 64K limit overflow: reduce newly added helper classes and methods, reuse existing injection points, avoid optional runtime-menu scaffolding, or shift additive helpers to another dex before retrying.
 If `sign_apk()` fails or the produced signature still looks invalid after one focused retry, stop the signing loop and hand off `patched-aligned.apk` or `patched-unsigned.apk` for manual signing.
 
 **6c. POST-BUILD SANITY CHECK (mandatory — do NOT skip):**
@@ -767,12 +768,18 @@ Most production APKs are obfuscated (ProGuard/R8/DexGuard). Expect this and plan
 
 Large apps have multiple DEX files → multiple `smali_classesN` directories.
 
+**Technical problem to remember:** multi-dex extraction does NOT remove the per-dex 64K method-reference ceiling.
+If you keep injecting helper-heavy scaffolds into one crowded dex, apktool/d8 can fail with `Too many method references`, `DexIndexOverflow`, `method ID not in [0, 0xffff]`, or similar unsigned-short overflow errors.
+
 ### Strategy:
 - `apktool_decompile` extracts ALL DEX files into `smali/`, `smali_classes2/`, `smali_classes3/`, etc.
 - ALL tools automatically scan ALL smali directories — you don't need to specify which one.
 - `graph_stats` shows which DEX has the most app code (vs library code).
 - When patching, the tool resolves the correct smali directory automatically.
 - `find_entry_points` scans all DEX files to find the Application class and activities.
+- Prefer the smallest additive footprint that solves the problem: patch existing app classes before generating new wrapper/helper classes.
+- Do NOT spray duplicate bridges, menu helpers, adapter classes, or one-off dispatchers into a hot dex just because it is convenient.
+- If optional runtime UI or helper injection would push method-reference pressure higher, prefer a lighter static/root-cause patch or move additive helpers to a less crowded `smali_classesN` dex when the tooling supports it.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ## 7. ENCRYPTED API PAYLOADS — TOP-DOWN NETWORK TRACING
@@ -1162,6 +1169,7 @@ Evidence survives compaction. Your memory does NOT.
    - "Unknown opcode" → typo in instruction name
    - "Unclosed method" → missing .end method
    - "Type mismatch" → return type doesn't match method signature
+   - "Too many method references" / "DexIndexOverflow" / "method ID not in [0, 0xffff]" → DEX 64K limit overflow; shrink injected helper footprint, avoid duplicate wrappers, and relocate optional additive helpers out of the crowded dex when possible
 5. Revert: write_file(backup_content) and re-apply with fixes
 ```
 
