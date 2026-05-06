@@ -463,7 +463,9 @@ def _normalize_menu_spec(spec: dict[str, Any], overlay_mode: str) -> dict[str, A
     default_persist = bool(spec.get("persist_on_resume", True))
     title = str(spec.get("title") or spec.get("menu_title") or "APK AGI MOD MENU").strip() or "APK AGI MOD MENU"
     launcher_label = str(spec.get("launcher_label") or spec.get("floating_icon_label") or spec.get("bubble_label") or "MOD").strip() or "MOD"
-    start_collapsed = bool(spec.get("start_collapsed", False))
+    start_collapsed = bool(spec.get("start_collapsed", True))
+    auto_reapply_actions = bool(spec.get("auto_reapply_actions", False))
+    restore_open_state = bool(spec.get("restore_open_state", False))
     target_smali_root = normalize_smali_root_name(
         spec.get("target_smali_root") or spec.get("helper_smali_root") or spec.get("target_dex_root") or "auto"
     )
@@ -497,6 +499,8 @@ def _normalize_menu_spec(spec: dict[str, Any], overlay_mode: str) -> dict[str, A
         "title": title,
         "launcher_label": launcher_label,
         "start_collapsed": start_collapsed,
+        "auto_reapply_actions": auto_reapply_actions,
+        "restore_open_state": restore_open_state,
         "target_smali_root": target_smali_root,
         "buttons": normalized_buttons,
         "hook_bindings": hook_bindings,
@@ -2681,13 +2685,15 @@ def _generate_bridge_smali(spec: dict[str, Any]) -> str:
     overlay_mode = str(spec.get("overlay_mode") or "in_app")
     include_in_app = overlay_mode in {"in_app", "hybrid"}
     include_system_overlay = overlay_mode in {"system_overlay", "hybrid"}
+    auto_reapply_actions = bool(spec.get("auto_reapply_actions", False))
+    restore_open_state = bool(spec.get("restore_open_state", False))
     widget_lines = _generate_widget_lines(spec, context_register="p0", container_register="v12")
     default_open = "0x0" if bool(spec.get("start_collapsed")) else "0x1"
 
     install_lines: list[str] = [
         "    if-eqz p0, :apkagi_install_done",
     ]
-    if not include_in_app:
+    if auto_reapply_actions and not include_in_app:
         install_lines.append("    invoke-static {p0}, Lapkagi/menu/MenuActions;->reapplyEnabled(Landroid/content/Context;)V")
     if include_system_overlay:
         install_lines.append("    invoke-static {p0}, Lapkagi/menu/InAppMenuBridge;->ensureSystemOverlay(Landroid/content/Context;)V")
@@ -2756,7 +2762,9 @@ def _generate_bridge_smali(spec: dict[str, Any]) -> str:
         ".method private static attachUnsafe(Landroid/app/Activity;)V",
         "    .locals 15",
         "    if-eqz p0, :apkagi_attach_done",
-        "    invoke-static {p0}, Lapkagi/menu/MenuActions;->reapplyEnabled(Landroid/content/Context;)V",
+        *([
+            "    invoke-static {p0}, Lapkagi/menu/MenuActions;->reapplyEnabled(Landroid/content/Context;)V",
+        ] if auto_reapply_actions else []),
         "    const v0, 0x1020002",
         "    invoke-virtual {p0, v0}, Landroid/app/Activity;->findViewById(I)Landroid/view/View;",
         "    move-result-object v0",
@@ -2824,9 +2832,13 @@ def _generate_bridge_smali(spec: dict[str, Any]) -> str:
         "    invoke-virtual {v7, v9}, Landroid/widget/LinearLayout;->addView(Landroid/view/View;)V",
         "    invoke-virtual {v12, v7}, Landroid/widget/LinearLayout;->addView(Landroid/view/View;)V",
         *widget_lines,
-        f"    const/4 v10, {default_open}",
-        "    invoke-static {p0, v10}, Lapkagi/menu/MenuActions;->isMenuOpen(Landroid/content/Context;Z)Z",
-        "    move-result v10",
+        *([
+            f"    const/4 v10, {default_open}",
+            "    invoke-static {p0, v10}, Lapkagi/menu/MenuActions;->isMenuOpen(Landroid/content/Context;Z)Z",
+            "    move-result v10",
+        ] if restore_open_state else [
+            f"    const/4 v10, {default_open}",
+        ]),
         "    if-eqz v10, :apkagi_attach_collapsed",
         "    const/16 v11, 0x8",
         "    invoke-virtual {v3, v11}, Landroid/view/View;->setVisibility(I)V",
@@ -2934,6 +2946,7 @@ def _generate_bridge_smali(spec: dict[str, Any]) -> str:
 def _generate_overlay_service_smali(spec: dict[str, Any]) -> str:
     widget_lines = _generate_widget_lines(spec, context_register="p1", container_register="v10")
     default_open = "0x0" if bool(spec.get("start_collapsed")) else "0x1"
+    restore_open_state = bool(spec.get("restore_open_state", False))
 
     return "\n".join([
         ".class public Lapkagi/menu/OverlayMenuService;",
@@ -3161,9 +3174,13 @@ def _generate_overlay_service_smali(spec: dict[str, Any]) -> str:
         "    invoke-virtual {v11, v9}, Landroid/widget/LinearLayout;->addView(Landroid/view/View;)V",
         "    invoke-virtual {v10, v11}, Landroid/widget/LinearLayout;->addView(Landroid/view/View;)V",
         *widget_lines,
-        f"    const/4 v12, {default_open}",
-        "    invoke-static {p1, v12}, Lapkagi/menu/MenuActions;->isMenuOpen(Landroid/content/Context;Z)Z",
-        "    move-result v12",
+        *([
+            f"    const/4 v12, {default_open}",
+            "    invoke-static {p1, v12}, Lapkagi/menu/MenuActions;->isMenuOpen(Landroid/content/Context;Z)Z",
+            "    move-result v12",
+        ] if restore_open_state else [
+            f"    const/4 v12, {default_open}",
+        ]),
         "    if-eqz v12, :apkagi_overlay_view_collapsed",
         "    const/16 v13, 0x8",
         "    invoke-virtual {v3, v13}, Landroid/view/View;->setVisibility(I)V",
@@ -3278,6 +3295,8 @@ def inject_runtime_menu_scaffold(
             "menu_title": normalized_spec["title"],
             "launcher_label": normalized_spec["launcher_label"],
             "start_collapsed": normalized_spec["start_collapsed"],
+            "auto_reapply_actions": normalized_spec["auto_reapply_actions"],
+            "restore_open_state": normalized_spec["restore_open_state"],
             "actions_generated": [button["id"] for button in normalized_spec["buttons"]],
             "control_types": normalized_spec["control_types"],
             "section_count": normalized_spec["section_count"],
@@ -3295,7 +3314,7 @@ def inject_runtime_menu_scaffold(
             } if manifest_followup_required else {"task": "runtime menu scaffold and controls"},
             "notes": [
                 "Dry run only: no smali files or bootstrap hooks were written.",
-                "The current implementation generates a floating launcher bubble, remembered open/close state, section headers, and direct dispatcher bindings for runtime hooks.",
+                "The current implementation generates a floating launcher bubble, starts collapsed by default, and keeps runtime actions passive unless the spec explicitly enables auto-reapply or open-state restore.",
                 "custom_helper_files can override generated helpers or replace the whole helper set when include_default_helpers=false.",
                 "When target_smali_root is omitted, helper placement stays dex-aware but startup-bootstrapped helpers are co-located with the resolved startup entry root to avoid early launch class-loading crashes.",
                 "Overlay-based modes expect manifest/service wiring as part of a successful deployment path.",
@@ -3391,6 +3410,8 @@ def inject_runtime_menu_scaffold(
         "menu_title": normalized_spec["title"],
         "launcher_label": normalized_spec["launcher_label"],
         "start_collapsed": normalized_spec["start_collapsed"],
+        "auto_reapply_actions": normalized_spec["auto_reapply_actions"],
+        "restore_open_state": normalized_spec["restore_open_state"],
         "actions_generated": [button["id"] for button in normalized_spec["buttons"]],
         "user_buttons": normalized_spec["user_buttons"],
         "persistent_buttons": normalized_spec["persistent_buttons"],
