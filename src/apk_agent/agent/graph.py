@@ -266,6 +266,7 @@ def agent_node(state: AgentState) -> dict:
                     "- Native RE core: analyze_native_re_core, plan_native_patch_targets for ELF/JNI/import/export/function-anchor recovery\n"
                     "- Validation: validate_patch, diff_patched_file, validate_patch_pipeline, generate_runtime_validation_plan\n"
                     "- Architecture recovery: map_semantic_architecture, recover_hidden_state_model, profile_guard_and_revalidation_surface, find_enforcement_surfaces, semantic_method_slice\n"
+                    "- Source-of-truth inference: build_source_of_truth_pack, summarize_source_of_truth, query_source_of_truth for probabilistic authority labels, patch-target advisories, authority propagation routes, and lifecycle windows\n"
                     "- Flutter/Dart AOT: analyze_dart_aot, build_dart_aot_index, locate_dart_aot_candidates for libapp.so anchor recovery before bounded native patching\n"
                     "- Routing: route_reverse_engineering_workflow to classify the current app into java/native/flutter/unity/react-native/dynamic-loader workflows before diving in\n"
                     "- Task planning: update_task_plan, update_execution_plan, edit_task_plan, mark_task_done, set_active_plan_task, record_plan_outcome, get_execution_plan_status to keep an adaptive task tree and update it as work progresses\n"
@@ -721,6 +722,9 @@ _STRATEGIC_ANALYSIS_TOOLS = frozenset({
     "build_behavior_graph",
     "summarize_behavior_graph",
     "query_behavior_graph",
+    "build_source_of_truth_pack",
+    "summarize_source_of_truth",
+    "query_source_of_truth",
     "locate_feature_controls",
     "recover_state_transitions",
     "map_security_surfaces",

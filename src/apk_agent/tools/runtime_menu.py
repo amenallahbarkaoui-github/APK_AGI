@@ -53,6 +53,11 @@ _BOOTSTRAP_MARKER = "# APK-AGI: RUNTIME MENU BOOTSTRAP"
 _MENU_PREFS_NAME = "apkagi_runtime_menu"
 _RESET_ACTION_ID = "__apkagi_reset_runtime_menu"
 _RESET_ACTION_LABEL = "Reset Runtime Actions"
+_MENU_HELPER_SECTION_TITLE = "Menu Tools"
+_RESET_POSITION_ACTION_ID = "__apkagi_reset_menu_position"
+_REQUEST_OVERLAY_ACCESS_ACTION_ID = "__apkagi_request_overlay_access"
+_OPEN_OVERLAY_SETTINGS_ACTION_ID = "__apkagi_open_overlay_settings"
+_RESTART_OVERLAY_SERVICE_ACTION_ID = "__apkagi_restart_overlay_service"
 _SUPPORTED_OVERLAY_MODES = {"in_app", "system_overlay", "hybrid"}
 _SUPPORTED_UI_KINDS = {"button", "toggle", "slider"}
 _SUPPORTED_ACTION_KINDS = {"shared_pref", "static_field", "invoke_static", "dispatcher"}
@@ -346,6 +351,88 @@ def _default_persist_for_action(kind: str, *, spec_default: bool) -> bool:
     return spec_default if kind == "shared_pref" else False
 
 
+def _is_generated_helper_action(action: dict[str, Any]) -> bool:
+    return bool(action.get("generated_helper", False))
+
+
+def _is_internal_action_kind(kind: str) -> bool:
+    return str(kind or "").startswith("internal_")
+
+
+def _helper_button_entry(
+    action_id: str,
+    label: str,
+    *,
+    kind: str,
+    section: str,
+    success_message: str,
+) -> dict[str, Any]:
+    return {
+        "id": action_id,
+        "label": label,
+        "ui_kind": "button",
+        "kind": kind,
+        "section": section,
+        "persist_on_resume": False,
+        "success_message": success_message,
+        "generated_helper": True,
+    }
+
+
+def _append_builtin_helper_buttons(
+    normalized_buttons: list[dict[str, Any]],
+    *,
+    runtime_settings: dict[str, Any],
+    overlay_mode: str,
+) -> None:
+    if not bool(runtime_settings.get("include_helper_actions", True)):
+        return
+
+    helper_section = str(runtime_settings.get("helper_section_title") or _MENU_HELPER_SECTION_TITLE).strip() or _MENU_HELPER_SECTION_TITLE
+    existing_ids = {str(button.get("id") or "") for button in normalized_buttons}
+
+    helper_entries: list[dict[str, Any]] = []
+    if overlay_mode in {"system_overlay", "hybrid"}:
+        if bool(runtime_settings.get("add_overlay_permission_button", False)) and _REQUEST_OVERLAY_ACCESS_ACTION_ID not in existing_ids:
+            helper_entries.append(_helper_button_entry(
+                _REQUEST_OVERLAY_ACCESS_ACTION_ID,
+                "Grant Overlay Permission / Start Overlay",
+                kind="internal_overlay_grant",
+                section=helper_section,
+                success_message="Overlay helper launched",
+            ))
+            existing_ids.add(_REQUEST_OVERLAY_ACCESS_ACTION_ID)
+        if bool(runtime_settings.get("add_overlay_settings_button", False)) and _OPEN_OVERLAY_SETTINGS_ACTION_ID not in existing_ids:
+            helper_entries.append(_helper_button_entry(
+                _OPEN_OVERLAY_SETTINGS_ACTION_ID,
+                "Open Overlay Settings",
+                kind="internal_overlay_settings",
+                section=helper_section,
+                success_message="Overlay settings opened",
+            ))
+            existing_ids.add(_OPEN_OVERLAY_SETTINGS_ACTION_ID)
+        if bool(runtime_settings.get("add_restart_overlay_button", False)) and _RESTART_OVERLAY_SERVICE_ACTION_ID not in existing_ids:
+            helper_entries.append(_helper_button_entry(
+                _RESTART_OVERLAY_SERVICE_ACTION_ID,
+                "Restart Overlay Service",
+                kind="internal_restart_overlay",
+                section=helper_section,
+                success_message="Overlay service restart requested",
+            ))
+            existing_ids.add(_RESTART_OVERLAY_SERVICE_ACTION_ID)
+
+    if bool(runtime_settings.get("add_reset_position_button", False)) and _RESET_POSITION_ACTION_ID not in existing_ids:
+        helper_entries.append(_helper_button_entry(
+            _RESET_POSITION_ACTION_ID,
+            "Reset Menu Position",
+            kind="internal_reset_position",
+            section=helper_section,
+            success_message="Stored menu position reset",
+        ))
+
+    normalized_buttons.extend(helper_entries)
+
+
 def _normalize_action(raw_action: dict[str, Any], index: int, default_persist: bool) -> dict[str, Any]:
     if not isinstance(raw_action, dict):
         raise ValueError(f"buttons[{index}] must be a JSON object")
@@ -501,6 +588,36 @@ def _normalize_menu_runtime_settings(spec: dict[str, Any], overlay_mode: str) ->
         )
     )
     auto_start_overlay = bool(raw_settings.get("auto_start_overlay", spec.get("auto_start_overlay", False)))
+    include_helper_actions = bool(raw_settings.get("include_helper_actions", spec.get("include_helper_actions", True)))
+    helper_section_title = str(
+        raw_settings.get("helper_section_title", spec.get("helper_section_title", _MENU_HELPER_SECTION_TITLE))
+        or _MENU_HELPER_SECTION_TITLE
+    ).strip() or _MENU_HELPER_SECTION_TITLE
+    overlay_helper_default = include_helper_actions and overlay_mode in {"system_overlay", "hybrid"}
+    add_reset_position_button = bool(
+        raw_settings.get(
+            "add_reset_position_button",
+            spec.get("add_reset_position_button", include_helper_actions),
+        )
+    ) if include_helper_actions else False
+    add_overlay_permission_button = bool(
+        raw_settings.get(
+            "add_overlay_permission_button",
+            spec.get("add_overlay_permission_button", overlay_helper_default),
+        )
+    ) if overlay_helper_default else False
+    add_overlay_settings_button = bool(
+        raw_settings.get(
+            "add_overlay_settings_button",
+            spec.get("add_overlay_settings_button", overlay_helper_default),
+        )
+    ) if overlay_helper_default else False
+    add_restart_overlay_button = bool(
+        raw_settings.get(
+            "add_restart_overlay_button",
+            spec.get("add_restart_overlay_button", overlay_helper_default),
+        )
+    ) if overlay_helper_default else False
 
     return {
         "attach_delay_ms": attach_delay_ms,
@@ -510,6 +627,12 @@ def _normalize_menu_runtime_settings(spec: dict[str, Any], overlay_mode: str) ->
         "overlay_fallback_on_attach_failure": overlay_fallback_on_attach_failure,
         "request_overlay_permission_on_fallback": request_overlay_permission_on_fallback,
         "auto_start_overlay": auto_start_overlay,
+        "include_helper_actions": include_helper_actions,
+        "helper_section_title": helper_section_title,
+        "add_reset_position_button": add_reset_position_button,
+        "add_overlay_permission_button": add_overlay_permission_button,
+        "add_overlay_settings_button": add_overlay_settings_button,
+        "add_restart_overlay_button": add_restart_overlay_button,
     }
 
 
@@ -561,6 +684,12 @@ def _normalize_menu_spec(spec: dict[str, Any], overlay_mode: str) -> dict[str, A
         [binding for binding in list(spec.get("hook_bindings") or []) if isinstance(binding, dict)],
     )
 
+    _append_builtin_helper_buttons(
+        normalized_buttons,
+        runtime_settings=runtime_settings,
+        overlay_mode=chosen_mode,
+    )
+
     has_persistent = any(button.get("persist_on_resume") for button in normalized_buttons)
     if has_persistent:
         normalized_buttons.append({
@@ -571,6 +700,8 @@ def _normalize_menu_spec(spec: dict[str, Any], overlay_mode: str) -> dict[str, A
             "persist_on_resume": False,
             "success_message": "Runtime menu state reset",
         })
+
+    visible_buttons = [button for button in normalized_buttons if not _is_generated_helper_action(button)]
 
     return {
         "overlay_mode": chosen_mode,
@@ -594,8 +725,12 @@ def _normalize_menu_spec(spec: dict[str, Any], overlay_mode: str) -> dict[str, A
         "include_default_helpers": include_default_helpers,
         "user_buttons": len(buttons_raw),
         "persistent_buttons": sum(1 for button in normalized_buttons if button.get("persist_on_resume")),
-        "section_count": len({button.get("section", "") for button in normalized_buttons if button.get("section")}),
-        "control_types": sorted({button.get("ui_kind", "button") for button in normalized_buttons if button.get("kind") != "internal_reset"}),
+        "section_count": len({button.get("section", "") for button in visible_buttons if button.get("section")}),
+        "control_types": sorted({
+            button.get("ui_kind", "button")
+            for button in visible_buttons
+            if not _is_internal_action_kind(str(button.get("kind") or ""))
+        }),
     }
 
 
@@ -1820,6 +1955,14 @@ def _button_action_lines(action: dict[str, Any]) -> list[str]:
         return _dispatcher_action_lines(action)
     if kind == "internal_reset":
         return ["    invoke-static {p0}, Lapkagi/menu/MenuActions;->resetControls(Landroid/content/Context;)V"]
+    if kind == "internal_reset_position":
+        return ["    invoke-static {p0}, Lapkagi/menu/MenuActions;->resetMenuPosition(Landroid/content/Context;)V"]
+    if kind == "internal_overlay_grant":
+        return ["    invoke-static {p0}, Lapkagi/menu/InAppMenuBridge;->requestOverlayAccessOrStart(Landroid/content/Context;)V"]
+    if kind == "internal_overlay_settings":
+        return ["    invoke-static {p0}, Lapkagi/menu/InAppMenuBridge;->openOverlaySettings(Landroid/content/Context;)V"]
+    if kind == "internal_restart_overlay":
+        return ["    invoke-static {p0}, Lapkagi/menu/InAppMenuBridge;->restartSystemOverlay(Landroid/content/Context;)V"]
     raise ValueError(f"Unsupported runtime-menu action kind: {kind}")
 
 
@@ -2145,6 +2288,24 @@ def _generate_actions_smali(spec: dict[str, Any]) -> str:
         "    invoke-interface {v0, v1, p1}, Landroid/content/SharedPreferences;->getInt(Ljava/lang/String;I)I",
         "    move-result v0",
         "    return v0",
+        ".end method",
+        "",
+        ".method public static resetMenuPosition(Landroid/content/Context;)V",
+        "    .locals 3",
+        "    if-eqz p0, :apkagi_reset_menu_position_done",
+        "    invoke-static {p0}, Lapkagi/menu/MenuActions;->prefs(Landroid/content/Context;)Landroid/content/SharedPreferences;",
+        "    move-result-object v0",
+        "    invoke-interface {v0}, Landroid/content/SharedPreferences;->edit()Landroid/content/SharedPreferences$Editor;",
+        "    move-result-object v0",
+        f'    const-string v1, "{_menu_left_key()}"',
+        "    invoke-interface {v0, v1}, Landroid/content/SharedPreferences$Editor;->remove(Ljava/lang/String;)Landroid/content/SharedPreferences$Editor;",
+        "    move-result-object v0",
+        f'    const-string v1, "{_menu_top_key()}"',
+        "    invoke-interface {v0, v1}, Landroid/content/SharedPreferences$Editor;->remove(Ljava/lang/String;)Landroid/content/SharedPreferences$Editor;",
+        "    move-result-object v0",
+        "    invoke-interface {v0}, Landroid/content/SharedPreferences$Editor;->apply()V",
+        ":apkagi_reset_menu_position_done",
+        "    return-void",
         ".end method",
         "",
         ".method public static resetControls(Landroid/content/Context;)V",
@@ -3738,7 +3899,7 @@ def inject_runtime_menu_scaffold(
                 add_overlay_permission=True,
                 require_foreground_service=effective_foreground_service,
             )
-            manifest_auto_configured = True
+            manifest_auto_configured = bool(manifest_result.get("success"))
             if manifest_result.get("success"):
                 manifest_file = str(manifest_result.get("manifest_file") or "")
                 if manifest_file:
@@ -3901,6 +4062,9 @@ def configure_runtime_menu_manifest(
     existing_services = {service.get("name", "") for service in parsed_before.get("services") or []}
     missing_services = [service for service in desired_services if service not in existing_services]
     if not missing_permissions and not missing_services:
+        notes = ["No manifest permission changes were needed."]
+        if any(permission.endswith("SYSTEM_ALERT_WINDOW") for permission in desired_permissions):
+            notes.append("SYSTEM_ALERT_WINDOW still requires user approval at runtime on supported Android versions.")
         return {
             "success": True,
             "requested_overlay_mode": mode,
@@ -3912,12 +4076,7 @@ def configure_runtime_menu_manifest(
             "manifest_file": str(manifest_path),
             "tier_b_requirements": requirements,
             "risk_level": "high" if mode in {"system_overlay", "hybrid"} else "low",
-            "notes": [
-                "No manifest permission changes were needed.",
-                "SYSTEM_ALERT_WINDOW still requires user approval at runtime on supported Android versions."
-                if any(permission.endswith("SYSTEM_ALERT_WINDOW") for permission in desired_permissions)
-                else "",
-            ],
+            "notes": notes,
         }
 
     backed_up: dict[str, str] = {}

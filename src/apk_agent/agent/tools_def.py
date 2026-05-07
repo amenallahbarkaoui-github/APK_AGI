@@ -64,6 +64,8 @@ _CACHEABLE_TOOLS = frozenset({
     "summarize_app_knowledge",
     "summarize_behavior_graph",
     "query_behavior_graph",
+    "summarize_source_of_truth",
+    "query_source_of_truth",
     "locate_feature_controls",
     "recover_state_transitions",
     "map_security_surfaces",
@@ -86,6 +88,7 @@ def set_tool_context(config, project) -> None:
         "smali_index",
         "app_knowledge_pack",
         "behavior_graph_pack",
+        "source_of_truth_pack",
         "semantic_architecture_cache",
         "hidden_state_model_cache",
         "guard_surface_profile_cache",
@@ -111,6 +114,7 @@ def invalidate_graph_caches() -> None:
         "smali_index",
         "app_knowledge_pack",
         "behavior_graph_pack",
+        "source_of_truth_pack",
         "semantic_architecture_cache",
         "hidden_state_model_cache",
         "guard_surface_profile_cache",
@@ -9181,6 +9185,9 @@ def _ensure_smali_index():
     idx = load_smali_index(index_path)
     if idx is not None:
         clear_runtime_slots(
+            "app_knowledge_pack",
+            "behavior_graph_pack",
+            "source_of_truth_pack",
             "semantic_architecture_cache",
             "hidden_state_model_cache",
             "guard_surface_profile_cache",
@@ -9287,6 +9294,44 @@ def _ensure_behavior_graph_pack(*, auto_build: bool = True, focus_hint: str = ""
     )
     save_behavior_graph(pack, pack_path)
     set_runtime_slot("behavior_graph_pack", pack)
+    return pack
+
+
+def _source_of_truth_pack_path() -> Path:
+    return _project_outputs_dir() / "source_of_truth_pack.json"
+
+
+def _ensure_source_of_truth_pack(*, auto_build: bool = True, focus_hint: str = ""):
+    """Load or build the persisted source-of-truth inference pack."""
+    cached_pack = get_runtime_slot("source_of_truth_pack")
+    if cached_pack is not None:
+        return cached_pack
+
+    behavior_pack = _ensure_behavior_graph_pack(auto_build=auto_build, focus_hint=focus_hint)
+    if behavior_pack is None:
+        return None
+
+    from apk_agent.tools.source_of_truth import (
+        build_source_of_truth_pack as _build_source_of_truth_pack,
+        load_source_of_truth_pack,
+        save_source_of_truth_pack,
+    )
+
+    pack_path = _source_of_truth_pack_path()
+    pack = load_source_of_truth_pack(pack_path)
+    if pack is not None:
+        current_behavior_built_at = float(behavior_pack.get("built_at", 0.0) or 0.0)
+        stored_behavior_built_at = float(pack.get("upstream", {}).get("behavior_built_at", -1.0) or -1.0)
+        if current_behavior_built_at == stored_behavior_built_at:
+            set_runtime_slot("source_of_truth_pack", pack)
+            return pack
+
+    if not auto_build:
+        return None
+
+    pack = _build_source_of_truth_pack(behavior_pack, focus_hint=focus_hint)
+    save_source_of_truth_pack(pack, pack_path)
+    set_runtime_slot("source_of_truth_pack", pack)
     return pack
 
 
@@ -11598,6 +11643,9 @@ def build_smali_index() -> str:
         from apk_agent.progress import report_progress
         idx = build_smali_idx(smali_dirs, progress_callback=report_progress)
         clear_runtime_slots(
+            "app_knowledge_pack",
+            "behavior_graph_pack",
+            "source_of_truth_pack",
             "semantic_architecture_cache",
             "hidden_state_model_cache",
             "guard_surface_profile_cache",
@@ -12410,6 +12458,7 @@ def build_behavior_graph(
         )
         pack_path = _behavior_graph_path()
         save_result = save_behavior_graph(pack, pack_path)
+        clear_runtime_slots("source_of_truth_pack")
         set_runtime_slot("behavior_graph_pack", pack)
         return json.dumps({
             "success": True,
@@ -12476,6 +12525,116 @@ def query_behavior_graph(
         _run,
         "query_behavior_graph",
         _cache_hint=f"{query}:{feature}:{class_name}:{method_name}:{record_type}:{max_results}",
+    )
+
+
+@tool
+def build_source_of_truth_pack(
+    focus_hint: str = "",
+    max_surfaces: int = 80,
+    max_relationships: int = 120,
+    max_claims: int = 30,
+) -> str:
+    """Build and persist a probabilistic source-of-truth inference pack.
+
+    This layer sits above the unified behavior graph and models likely state
+    authority, propagation, and lifecycle as advisory hypotheses. The output is
+    contestable and overridable; it should guide patch selection, not hard-block
+    exploratory instrumentation or tactical UI-only work.
+    """
+    from apk_agent.tools.source_of_truth import (
+        build_source_of_truth_pack as _build_source_of_truth_pack,
+        save_source_of_truth_pack,
+        summarize_source_of_truth_pack,
+    )
+
+    def _run():
+        behavior_pack = _ensure_behavior_graph_pack(auto_build=True, focus_hint=focus_hint)
+        if behavior_pack is None:
+            return json.dumps({"success": False, "error": "Behavior graph unavailable. Run build_behavior_graph first."})
+
+        pack = _build_source_of_truth_pack(
+            behavior_pack,
+            focus_hint=focus_hint,
+            max_surfaces=max_surfaces,
+            max_relationships=max_relationships,
+            max_claims=max_claims,
+        )
+        pack_path = _source_of_truth_pack_path()
+        save_result = save_source_of_truth_pack(pack, pack_path)
+        set_runtime_slot("source_of_truth_pack", pack)
+        return json.dumps({
+            "success": True,
+            "output_path": str(pack_path),
+            "persisted": save_result.get("success", False),
+            "persist_result": save_result,
+            "summary": summarize_source_of_truth_pack(pack).get("summary", {}),
+            "identity": pack.get("identity", {}),
+            "top_authority_claims": pack.get("source_of_truth", {}).get("authority_claims", [])[:5],
+            "patch_target_advisories": pack.get("source_of_truth", {}).get("patch_target_advisories", [])[:5],
+            "blocked_patch_targets": pack.get("source_of_truth", {}).get("blocked_patch_targets", [])[:5],
+            "authority_propagation_routes": pack.get("source_of_truth", {}).get("authority_propagation_graph", {}).get("routes", [])[:3],
+            "lifecycle_highlights": pack.get("source_of_truth", {}).get("state_lifecycle_model", {}).get("risk_windows", [])[:5],
+            "warnings": pack.get("warnings", []),
+        }, ensure_ascii=False, indent=2)[:25000]
+
+    return _safe_call(
+        _run,
+        "build_source_of_truth_pack",
+        _cache_hint=f"{focus_hint}:{max_surfaces}:{max_relationships}:{max_claims}",
+    )
+
+
+@tool
+def summarize_source_of_truth() -> str:
+    """Return a compact summary of the persisted source-of-truth pack."""
+    from apk_agent.tools.source_of_truth import summarize_source_of_truth_pack as _summarize_source_of_truth_pack
+
+    def _run():
+        pack = _ensure_source_of_truth_pack(auto_build=True)
+        if pack is None:
+            return json.dumps({"success": False, "error": "Source-of-truth pack unavailable. Build it first."})
+        result = _summarize_source_of_truth_pack(pack)
+        result["output_path"] = str(_source_of_truth_pack_path())
+        return json.dumps(result, ensure_ascii=False, indent=2)[:15000]
+
+    return _safe_call(_run, "summarize_source_of_truth")
+
+
+@tool
+def query_source_of_truth(
+    query: str,
+    class_name: str = "",
+    method_name: str = "",
+    field_name: str = "",
+    record_type: str = "",
+    authority_label: str = "",
+    max_results: int = 10,
+) -> str:
+    """Run a semantic query over probabilistic authority, advisory, propagation, and lifecycle records."""
+    from apk_agent.tools.source_of_truth import query_source_of_truth as _query_source_of_truth
+
+    def _run():
+        pack = _ensure_source_of_truth_pack(auto_build=True, focus_hint=query or class_name or field_name)
+        if pack is None:
+            return json.dumps({"success": False, "error": "Source-of-truth pack unavailable. Run build_source_of_truth_pack first."})
+        result = _query_source_of_truth(
+            pack,
+            query=query,
+            class_name=class_name,
+            method_name=method_name,
+            field_name=field_name,
+            record_type=record_type,
+            authority_label=authority_label,
+            max_results=max_results,
+        )
+        result["output_path"] = str(_source_of_truth_pack_path())
+        return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
+
+    return _safe_call(
+        _run,
+        "query_source_of_truth",
+        _cache_hint=f"{query}:{class_name}:{method_name}:{field_name}:{record_type}:{authority_label}:{max_results}",
     )
 
 
@@ -13720,6 +13879,9 @@ ALL_TOOLS = [
     build_behavior_graph,
     summarize_behavior_graph,
     query_behavior_graph,
+    build_source_of_truth_pack,
+    summarize_source_of_truth,
+    query_source_of_truth,
     locate_feature_controls,
     recover_state_transitions,
     map_security_surfaces,

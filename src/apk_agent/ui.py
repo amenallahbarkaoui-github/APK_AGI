@@ -883,6 +883,7 @@ def _categorize_tool_name(name: str) -> str:
         "find_enforcement_surfaces", "map_semantic_architecture", "recover_hidden_state_model",
         "profile_guard_and_revalidation_surface", "build_app_knowledge_pack", "summarize_app_knowledge",
         "query_app_knowledge", "build_behavior_graph", "summarize_behavior_graph", "query_behavior_graph",
+        "build_source_of_truth_pack", "summarize_source_of_truth", "query_source_of_truth",
         "recover_state_transitions", "map_security_surfaces", "analyze_network_behavior",
         "recover_semantic_symbols", "build_dart_aot_index",
     }:
