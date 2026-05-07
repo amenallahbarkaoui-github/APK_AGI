@@ -2168,6 +2168,7 @@ def apktool_build() -> str:
         backup_dir=_project.patch_backup_dir,
         patch_journal=list(_patch_journal),
         task_plan=_get_task_plan(),
+        source_of_truth_pack=_ensure_source_of_truth_pack(auto_build=False),
     )
     syntax = validation_result.get("syntax", {}) if isinstance(validation_result, dict) else {}
     invalid_smali_count = int(syntax.get("invalid_smali_count", 0) or 0)
@@ -2175,6 +2176,7 @@ def apktool_build() -> str:
     coverage_gaps = validation_result.get("coverage_gaps", []) if isinstance(validation_result, dict) else []
     missing_followups = validation_result.get("missing_followups", []) if isinstance(validation_result, dict) else []
     unsafe_overlaps = validation_result.get("unsafe_overlaps", []) if isinstance(validation_result, dict) else []
+    soft_prior_warnings = validation_result.get("soft_prior_warnings", []) if isinstance(validation_result, dict) else []
     validation_warnings: list[str] = []
     if invalid_smali_count > 0:
         validation_warnings.append(
@@ -2192,6 +2194,8 @@ def apktool_build() -> str:
         validation_warnings.append(
             f"Overlapping patch activity was detected on {len(unsafe_overlaps)} target(s); verify final file/method state carefully after rebuild."
         )
+    for warning in soft_prior_warnings[:4]:
+        validation_warnings.append(str(warning))
 
     # --- PRE-BUILD: verify patched files still contain our patches ---
     pre_warnings = _pre_build_patch_check()
@@ -2227,6 +2231,8 @@ def apktool_build() -> str:
         build_output += "\nSuggested followups: " + " | ".join(str(item) for item in coverage_gaps[:3])
     if missing_followups:
         build_output += "\nMissing followups: " + " | ".join(str(item) for item in missing_followups[:3])
+    if soft_prior_warnings:
+        build_output += "\nSoft-prior warnings: " + " | ".join(str(item) for item in soft_prior_warnings[:3])
     if unsafe_overlaps:
         build_output += "\nUnsafe overlaps: " + " | ".join(
             f"{item.get('target_file', '?')} via {','.join(item.get('tools', [])[:3])}"
@@ -10911,6 +10917,166 @@ def smart_entity_patch(
                 deduped.append(part)
             return " | ".join(deduped)[:600]
 
+        def _neutral_patch_advisory(surface_ref: str = "", *, reason: str = "") -> dict[str, Any]:
+            return {
+                "schema": "PatchAdvisory",
+                "evidence_mode": "evidence_first",
+                "advisory_only": True,
+                "decision_owner": "agent",
+                "available": False,
+                "surface_ref": surface_ref,
+                "durability_score": 0.5,
+                "durability_risk": 0.5,
+                "overwrite_probability": 0.5,
+                "authority_distance": 99,
+                "projection_depth": 99,
+                "interception_quality": 0.0,
+                "upstream_alignment": 0.0,
+                "projection_only_penalty": 0.0,
+                "recommended_interception_ref": "",
+                "recommended_interception_reason": reason,
+                "rank_hint": "unknown",
+                "advisory_reasons": [reason] if reason else [],
+                "advisory_counter_signals": [],
+                "advisory_summary": reason,
+                "soft_prior_score": 0.0,
+                "classification_confidence": 0.0,
+                "classification_status": "unavailable",
+                "state_surface": "",
+                "authority_label": "",
+            }
+
+        def _patch_admission_score(base_score: float | int | None, advisory: dict[str, Any]) -> float:
+            score = float(base_score or 0.0)
+            if advisory.get("available"):
+                score += float(advisory.get("soft_prior_score", 0.0))
+            return round(score, 3)
+
+        def _resolved_advisory_rank_hint(advisory: dict[str, Any]) -> str:
+            rank_hint = str(advisory.get("rank_hint", "") or "").strip()
+            if rank_hint and rank_hint != "unknown":
+                return rank_hint
+
+            overwrite_probability_raw = advisory.get("overwrite_probability", 0.5)
+            durability_risk_raw = advisory.get("durability_risk", 0.5)
+            authority_distance_raw = advisory.get("authority_distance", 99)
+            projection_depth_raw = advisory.get("projection_depth", 99)
+            interception_quality_raw = advisory.get("interception_quality", 0.0)
+
+            overwrite_probability = float(0.5 if overwrite_probability_raw is None else overwrite_probability_raw)
+            durability_risk = float(0.5 if durability_risk_raw is None else durability_risk_raw)
+            authority_distance = int(99 if authority_distance_raw is None else authority_distance_raw)
+            projection_depth = int(99 if projection_depth_raw is None else projection_depth_raw)
+            interception_quality = float(0.0 if interception_quality_raw is None else interception_quality_raw)
+            recommended_interception_ref = str(advisory.get("recommended_interception_ref", "") or "").strip()
+
+            if projection_depth == 0:
+                return "ui_tactical_only"
+            if recommended_interception_ref and authority_distance > 0 and overwrite_probability >= 0.55:
+                return "prefer_upstream_interception"
+            if authority_distance <= 1 and durability_risk < 0.45 and interception_quality > 0.0:
+                return "candidate_durable_root_patch"
+            if overwrite_probability >= 0.55 or durability_risk >= 0.6:
+                return "temporary_local_patch"
+            return "exploratory_patch_ok"
+
+        def _planner_evidence_bucket(
+            advisory: dict[str, Any],
+            *,
+            surface_role: str,
+            selection_source: str,
+        ) -> tuple[int, str]:
+            rank_hint = _resolved_advisory_rank_hint(advisory)
+            if selection_source != "semantic_surface":
+                return 5, "fallback_gate"
+
+            if surface_role in {"revalidation_boundary", "state_mutator"}:
+                mapping = {
+                    "candidate_durable_root_patch": (0, "preferred_upstream_durable"),
+                    "prefer_upstream_interception": (1, "preferred_upstream_interception"),
+                    "exploratory_patch_ok": (2, "upstream_exploratory"),
+                    "temporary_local_patch": (3, "upstream_temporal_risk"),
+                    "ui_tactical_only": (4, "projection_only"),
+                    "unknown": (2, "upstream_mixed"),
+                }
+                return mapping.get(rank_hint, (2, "upstream_mixed"))
+
+            mapping = {
+                "candidate_durable_root_patch": (0, "durable_gate_candidate"),
+                "exploratory_patch_ok": (1, "exploratory_gate_candidate"),
+                "temporary_local_patch": (2, "temporary_gate_candidate"),
+                "ui_tactical_only": (3, "ui_tactical_gate"),
+                "prefer_upstream_interception": (4, "upstream_followup_preferred"),
+                "unknown": (2, "mixed_gate_candidate"),
+            }
+            return mapping.get(rank_hint, (2, "mixed_gate_candidate"))
+
+        def _surface_patch_advisory(prior: dict[str, Any], surface_ref: str) -> dict[str, Any]:
+            if not prior.get("available"):
+                return _neutral_patch_advisory(surface_ref, reason=str(prior.get("reason", "source-of-truth soft prior unavailable")))
+            surface = prior.get("surface_by_ref", {}).get(surface_ref)
+            if not isinstance(surface, dict):
+                return _neutral_patch_advisory(surface_ref, reason="no matching source-of-truth surface")
+            advisory = dict(surface.get("patch_advisory") or {})
+            merged = _neutral_patch_advisory(surface.get("surface_ref", surface_ref), reason="matched source-of-truth surface")
+            merged.update(advisory)
+            merged.update({
+                "available": True,
+                "surface_ref": surface.get("surface_ref", surface_ref),
+                "state_surface": surface.get("state_surface", ""),
+                "authority_label": surface.get("authority_label", ""),
+                "classification_confidence": float(surface.get("classification_confidence", surface.get("ownership_confidence", 0.0)) or 0.0),
+                "classification_status": str(surface.get("classification_status", "contestable_hypothesis") or "contestable_hypothesis"),
+            })
+            return merged
+
+        def _load_source_of_truth_soft_prior(focus_hint: str) -> dict[str, Any]:
+            try:
+                pack = _ensure_source_of_truth_pack(auto_build=False, focus_hint=focus_hint)
+            except Exception as exc:
+                return {
+                    "available": False,
+                    "reason": f"source-of-truth soft prior unavailable: {exc}",
+                    "surface_by_ref": {},
+                    "top_interception_points": [],
+                    "lifecycle_risk_windows": [],
+                    "uncertainty_hotspots": [],
+                }
+
+            if not isinstance(pack, dict):
+                return {
+                    "available": False,
+                    "reason": "source-of-truth pack not available; scoring falls back to semantic surfaces only",
+                    "surface_by_ref": {},
+                    "top_interception_points": [],
+                    "lifecycle_risk_windows": [],
+                    "uncertainty_hotspots": [],
+                }
+
+            source = pack.get("source_of_truth", {}) if isinstance(pack.get("source_of_truth", {}), dict) else {}
+            surfaces = [item for item in source.get("surfaces", []) if isinstance(item, dict)]
+            uncertainty_hotspots = [
+                {
+                    "surface_ref": str(surface.get("surface_ref", "")),
+                    "classification_confidence": float(surface.get("classification_confidence", 0.0) or 0.0),
+                    "counter_signals": list(surface.get("counter_signals", []))[:3],
+                }
+                for surface in surfaces
+                if surface.get("classification_status") != "leading_hypothesis" or surface.get("counter_signals")
+            ][:5]
+            return {
+                "available": True,
+                "reason": "source-of-truth soft prior loaded from persisted pack",
+                "surface_by_ref": {
+                    str(surface.get("surface_ref", "")): surface
+                    for surface in surfaces
+                    if str(surface.get("surface_ref", ""))
+                },
+                "top_interception_points": list(source.get("authority_propagation_graph", {}).get("interception_points", []))[:5],
+                "lifecycle_risk_windows": list(source.get("state_lifecycle_model", {}).get("risk_windows", []))[:5],
+                "uncertainty_hotspots": uncertainty_hotspots,
+            }
+
         def _response_override_plan() -> tuple[dict[str, dict], list[dict], dict, list[dict]]:
             hidden_state_result = _recover_hidden_state_model(
                 si,
@@ -10992,6 +11158,7 @@ def smart_entity_patch(
             return bool(class_package and surface_class.startswith(f"L{class_package}"))
 
         semantic_context = _runtime_planner_context()
+        source_of_truth_prior = _load_source_of_truth_soft_prior(semantic_context or class_descriptor)
         semantic_result = _find_surfaces(si, semantic_context, graph=graph, max_results=160)
         semantic_surfaces = semantic_result.get("surfaces", []) if semantic_result.get("success") else []
         same_class_surfaces: dict[str, dict] = {}
@@ -11010,12 +11177,22 @@ def smart_entity_patch(
                 continue
             if not _surface_links_to_class(surface):
                 continue
+            patch_advisory = _surface_patch_advisory(source_of_truth_prior, method_sig)
+            planning_bucket, planning_preference = _planner_evidence_bucket(
+                patch_advisory,
+                surface_role=str(surface.get("surface_role", "candidate") or "candidate"),
+                selection_source="semantic_surface",
+            )
             companion_by_method[method_sig] = {
                 "method": method_sig,
                 "class": surface.get("class", ""),
                 "file": surface.get("file", ""),
                 "surface_role": surface.get("surface_role", "candidate"),
                 "score": surface.get("score", 0),
+                "planning_bucket": planning_bucket,
+                "planning_preference": planning_preference,
+                "patch_admission_score": _patch_admission_score(surface.get("score", 0), patch_advisory),
+                "patch_advisory": patch_advisory,
                 "api_categories": surface.get("api_categories", []),
                 "reasons": surface.get("reasons", [])[:3],
                 "recommended_tool": (
@@ -11027,7 +11204,13 @@ def smart_entity_patch(
 
         companion_surfaces = sorted(
             companion_by_method.values(),
-            key=lambda item: (_EXECUTION_PRIORITY.get(item["surface_role"], 99), -int(item.get("score", 0)), item["method"]),
+            key=lambda item: (
+                _EXECUTION_PRIORITY.get(item["surface_role"], 99),
+                int(item.get("planning_bucket", 99)),
+                -int(item.get("score", 0)),
+                -float(item.get("patch_admission_score", 0.0)),
+                item["method"],
+            ),
         )[:8]
         response_field_overrides, response_override_preview, hidden_state_result, suppressed_guess_only = _response_override_plan()
         auto_response_flow = {
@@ -11092,15 +11275,26 @@ def smart_entity_patch(
             surface_role = surface.get("surface_role", "legacy_gate") if surface else "legacy_gate"
             selection_source = "semantic_surface" if surface else "legacy_gate_fallback"
             semantic_score = int(surface.get("score", 0)) if surface else None
+            method_ref = method.full_signature
+            patch_advisory = _surface_patch_advisory(source_of_truth_prior, method_ref)
+            planning_bucket, planning_preference = _planner_evidence_bucket(
+                patch_advisory,
+                surface_role=surface_role,
+                selection_source=selection_source,
+            )
+            patch_admission_score = _patch_admission_score(semantic_score, patch_advisory)
             patch_priority = (
                 0 if selection_source == "semantic_surface" else 1,
                 _ROLE_PRIORITY.get(surface_role, 99),
+                planning_bucket,
                 -int(semantic_score or 0),
+                -float(patch_admission_score),
                 method.signature,
             )
 
             gate_info = {
                 "method": method.signature,
+                "method_ref": method_ref,
                 "return_type": method.return_type,
                 "semantics": semantics,
                 "target_value": target_value,
@@ -11108,6 +11302,9 @@ def smart_entity_patch(
                 "surface_role": surface_role,
                 "selection_source": selection_source,
                 "semantic_score": semantic_score,
+                "planning_bucket": planning_bucket,
+                "planning_preference": planning_preference,
+                "patch_admission_score": patch_admission_score,
                 "semantic_reasons": surface.get("reasons", [])[:3] if surface else [],
                 "plan_tier": "primary" if selection_source == "semantic_surface" else "fallback",
                 "_sort_key": patch_priority,
@@ -11123,12 +11320,17 @@ def smart_entity_patch(
             patches.append({
                 "file": cls_obj.abs_path or cls_obj.file_path,
                 "method": method.signature,
+                "method_ref": method_ref,
                 "patch_code": patch_code,
                 "semantics": semantics,
                 "target_value": target_value,
                 "surface_role": surface_role,
                 "selection_source": selection_source,
                 "semantic_score": semantic_score,
+                "planning_bucket": planning_bucket,
+                "planning_preference": planning_preference,
+                "patch_admission_score": patch_admission_score,
+                "patch_advisory": patch_advisory,
                 "semantic_reasons": surface.get("reasons", [])[:3] if surface else [],
                 "plan_tier": "primary" if selection_source == "semantic_surface" else "fallback",
                 "_sort_key": patch_priority,
@@ -11149,6 +11351,9 @@ def smart_entity_patch(
                 "method": surface["method"],
                 "class": surface["class"],
                 "score": surface["score"],
+                "planning_bucket": surface.get("planning_bucket", 99),
+                "planning_preference": surface.get("planning_preference", "unknown"),
+                "patch_admission_score": surface.get("patch_admission_score", 0.0),
                 "why": surface["reasons"],
             }
             for surface in companion_surfaces
@@ -11161,6 +11366,9 @@ def smart_entity_patch(
                 "method": patch["method"],
                 "class": class_descriptor,
                 "score": patch["semantic_score"],
+                "planning_bucket": patch.get("planning_bucket", 99),
+                "planning_preference": patch.get("planning_preference", "unknown"),
+                "patch_admission_score": patch.get("patch_admission_score", 0.0),
                 "why": patch["semantic_reasons"],
             }
             for patch in patches
@@ -11168,7 +11376,10 @@ def smart_entity_patch(
 
         semantic_plan = {
             "planner_mode": "revalidation_first_semantic_surface",
+            "decision_mode": "agent_decides",
+            "advisory_only": True,
             "planner_context": semantic_context,
+            "planner_integration_mode": "evidence_bucket_then_score_tiebreak",
             "same_class_semantic_hits": len(same_class_surfaces),
             "primary_patch_targets": [
                 {
@@ -11177,6 +11388,10 @@ def smart_entity_patch(
                     "semantic_score": patch["semantic_score"],
                     "selection_source": patch["selection_source"],
                     "target_value": patch["target_value"],
+                    "planning_bucket": patch["planning_bucket"],
+                    "planning_preference": patch["planning_preference"],
+                    "patch_admission_score": patch["patch_admission_score"],
+                    "patch_advisory": patch["patch_advisory"],
                     "semantics": patch["semantics"],
                     "reasons": patch["semantic_reasons"],
                 }
@@ -11189,6 +11404,10 @@ def smart_entity_patch(
                     "surface_role": patch["surface_role"],
                     "selection_source": patch["selection_source"],
                     "target_value": patch["target_value"],
+                    "planning_bucket": patch["planning_bucket"],
+                    "planning_preference": patch["planning_preference"],
+                    "patch_admission_score": patch["patch_admission_score"],
+                    "patch_advisory": patch["patch_advisory"],
                     "semantics": patch["semantics"],
                 }
                 for patch in patches
@@ -11198,19 +11417,41 @@ def smart_entity_patch(
             "execution_order": execution_order,
             "preferred_first_action": execution_order[0] if execution_order else None,
             "requires_companion_followups_before_build": bool(companion_surfaces),
+            "companion_followups_are_advisory_only": True,
+            "recommends_companion_followups_before_build": bool(companion_surfaces),
+            "source_of_truth_soft_prior": {
+                "available": bool(source_of_truth_prior.get("available")),
+                "reason": source_of_truth_prior.get("reason", ""),
+                "used_as": "scoring_influence_only",
+                "planner_integration_mode": "evidence_bucket_then_score_tiebreak",
+                "score_role": "secondary_tiebreak_and_display",
+                "advisory_only": True,
+                "decision_owner": "agent",
+                "top_interception_points": source_of_truth_prior.get("top_interception_points", []),
+                "lifecycle_risk_windows": source_of_truth_prior.get("lifecycle_risk_windows", []),
+                "uncertainty_hotspots": source_of_truth_prior.get("uncertainty_hotspots", []),
+            },
             "role_summary": semantic_result.get("role_summary", {}) if semantic_result.get("success") else {},
             "auto_response_flow": auto_response_flow,
             "recommended_followups": (
                 [
-                    "Start with linked revalidation_boundary methods via patch_api_response_flow before relying on gate patches if server/account sync rewrites state.",
-                    "Trace companion state_mutator field writers/readers before build if cached or lifecycle state keeps reverting.",
+                    "Consider starting with linked revalidation_boundary methods via patch_api_response_flow before relying on gate patches if server/account sync rewrites state.",
+                    "Consider tracing companion state_mutator field writers/readers before build if cached or lifecycle state keeps reverting.",
+                    "Treat source-of-truth PatchAdvisory as a soft prior only: inspect uncertainty, counter-signals, lifecycle windows, and interception options before assuming a gate patch is durable.",
                 ]
                 if companion_surfaces else
-                []
+                ([
+                    "Use source-of-truth propagation/lifecycle advisories as scoring influence only; do not hard-reject exploratory or tactical patches from label alone."
+                ] if source_of_truth_prior.get("available") else [])
             ),
         }
 
         preview_instruction = f"Preview: {len(patches)} patches ready. Call again with mode='auto' to apply."
+        risky_gate_patches = [
+            patch for patch in patches
+            if float(patch.get("patch_advisory", {}).get("overwrite_probability", 0.0) or 0.0) >= 0.55
+        ]
+        top_interception_point = (source_of_truth_prior.get("top_interception_points") or [None])[0]
         if auto_response_flow["eligible"]:
             preview_instruction = (
                 f"Semantic planner found {len(companion_surfaces)} linked revalidation/state writers and recovered "
@@ -11227,10 +11468,16 @@ def smart_entity_patch(
         elif companion_surfaces:
             preview_instruction = (
                 f"Semantic planner ranked {len(companion_surfaces)} linked revalidation/state writers ahead of direct gate patches. "
-                "Start with companion_followups or execution_order[0] before relying on gate-only patches. "
+                "Consider companion_followups or execution_order[0] before relying on gate-only patches. "
             ) + preview_instruction + (
                 " Use patch_api_response_flow or trace_field_access before building if server/account creation can overwrite state."
             )
+        elif risky_gate_patches and isinstance(top_interception_point, dict):
+            preview_instruction = (
+                f"Source-of-truth soft prior raises overwrite skepticism for {len(risky_gate_patches)} gate target(s) and prefers upstream interception at "
+                f"{top_interception_point.get('surface_ref', 'an upstream boundary')}. "
+                "This is advisory only: use it to rank followups, not to hard-block exploratory patches. "
+            ) + preview_instruction
 
         if mode == "preview":
             return json.dumps({
@@ -11242,7 +11489,7 @@ def smart_entity_patch(
                 "semantic_plan": semantic_plan,
                 "patches_preview": patches,
                 "instruction": preview_instruction,
-            }, ensure_ascii=False, indent=2)[:15000]
+            }, ensure_ascii=False, indent=2)
 
         # Apply patches
         applied = []
@@ -11274,6 +11521,12 @@ def smart_entity_patch(
                     "diff_text": (
                         f"patch_api_response_flow applied {response_flow_result.get('patches_applied', 0)} response/model-boundary patches"
                     ),
+                    "source_of_truth_soft_prior": {
+                        "surface_ref": auto_response_flow.get("recommended_interception_ref", class_descriptor),
+                        "overwrite_probability": 0.12,
+                        "durability_risk": 0.18,
+                        "recommended_interception_ref": auto_response_flow.get("recommended_interception_ref", class_descriptor),
+                    },
                 })
 
         for patch in patches:
@@ -11309,6 +11562,7 @@ def smart_entity_patch(
                         "target_file": str(fpath),
                         "description": f"smart_entity_patch: {method_name} → {patch['target_value']} ({patch['semantics']})",
                         "diff_text": f"Body replaced with const/{patch['target_value']} return",
+                        "source_of_truth_soft_prior": patch.get("patch_advisory", {}),
                     })
                     applied.append(patch["method"])
                 else:
@@ -11343,7 +11597,7 @@ def smart_entity_patch(
                 + (" Review companion_followups/execution_order and patch linked revalidation/state writers before build if server or lifecycle code can revert the state." if companion_surfaces else "")
                 + " Now run validate_patch_completeness to verify, then check child classes."
             ),
-        }, ensure_ascii=False, indent=2)[:15000]
+        }, ensure_ascii=False, indent=2)
 
     return _safe_call(_run, "smart_entity_patch")
 
@@ -11623,7 +11877,9 @@ def build_smali_index() -> str:
     """Build (or rebuild) the SmaliIndex — a full IR (Intermediate Representation)
     of every smali class, method, instruction, field, and annotation.
     Enables instant API caller lookup, string constant search, class hierarchy
-    queries, and method-category classification.
+    queries, method-category classification, precomputed CFG/liveness/type
+    analysis, and semantic summaries for frameworks, native bridges, and
+    obfuscation.
     Must have run apktool_decompile first. Build this BEFORE unified_scan or taint analysis.
 
     When to use: Run once after apktool_decompile. Required for unified_scan,
@@ -11631,7 +11887,9 @@ def build_smali_index() -> str:
 
     Returns: JSON with keys: success, total_classes, total_methods,
     total_instructions, total_strings, total_api_targets,
-    method_categories (dict of category→count), built_at (timestamp).
+    total_fields, total_call_graph_edges, total_field_access_edges,
+    method_categories, framework_hints, native_summary,
+    obfuscation_summary, semantic_summary, and built_at.
     """
     from apk_agent.tools.smali_ir import build_index as build_smali_idx, save_index as save_smali_idx, index_stats
 
@@ -11665,16 +11923,19 @@ def build_smali_index() -> str:
 
 @tool
 def smali_index_stats() -> str:
-    """Get SmaliIndex statistics — total classes, methods, strings, API calls indexed.
-    Useful to confirm the index is built and see its scope.
+    """Get SmaliIndex statistics and semantic-summary coverage.
+    Useful to confirm the index is built, see its scope, and inspect the
+    internal knowledge base exposed to the agent.
 
     When to use: Quick check after build_smali_index to verify it completed
     and see what’s indexed. Also useful to confirm index availability before
     running unified_scan or taint analysis.
 
     Returns: JSON with keys: success, total_classes, total_methods,
-    total_instructions, total_strings, total_api_targets,
-    method_categories (dict of category→count), hierarchy_roots (int), built_at (timestamp).
+    total_instructions, total_strings, total_api_targets, total_fields,
+    total_call_graph_edges, total_field_access_edges, method_categories,
+    hierarchy_roots, framework_hints, native_summary,
+    obfuscation_summary, semantic_summary, and built_at.
     """
     from apk_agent.tools.smali_ir import index_stats
 
@@ -12212,6 +12473,7 @@ def validate_patch_pipeline(target_class: str = "", include_global_gate_check: b
             backup_dir=_project.patch_backup_dir,
             patch_journal=list(_patch_journal),
             task_plan=_get_task_plan(),
+            source_of_truth_pack=_ensure_source_of_truth_pack(auto_build=False, focus_hint=target_class),
         )
 
         if target_class:
@@ -12747,7 +13009,7 @@ def plan_runtime_hooks(focus_hint: str = "", class_name: str = "", max_results: 
 def plan_runtime_menu_workflow(
     focus_hint: str = "",
     class_name: str = "",
-    overlay_mode: str = "in_app",
+    overlay_mode: str = "overlay_primary",
     max_results: int = 6,
     start_collapsed: bool = True,
 ) -> str:
@@ -12798,7 +13060,8 @@ def plan_runtime_menu_workflow(
         return class_name
 
     def _chain_for_strategy(strategy_name: str, spec_json: str, override_rules_json: str, class_descriptor: str) -> list[dict[str, Any]]:
-        overlay_requires_manifest = overlay_mode in {"system_overlay", "hybrid"}
+        overlay_requires_manifest = overlay_mode in {"system_overlay", "overlay_primary"}
+        overlay_requires_foreground_service = overlay_mode == "overlay_primary"
         default_menu_target_root = "auto"
         menu_chain = [
             _step(
@@ -12814,7 +13077,7 @@ def plan_runtime_menu_workflow(
             _step(
                 2,
                 "draft_runtime_menu_from_hooks",
-                "Draft the floating menu spec from menu-compatible or hybrid hook candidates.",
+                "Draft the floating menu spec from menu-compatible or override-coupled hook candidates.",
                 {
                     "focus_hint": focus_hint,
                     "class_name": class_name,
@@ -12832,7 +13095,7 @@ def plan_runtime_menu_workflow(
                     "overlay_mode": overlay_mode,
                     "reapply_on_resume": True,
                     "auto_configure_manifest": overlay_requires_manifest,
-                    "require_foreground_service": False,
+                    "require_foreground_service": overlay_requires_foreground_service,
                     "target_smali_root": default_menu_target_root,
                 },
             ),
@@ -12843,9 +13106,9 @@ def plan_runtime_menu_workflow(
                 {
                     "overlay_mode": overlay_mode,
                     "add_overlay_permission": overlay_requires_manifest,
-                    "require_foreground_service": False,
+                    "require_foreground_service": overlay_requires_foreground_service,
                 },
-                when="Only when overlay_mode is system_overlay or hybrid and automatic manifest configuration was disabled or needs manual verification.",
+                when="Only when overlay_mode uses the global overlay service and automatic manifest configuration was disabled or needs manual verification.",
             ),
             _step(
                 5,
@@ -12902,7 +13165,7 @@ def plan_runtime_menu_workflow(
                     "inject_runtime_override_layer",
                     "Lay down runtime override rules first so menu toggles do not lose against later revalidation.",
                     {
-                        "rules_json": override_rules_json or "<build hybrid override rules from routing_analysis.runtime_override_candidates>",
+                        "rules_json": override_rules_json or "<build combined override rules from routing_analysis.runtime_override_candidates>",
                         "reapply_on_resume": True,
                     },
                 ),
@@ -12926,15 +13189,15 @@ def plan_runtime_menu_workflow(
                     {
                         "overlay_mode": overlay_mode,
                         "add_overlay_permission": overlay_requires_manifest,
-                        "require_foreground_service": False,
+                        "require_foreground_service": overlay_requires_foreground_service,
                     },
-                    when="Only when overlay_mode is system_overlay or hybrid and automatic manifest configuration was disabled or needs manual verification.",
+                    when="Only when overlay_mode uses the global overlay service and automatic manifest configuration was disabled or needs manual verification.",
                 ),
                 _step(
                     5,
                     "generate_runtime_validation_plan",
                     "Validate both menu actions and runtime reapply policy behavior together.",
-                    {"task": "hybrid runtime menu plus override policy"},
+                    {"task": "combined runtime menu plus override policy"},
                 ),
             ]
         if strategy_name == PatchStrategy.STATIC_PATCH_ONLY.value:
@@ -12998,8 +13261,8 @@ def plan_runtime_menu_workflow(
                     "spec_json": spec_json,
                     "overlay_mode": overlay_mode,
                     "reapply_on_resume": True,
-                    "auto_configure_manifest": overlay_mode in {"system_overlay", "hybrid"},
-                    "require_foreground_service": False,
+                    "auto_configure_manifest": overlay_mode in {"system_overlay", "overlay_primary"},
+                    "require_foreground_service": overlay_mode == "overlay_primary",
                     "target_smali_root": "auto",
                 }
             return "draft_runtime_menu_from_hooks", {
@@ -13210,7 +13473,7 @@ def plan_runtime_menu_workflow(
             "output_path": str(_behavior_graph_path()),
             "notes": [
                 "This helper is planning-only: it does not inject files or change the manifest.",
-                "The floating menu draft now filters to hooks routed as runtime_menu_good_fit or hybrid_required instead of assuming every runtime hook belongs in the menu.",
+                "The floating menu draft now filters to menu-ready hooks plus override-coupled hooks instead of assuming every runtime hook belongs in the menu.",
                 "Menu is recommended only after routing or the generated draft proves a real binding path; provisional menu hooks otherwise fall back to override or static lanes.",
                 "When the draft contains persistent menu actions, override_rules_json now contains executable runtime override rules instead of placeholder text.",
                 "Runtime-menu helper placement now defaults to dex-aware auto selection; set target_smali_root explicitly only when you intentionally want a specific smali_classesN root.",
@@ -13230,19 +13493,20 @@ def plan_runtime_menu_workflow(
 @tool
 def inject_runtime_menu_scaffold(
         spec_json: str,
-        overlay_mode: str = "in_app",
+        overlay_mode: str = "overlay_primary",
         reapply_on_resume: bool = True,
     auto_configure_manifest: bool = True,
-    require_foreground_service: bool = False,
+    require_foreground_service: bool = True,
     target_smali_root: str = "",
         dry_run: bool = False,
 ) -> str:
         """Inject a first-pass runtime mod-menu scaffold into the current APK project.
 
-        The current implementation generates a draggable floating menu attached to the
-        foreground Activity or a system overlay service, depending on overlay_mode.
+        The current implementation generates a draggable floating menu as a
+        global overlay service, with the exact startup/foreground profile controlled by overlay_mode.
         Controls can be buttons, toggles, or sliders, and each control can trigger one
         of these runtime action kinds:
+            - toast
             - shared_pref
             - static_field
             - invoke_static
@@ -13252,6 +13516,11 @@ def inject_runtime_menu_scaffold(
             {
                 "title": "Premium Runtime Menu",
                 "buttons": [
+                    {
+                        "label": "Show Toast",
+                        "kind": "toast",
+                        "message": "Toast fired"
+                    },
                     {
                         "id": "premium_pref",
                         "label": "Force Premium Pref",
@@ -13300,12 +13569,14 @@ def inject_runtime_menu_scaffold(
         - Top-level `launcher_label` customizes the floating bubble text, and
             `start_collapsed=true` starts from the launcher icon instead of an open panel.
         - Action-level `section` strings insert grouped headers inside the panel.
+        - `kind="toast"` creates a simple button that only shows a toast message without
+            requiring app-specific helper smali.
         - `kind="dispatcher"` binds buttons/toggles/sliders directly to static runtime
             hook methods.
-        - The generated menu is inside the app window itself in `in_app` mode, so no overlay permission
-            is required for overlay_mode='in_app'.
-        - If overlay_mode='system_overlay' or 'hybrid' is requested, the tool generates
-            a real WindowManager overlay service and explicit Tier B requirements/warnings.
+        - `overlay_mode="overlay_primary"` is the default service-first profile: it starts the
+            overlay service immediately, expects overlay permission, and requests foreground-service
+            support for a persistent floating controller tied to the app runtime.
+        - Supported overlay modes are `overlay_primary` and `system_overlay`.
         - `auto_configure_manifest=true` now applies the needed overlay/service manifest wiring
             automatically for overlay-based modes; set it to false only when you intentionally want
             a separate explicit `configure_runtime_menu_manifest(...)` step.
@@ -13354,7 +13625,7 @@ def inject_runtime_menu_scaffold(
 def draft_runtime_menu_from_hooks(
     focus_hint: str = "",
     class_name: str = "",
-    overlay_mode: str = "in_app",
+    overlay_mode: str = "overlay_primary",
     max_results: int = 6,
     start_collapsed: bool = True,
 ) -> str:
@@ -13474,8 +13745,8 @@ def draft_runtime_menu_from_hooks(
                 "spec_json": draft.get("spec_json", ""),
                 "overlay_mode": overlay_mode,
                 "reapply_on_resume": True,
-                "auto_configure_manifest": overlay_mode in {"system_overlay", "hybrid"},
-                "require_foreground_service": False,
+                "auto_configure_manifest": overlay_mode in {"system_overlay", "overlay_primary"},
+                "require_foreground_service": overlay_mode == "overlay_primary",
                 "target_smali_root": "auto",
             }
         elif draft["recommended_next_strategy"] in {
@@ -13511,9 +13782,9 @@ def draft_runtime_menu_from_hooks(
 
 @tool
 def configure_runtime_menu_manifest(
-        overlay_mode: str = "in_app",
+    overlay_mode: str = "overlay_primary",
         add_overlay_permission: bool = False,
-        require_foreground_service: bool = False,
+    require_foreground_service: bool = True,
 ) -> str:
         """Ensure AndroidManifest.xml declares the permissions needed by runtime menu modes.
 
@@ -13521,8 +13792,8 @@ def configure_runtime_menu_manifest(
         foreground-service support.
 
         Notes:
-        - in_app mode usually needs no extra permissions.
-        - system_overlay / hybrid modes typically need SYSTEM_ALERT_WINDOW.
+        - overlay_primary is the default and typically needs SYSTEM_ALERT_WINDOW plus foreground-service support.
+        - system_overlay is the lighter overlay-service profile when foreground-service persistence is not required.
         - Foreground-service flows may also need FOREGROUND_SERVICE and, on newer
             targets, POST_NOTIFICATIONS.
         - This tool declares permissions only; Android may still require an explicit

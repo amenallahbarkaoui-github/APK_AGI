@@ -106,15 +106,16 @@ def build_source_of_truth_pack(
         (dict(rel) for rel in relationships.values()),
         key=lambda item: (-float(item.get("confidence", 0)), item.get("relationship_type", ""), item.get("source_surface_id", ""), item.get("target_surface_id", "")),
     )[:max_relationships]
-    lifecycle_model = _build_state_lifecycle_model(surface_items)
-    authority_claims = _build_authority_claims(surface_items, relationships)[:max_claims]
-    patch_target_advisories = _build_patch_target_advisories(surface_items)[:max_claims]
-    blocked_patch_targets = [dict(item) for item in patch_target_advisories]
     authority_propagation_graph = _build_authority_propagation_graph(
         surface_items,
         relationship_items,
         max_routes=max_claims,
     )
+    lifecycle_model = _build_state_lifecycle_model(surface_items)
+    _attach_patch_advisories(surface_items, authority_propagation_graph, lifecycle_model)
+    authority_claims = _build_authority_claims(surface_items, relationships)[:max_claims]
+    patch_target_advisories = _build_patch_target_advisories(surface_items)[:max_claims]
+    blocked_patch_targets = [dict(item) for item in patch_target_advisories]
     records_out = _build_records(
         surface_items,
         relationship_items,
@@ -805,6 +806,15 @@ def _build_patch_target_advisories(surfaces: list[dict[str, Any]]) -> list[dict[
             "contestable": True,
             "overridable": True,
             "preferred_upstream_surface_ids": list(surface.get("upstream_surface_ids", []))[:4],
+            "patch_advisory": dict(surface.get("patch_advisory", {})),
+            "durability_score": float(surface.get("patch_advisory", {}).get("durability_score", 0.0)),
+            "durability_risk": float(surface.get("patch_advisory", {}).get("durability_risk", 0.0)),
+            "overwrite_probability": float(surface.get("patch_advisory", {}).get("overwrite_probability", 0.0)),
+            "authority_distance": int(surface.get("patch_advisory", {}).get("authority_distance", 99)),
+            "projection_depth": int(surface.get("patch_advisory", {}).get("projection_depth", 99)),
+            "interception_quality": float(surface.get("patch_advisory", {}).get("interception_quality", 0.0)),
+            "upstream_alignment": float(surface.get("patch_advisory", {}).get("upstream_alignment", 0.0)),
+            "recommended_interception_ref": str(surface.get("patch_advisory", {}).get("recommended_interception_ref", "")),
             "reason": _patch_advisory_reason(surface),
             "score": round(surface.get("importance_score", 0.0) + (surface.get("overwrite_risk", 0.0) * 10.0), 3),
         })
@@ -839,6 +849,11 @@ def _build_records(
                 surface.get("classification_status", ""),
                 *surface.get("classification_reasons", []),
                 surface.get("temporal_profile", ""),
+                f"durability_risk={surface.get('patch_advisory', {}).get('durability_risk', 0.0)}",
+                f"overwrite_probability={surface.get('patch_advisory', {}).get('overwrite_probability', 0.0)}",
+                f"authority_distance={surface.get('patch_advisory', {}).get('authority_distance', 99)}",
+                f"projection_depth={surface.get('patch_advisory', {}).get('projection_depth', 99)}",
+                f"interception_quality={surface.get('patch_advisory', {}).get('interception_quality', 0.0)}",
                 *surface.get("supporting_signals", []),
                 *surface.get("counter_signals", []),
             ],
@@ -891,6 +906,11 @@ def _build_records(
                 advisory.get("patchability_class", ""),
                 advisory.get("advisory_mode", ""),
                 advisory.get("reason", ""),
+                f"durability_risk={advisory.get('durability_risk', 0.0)}",
+                f"overwrite_probability={advisory.get('overwrite_probability', 0.0)}",
+                f"authority_distance={advisory.get('authority_distance', 99)}",
+                f"projection_depth={advisory.get('projection_depth', 99)}",
+                f"interception_quality={advisory.get('interception_quality', 0.0)}",
                 *advisory.get("classification_reasons", []),
                 *advisory.get("preferred_upstream_surface_ids", []),
             ],
@@ -1076,6 +1096,254 @@ def _build_state_lifecycle_model(surfaces: list[dict[str, Any]]) -> dict[str, An
             if profile.get("temporal_profile") in {"ui_projection_after_hydration", "survives_until_sync", "overwritten_after_refresh"}
         ][:15],
     }
+
+
+def _attach_patch_advisories(
+    surfaces: list[dict[str, Any]],
+    authority_propagation_graph: dict[str, Any],
+    lifecycle_model: dict[str, Any],
+) -> None:
+    surface_by_id = {str(surface.get("surface_id", "")): surface for surface in surfaces}
+    edges = list(authority_propagation_graph.get("edges", []))
+    routes = list(authority_propagation_graph.get("routes", []))
+    profiles = {
+        str(profile.get("surface_id", "")): profile
+        for profile in lifecycle_model.get("profiles", [])
+    }
+
+    forward_graph: dict[str, list[str]] = {}
+    reverse_graph: dict[str, list[str]] = {}
+    for edge in edges:
+        source_id = str(edge.get("source_surface_id", ""))
+        target_id = str(edge.get("target_surface_id", ""))
+        if not source_id or not target_id:
+            continue
+        forward_graph.setdefault(source_id, []).append(target_id)
+        reverse_graph.setdefault(target_id, []).append(source_id)
+
+    authoritative_ids = [
+        surface_id
+        for surface_id, surface in surface_by_id.items()
+        if surface.get("authority_label") in {"authoritative", "likely_authoritative"}
+    ]
+    projection_ids = [
+        surface_id
+        for surface_id, surface in surface_by_id.items()
+        if surface.get("authority_label") == "display_only" or surface.get("state_surface") == "UI_STATE"
+    ]
+    authority_distance_map = _distance_from_sources(authoritative_ids, forward_graph)
+    projection_depth_map = _distance_from_sources(projection_ids, reverse_graph)
+
+    route_authority_distance: dict[str, int] = {}
+    route_projection_depth: dict[str, int] = {}
+    route_recommended_interception: dict[str, tuple[float, str, str]] = {}
+    for route in routes:
+        path_ids = [str(item) for item in route.get("path_surface_ids", []) if str(item)]
+        route_score = float(route.get("score", 0.0))
+        interception_ref = str(route.get("recommended_interception_ref", ""))
+        interception_reason = str(route.get("recommended_interception_reason", ""))
+        for index, surface_id in enumerate(path_ids):
+            distance = index
+            projection_depth = max(0, len(path_ids) - index - 1)
+            current_distance = route_authority_distance.get(surface_id)
+            if current_distance is None or distance < current_distance:
+                route_authority_distance[surface_id] = distance
+            current_projection = route_projection_depth.get(surface_id)
+            if current_projection is None or projection_depth < current_projection:
+                route_projection_depth[surface_id] = projection_depth
+            current_route = route_recommended_interception.get(surface_id)
+            if current_route is None or route_score > current_route[0]:
+                route_recommended_interception[surface_id] = (route_score, interception_ref, interception_reason)
+
+    for surface in surfaces:
+        surface_id = str(surface.get("surface_id", ""))
+        profile = profiles.get(surface_id, {})
+        temporal_profile = str(profile.get("temporal_profile", surface.get("temporal_profile", "session_scoped")))
+        overwrite_probability = float(surface.get("overwrite_risk", 0.0))
+        if temporal_profile == "overwritten_after_refresh":
+            overwrite_probability = max(overwrite_probability, 0.85)
+        elif temporal_profile == "survives_until_sync":
+            overwrite_probability = max(overwrite_probability, 0.68)
+        elif temporal_profile == "ui_projection_after_hydration":
+            overwrite_probability = max(overwrite_probability, 0.74)
+        elif temporal_profile == "persists_across_relaunch":
+            overwrite_probability = min(overwrite_probability, 0.2)
+        elif temporal_profile == "refresh_origin":
+            overwrite_probability = min(overwrite_probability, 0.12)
+        overwrite_probability = round(min(0.99, max(0.05, overwrite_probability)), 3)
+
+        authority_distance = route_authority_distance.get(surface_id)
+        if authority_distance is None:
+            authority_distance = authority_distance_map.get(surface_id, 99)
+        projection_depth = route_projection_depth.get(surface_id)
+        if projection_depth is None:
+            projection_depth = projection_depth_map.get(surface_id, 99)
+
+        label = str(surface.get("authority_label", ""))
+        patchability = str(surface.get("patchability_class", ""))
+        projection_only_penalty = 0.0
+        if label == "display_only" or patchability == "cosmetic_only":
+            projection_only_penalty = 0.9
+        elif projection_depth == 0:
+            projection_only_penalty = 0.75
+        elif projection_depth == 1:
+            projection_only_penalty = 0.45
+        elif projection_depth == 2:
+            projection_only_penalty = 0.2
+
+        durability_risk = overwrite_probability
+        if label in {"cache", "mirror"}:
+            durability_risk += 0.08
+        if label == "display_only":
+            durability_risk += 0.14
+        if patchability in {"volatile_cache", "volatile_state", "cosmetic_only", "consumer_only"}:
+            durability_risk += 0.08
+        if patchability in {"patch_boundary_or_mapper", "candidate_root_cause"}:
+            durability_risk -= 0.14
+        if temporal_profile == "persists_across_relaunch":
+            durability_risk -= 0.14
+        if temporal_profile == "refresh_origin":
+            durability_risk -= 0.18
+        durability_risk = round(min(0.99, max(0.02, durability_risk)), 3)
+        durability_score = round(1.0 - durability_risk, 3)
+
+        upstream_alignment = 0.0
+        if authority_distance == 0:
+            upstream_alignment = 0.95
+        elif authority_distance == 1:
+            upstream_alignment = 0.75
+        elif authority_distance == 2:
+            upstream_alignment = 0.48
+        elif authority_distance == 99:
+            upstream_alignment = 0.18
+        else:
+            upstream_alignment = max(0.12, 0.4 - (authority_distance * 0.04))
+
+        interception_quality = (
+            float(surface.get("classification_confidence", 0.0)) * 0.35
+            + upstream_alignment * 0.3
+            + (0.25 if patchability in {"patch_boundary_or_mapper", "candidate_root_cause"} else 0.0)
+            - (overwrite_probability * 0.2)
+            - (projection_only_penalty * 0.25)
+        )
+        if label in {"cache", "mirror"}:
+            interception_quality -= 0.08
+        if label == "display_only":
+            interception_quality -= 0.12
+        interception_quality = round(min(0.99, max(0.05, interception_quality)), 3)
+
+        route_info = route_recommended_interception.get(surface_id)
+        recommended_interception_ref = surface.get("surface_ref", "") if authority_distance == 0 else ""
+        recommended_interception_reason = ""
+        if route_info is not None:
+            recommended_interception_ref = route_info[1] or recommended_interception_ref
+            recommended_interception_reason = route_info[2]
+        elif authority_distance <= 1 and patchability in {"patch_boundary_or_mapper", "candidate_root_cause"}:
+            recommended_interception_ref = str(surface.get("surface_ref", ""))
+            recommended_interception_reason = "surface already sits close to the recovered authority boundary"
+
+        advisory_reasons: list[str] = []
+        for reason in surface.get("classification_reasons", []):
+            _append_unique(advisory_reasons, str(reason))
+            if len(advisory_reasons) >= 4:
+                break
+        for reason in surface.get("temporal_reasons", []):
+            _append_unique(advisory_reasons, str(reason))
+            if len(advisory_reasons) >= 6:
+                break
+        if recommended_interception_reason:
+            _append_unique(advisory_reasons, recommended_interception_reason)
+
+        if authority_distance == 0:
+            _append_unique(advisory_reasons, "surface already lies on the recovered upstream authority path")
+        elif authority_distance == 1:
+            _append_unique(advisory_reasons, "surface is one hop downstream of a recovered authority path")
+        elif authority_distance not in {99}:
+            _append_unique(advisory_reasons, f"surface is {authority_distance} hops away from a recovered authority path")
+
+        if projection_depth == 0:
+            _append_unique(advisory_reasons, "surface sits at a UI projection boundary")
+        elif projection_depth not in {99}:
+            _append_unique(advisory_reasons, f"surface remains {projection_depth} hops away from UI projection")
+
+        advisory_counter_signals: list[str] = []
+        for reason in surface.get("counter_signals", []):
+            _append_unique(advisory_counter_signals, str(reason))
+            if len(advisory_counter_signals) >= 4:
+                break
+        for reason in surface.get("temporal_counter_signals", []):
+            _append_unique(advisory_counter_signals, str(reason))
+            if len(advisory_counter_signals) >= 6:
+                break
+
+        if label == "display_only" or patchability == "cosmetic_only":
+            rank_hint = "ui_tactical_only"
+        elif recommended_interception_ref and authority_distance > 0 and overwrite_probability >= 0.55:
+            rank_hint = "prefer_upstream_interception"
+        elif patchability in {"patch_boundary_or_mapper", "candidate_root_cause"} and durability_risk < 0.45:
+            rank_hint = "candidate_durable_root_patch"
+        elif overwrite_probability >= 0.55:
+            rank_hint = "temporary_local_patch"
+        else:
+            rank_hint = "exploratory_patch_ok"
+
+        if rank_hint == "ui_tactical_only":
+            advisory_summary = "Recovered evidence points to a UI/projection surface. Tactical display-only edits may still help, but durable behavior changes likely belong upstream."
+        elif rank_hint == "prefer_upstream_interception":
+            advisory_summary = "Recovered evidence suggests this local target can be overwritten; upstream interception looks more durable, but this remains an advisory rather than a block."
+        elif rank_hint == "candidate_durable_root_patch":
+            advisory_summary = "Recovered evidence suggests this surface sits close to a durable root-cause boundary, so it is a strong interception candidate."
+        elif rank_hint == "temporary_local_patch":
+            advisory_summary = "Recovered evidence suggests this patch may work temporarily until refresh/sync replaces the value."
+        else:
+            advisory_summary = "Recovered evidence is mixed; this target remains a valid exploratory option and final selection should stay with the agent."
+
+        soft_prior_score = round(
+            (durability_score * 35.0)
+            + (upstream_alignment * 25.0)
+            + (interception_quality * 25.0)
+            - (overwrite_probability * 20.0)
+            - (projection_only_penalty * 18.0),
+            3,
+        )
+
+        surface["patch_advisory"] = {
+            "schema": "PatchAdvisory",
+            "evidence_mode": "evidence_first",
+            "advisory_only": True,
+            "decision_owner": "agent",
+            "durability_score": durability_score,
+            "durability_risk": durability_risk,
+            "overwrite_probability": overwrite_probability,
+            "authority_distance": int(authority_distance),
+            "projection_depth": int(projection_depth),
+            "interception_quality": interception_quality,
+            "upstream_alignment": round(upstream_alignment, 3),
+            "projection_only_penalty": round(projection_only_penalty, 3),
+            "recommended_interception_ref": recommended_interception_ref,
+            "recommended_interception_reason": recommended_interception_reason,
+            "temporal_profile": temporal_profile,
+            "rank_hint": rank_hint,
+            "advisory_reasons": advisory_reasons[:8],
+            "advisory_counter_signals": advisory_counter_signals[:8],
+            "advisory_summary": advisory_summary,
+            "soft_prior_score": soft_prior_score,
+        }
+
+
+def _distance_from_sources(source_ids: list[str], adjacency: dict[str, list[str]]) -> dict[str, int]:
+    distances: dict[str, int] = {}
+    frontier = [(source_id, 0) for source_id in source_ids if source_id]
+    seen = {source_id for source_id, _ in frontier}
+    while frontier:
+        current, depth = frontier.pop(0)
+        distances[current] = min(depth, distances.get(current, depth))
+        for neighbor in adjacency.get(current, []):
+            if neighbor in seen:
+                continue
+            seen.add(neighbor)
+            frontier.append((neighbor, depth + 1))
+    return distances
 
 
 def _build_authority_propagation_graph(

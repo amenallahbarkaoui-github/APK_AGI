@@ -22,6 +22,7 @@ def run_patch_validation_pipeline(
     backup_dir: Path,
     patch_journal: list[dict[str, Any]],
     task_plan: list[dict[str, Any]] | None = None,
+    source_of_truth_pack: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run a journal-aware syntax + plan-consistency validation pass."""
     patched_files = _collect_patched_files(apktool_dir, backup_dir, patch_journal)
@@ -59,6 +60,7 @@ def run_patch_validation_pipeline(
     plan_consistency = _evaluate_plan_consistency(
         patch_journal=patch_journal,
         task_plan=list(task_plan or []),
+        source_of_truth_pack=source_of_truth_pack,
     )
     next_actions.extend(
         action for action in plan_consistency["next_actions"]
@@ -67,6 +69,9 @@ def run_patch_validation_pipeline(
 
     return {
         "success": True,
+        "advisory_only": True,
+        "decision_owner": "agent",
+        "evidence_mode": "evidence_first",
         "project_root": str(project_root),
         "patched_files_count": len(patched_files),
         "patched_smali_count": len(patched_smali),
@@ -89,6 +94,8 @@ def run_patch_validation_pipeline(
         "coverage_gaps": plan_consistency["coverage_gaps"],
         "unsafe_overlaps": plan_consistency["unsafe_overlaps"],
         "missing_followups": plan_consistency["missing_followups"],
+        "soft_prior_warnings": plan_consistency["soft_prior_warnings"],
+        "lifecycle_risks": plan_consistency["lifecycle_risks"],
         "next_actions": next_actions,
     }
 
@@ -162,10 +169,13 @@ def _evaluate_plan_consistency(
     *,
     patch_journal: list[dict[str, Any]],
     task_plan: list[dict[str, Any]],
+    source_of_truth_pack: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     successful_entries = [entry for entry in patch_journal if entry.get("success", True)]
     coverage_gaps: list[str] = []
     missing_followups: list[str] = []
+    soft_prior_warnings: list[str] = []
+    lifecycle_risks: list[dict[str, Any]] = []
     unsafe_overlaps: list[dict[str, Any]] = []
 
     pending_statuses = {"pending", "in_progress", "in-progress", "not-started", "not_started"}
@@ -193,8 +203,56 @@ def _evaluate_plan_consistency(
     companion_seen = any(str(entry.get("tool", "")) in companion_tools for entry in successful_entries)
     if gate_like_seen and not companion_seen:
         missing_followups.append(
-            "Gate-oriented patches were recorded without any response/state-boundary or runtime override companion patch."
+            "Gate-oriented patches were recorded without any response/state-boundary or runtime override companion patch; this is an evidence-backed durability warning, not a hard block."
         )
+
+    for entry in successful_entries:
+        advisory = entry.get("source_of_truth_soft_prior")
+        if not isinstance(advisory, dict):
+            continue
+        overwrite_probability = float(advisory.get("overwrite_probability", 0.0) or 0.0)
+        durability_risk = float(advisory.get("durability_risk", 0.0) or 0.0)
+        surface_ref = str(advisory.get("surface_ref", "") or entry.get("description", "patch target")).strip()
+        recommended_interception_ref = str(advisory.get("recommended_interception_ref", "") or "").strip()
+        if overwrite_probability >= 0.55:
+            lifecycle_risks.append({
+                "surface_ref": surface_ref,
+                "overwrite_probability": round(overwrite_probability, 3),
+                "recommended_interception_ref": recommended_interception_ref,
+            })
+            soft_prior_warnings.append(
+                "Source-of-truth soft prior flags high overwrite probability for "
+                f"{surface_ref} ({overwrite_probability:.2f}); prefer upstream interception"
+                + (f" via {recommended_interception_ref}" if recommended_interception_ref else "")
+                + " when durability matters."
+            )
+            if not companion_seen:
+                missing_followups.append(
+                    "High overwrite probability evidence was recovered for "
+                    f"{surface_ref} ({overwrite_probability:.2f}); consider upstream interception"
+                    + (f" via {recommended_interception_ref}" if recommended_interception_ref else "")
+                    + " before treating a gate-only patch as durable. This remains advisory only."
+                )
+        elif durability_risk >= 0.6:
+            soft_prior_warnings.append(
+                "Durability risk remains elevated for "
+                f"{surface_ref} ({durability_risk:.2f}); treat the patch as potentially temporary unless lifecycle/revalidation followups are covered."
+            )
+
+    if isinstance(source_of_truth_pack, dict) and gate_like_seen:
+        advisories = source_of_truth_pack.get("source_of_truth", {}).get("patch_target_advisories", [])
+        if isinstance(advisories, list):
+            for advisory in advisories[:2]:
+                if not isinstance(advisory, dict):
+                    continue
+                overwrite_probability = float(advisory.get("overwrite_probability", 0.0) or 0.0)
+                if overwrite_probability < 0.65:
+                    continue
+                soft_prior_warnings.append(
+                    "Source-of-truth soft prior reports overwrite-heavy targets such as "
+                    f"{advisory.get('surface_ref', '')}; use this as a warning, not a hard block."
+                )
+                break
 
     targets: dict[str, set[str]] = {}
     for entry in successful_entries:
@@ -215,6 +273,8 @@ def _evaluate_plan_consistency(
     score = 100
     score -= min(40, len(coverage_gaps) * 10)
     score -= min(30, len(missing_followups) * 20)
+    score -= min(15, len(soft_prior_warnings) * 5)
+    score -= min(15, len(lifecycle_risks) * 8)
     score -= min(20, len(unsafe_overlaps) * 10)
     score = max(0, score)
 
@@ -222,21 +282,31 @@ def _evaluate_plan_consistency(
     if coverage_gaps:
         next_actions.append("Close the remaining task-plan gaps before treating the patch set as complete.")
     if missing_followups:
-        next_actions.append("Review response/state-boundary or runtime override followups before build if runtime revalidation can overwrite the patched state.")
+        next_actions.append("Review response/state-boundary or runtime override followups before build if runtime revalidation can overwrite the patched state; this is guidance, not a forced gate.")
+    if soft_prior_warnings or lifecycle_risks:
+        next_actions.append("Inspect source-of-truth overwrite/lifecycle advisories before build; consider upstream interception when a patch looks temporary, but keep final patch choice with the agent.")
     if unsafe_overlaps:
         next_actions.append("Inspect files touched by multiple patch tools and confirm the final method/file state before rebuild.")
 
     return {
         "score": score,
+        "score_advisory_only": True,
+        "decision_owner": "agent",
+        "evidence_mode": "evidence_first",
         "coverage_gaps": coverage_gaps,
         "unsafe_overlaps": unsafe_overlaps,
         "missing_followups": missing_followups,
+        "soft_prior_warnings": soft_prior_warnings,
+        "lifecycle_risks": lifecycle_risks,
         "next_actions": next_actions,
         "signals": {
             "task_plan_items": len(task_plan),
             "successful_patch_entries": len(successful_entries),
             "gate_like_seen": gate_like_seen,
             "companion_seen": companion_seen,
+            "source_of_truth_available": isinstance(source_of_truth_pack, dict),
+            "soft_prior_warning_count": len(soft_prior_warnings),
+            "lifecycle_risk_count": len(lifecycle_risks),
         },
     }
 

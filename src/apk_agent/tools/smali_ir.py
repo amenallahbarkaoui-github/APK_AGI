@@ -901,6 +901,8 @@ def _parse_method(lines: list[str], start_idx: int, end_idx: int,
             method.category = cat
             break
 
+    _ensure_method_analysis(method, class_name)
+
     return method
 
 
@@ -927,6 +929,33 @@ def _parse_param_types(param_str: str) -> list[str]:
             types.append(c)
             i += 1
     return types
+
+
+def _ensure_method_analysis(method: SmaliMethod, owner_class: str) -> None:
+    """Populate CFG/liveness/type summaries when they are missing."""
+    if not method.instructions:
+        method.basic_blocks = []
+        method.liveness_in = []
+        method.liveness_out = []
+        method.inferred_register_types = []
+        return
+
+    try:
+        if not method.basic_blocks:
+            method.build_cfg()
+        if len(method.liveness_in) != len(method.instructions) or len(method.liveness_out) != len(method.instructions):
+            method.build_liveness()
+        if len(method.inferred_register_types) != len(method.instructions):
+            method.infer_register_types(owner_class)
+    except Exception:
+        if not method.basic_blocks:
+            method.basic_blocks = []
+        if len(method.liveness_in) != len(method.instructions):
+            method.liveness_in = []
+        if len(method.liveness_out) != len(method.instructions):
+            method.liveness_out = []
+        if len(method.inferred_register_types) != len(method.instructions):
+            method.inferred_register_types = []
 
 
 # ---------------------------------------------------------------------------
@@ -1155,6 +1184,7 @@ def _normalize_loaded_index(index: SmaliIndex) -> SmaliIndex:
                     instr.target_return_type = ""
                 if not hasattr(instr, "target_field_type"):
                     instr.target_field_type = ""
+            _ensure_method_analysis(method, cls.name)
 
     _rebuild_auxiliary_indices(index)
     return index

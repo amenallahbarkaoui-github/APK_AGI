@@ -187,6 +187,84 @@ def _return_insert_points(method: SmaliMethod) -> list[int]:
     return [instr.line - 1 for instr in method.instructions if instr.is_return]
 
 
+def _instruction_index_for_insert(method: SmaliMethod, insert_at: int) -> int | None:
+    for idx, instr in enumerate(method.instructions):
+        if instr.line - 1 >= insert_at:
+            return idx
+    if method.instructions:
+        return len(method.instructions) - 1
+    return None
+
+
+def _live_registers_before_insertion(method: SmaliMethod | None, insert_points: list[int]) -> set[str]:
+    if method is None or not method.instructions:
+        return set()
+    if len(method.liveness_in) != len(method.instructions):
+        method.build_liveness()
+
+    live_registers: set[str] = set()
+    for insert_at in sorted(set(insert_points)):
+        instr_idx = _instruction_index_for_insert(method, insert_at)
+        if instr_idx is None or instr_idx >= len(method.liveness_in):
+            continue
+        live_registers.update(method.liveness_in[instr_idx])
+    return live_registers
+
+
+def _extract_v_registers(smali_code: str) -> list[str]:
+    return sorted(set(re.findall(r'\bv\d+\b', smali_code)), key=lambda reg: int(reg[1:]))
+
+
+def _rewrite_v_registers(smali_code: str, mapping: dict[str, str]) -> str:
+    if not mapping:
+        return smali_code
+    return re.sub(r'\bv\d+\b', lambda match: mapping.get(match.group(0), match.group(0)), smali_code)
+
+
+def _remap_injected_v_registers(
+    smali_code: str,
+    cur_locals: int,
+    live_registers: set[str],
+) -> tuple[str, dict[str, str], int]:
+    source_regs = _extract_v_registers(smali_code)
+    if not source_regs or not live_registers:
+        return smali_code, {}, cur_locals
+
+    unavailable_low = {
+        int(reg[1:])
+        for reg in live_registers
+        if reg.startswith("v") and reg[1:].isdigit() and int(reg[1:]) < 16
+    }
+    low_candidates = [f"v{idx}" for idx in range(16) if idx not in unavailable_low]
+
+    mapping: dict[str, str] = {}
+    for src in source_regs:
+        if low_candidates:
+            mapping[src] = low_candidates.pop(0)
+
+    remaining = [src for src in source_regs if src not in mapping]
+    next_reg = max(cur_locals, 16)
+    for src in remaining:
+        mapping[src] = f"v{next_reg}"
+        next_reg += 1
+
+    rewritten = _rewrite_v_registers(smali_code, mapping)
+    needed_locals = max(cur_locals, max((int(reg[1:]) for reg in mapping.values()), default=-1) + 1)
+    return rewritten, mapping, needed_locals
+
+
+def _pick_safe_low_register(live_registers: set[str], reserved: set[str]) -> str | None:
+    unavailable = {
+        int(reg[1:])
+        for reg in (*live_registers, *reserved)
+        if reg.startswith("v") and reg[1:].isdigit() and int(reg[1:]) < 16
+    }
+    for idx in range(16):
+        if idx not in unavailable:
+            return f"v{idx}"
+    return None
+
+
 def _ensure_registers(lines: list[str], method_start: int, method_end: int,
                       method_header: str, needed_extra: int) -> tuple[int, str]:
     """Bump .locals (or .registers) by *needed_extra* and return (first_new_v, directive_used).
@@ -236,9 +314,6 @@ def inject_code_in_method(
         return {"success": False,
                 "error": f"Method '{method_name}' not found in {path.name}"}
 
-    # --- determine register needs ----------------------------------------
-    max_v = _highest_v_register(smali_code)
-
     # Find current locals count
     cur_locals = 0
     for i in range(start, min(start + 20, end)):
@@ -252,72 +327,7 @@ def inject_code_in_method(
             cur_locals = int(m.group(1)) - param_slots
             break
 
-    if max_v >= 0:
-        needed = max_v + 1
-        if needed > cur_locals:
-            _ensure_registers(lines, start, end, header, needed - cur_locals)
-            cur_locals = needed
-
-    # --- 4-bit register safety check for p0 in iput/iget instructions ---
-    # Dalvik iput/iget use 4-bit register encoding: both value and object
-    # registers must be v0-v15.  p0 maps to v{cur_locals}, so if
-    # cur_locals >= 16, any iput/iget using p0 will fail.
-    p0_as_v = cur_locals
-    p0_needs_alias = p0_as_v > 15
-
-    # Check if injected code uses p0 in 4-bit instructions
-    iput_iget_p0 = bool(re.search(
-        r'\b(iput|iget|iput-object|iget-object|iput-boolean|iget-boolean|'
-        r'iput-wide|iget-wide|iput-short|iget-short|iput-byte|iget-byte|'
-        r'iput-char|iget-char)\b.*\bp0\b', smali_code
-    ))
-
-    if p0_needs_alias and iput_iget_p0:
-        # Auto-fix: rewrite p0 in iput/iget to a low alias register
-        # Pick a safe alias register (use v0 or next available)
-        alias_v = max(max_v + 1 if max_v >= 0 else 0, 0)
-        if alias_v > 14:
-            alias_v = 0  # fall back to v0 — safe to reuse before return
-        alias_reg = f"v{alias_v}"
-
-        # Ensure we have enough locals for the alias
-        if alias_v >= cur_locals:
-            _ensure_registers(lines, start, end, header, alias_v + 1 - cur_locals)
-            # Re-find end
-            for i in range(start, len(lines)):
-                if lines[i].strip() == ".end method":
-                    end = i
-                    break
-
-        # Rewrite p0 in iput/iget instructions to alias_reg, and prepend
-        # move-object/from16 alias_reg, p0
-        new_lines = []
-        for raw_line in smali_code.strip().splitlines():
-            s = raw_line.strip()
-            if re.match(r'(iput|iget)', s) and 'p0' in s:
-                # Replace p0 with alias in this instruction
-                # p0 is the second register in iput (iput vA, p0, field)
-                # or the first register in iget (iget vA, p0, field)
-                new_lines.append(re.sub(r'\bp0\b', alias_reg, s))
-            else:
-                new_lines.append(s)
-
-        # Prepend the alias instruction
-        smali_code = f"move-object/from16 {alias_reg}, p0\n" + "\n".join(new_lines)
-
-    # --- build injection lines -------------------------------------------
-    inject_lines = ["    # === APK-AGI INJECTED CODE ==="]
-    for raw in smali_code.strip().splitlines():
-        inject_lines.append(f"    {raw.strip()}" if raw.strip() else "")
-    inject_lines.append("    # === END INJECTED CODE ===")
-
     # --- locate insertion point ------------------------------------------
-    # Recalculate end after possible register bump
-    for i in range(start, len(lines)):
-        if lines[i].strip() == ".end method":
-            end = i
-            break
-
     insert_points: list[int] = []
 
     if position == "start":
@@ -353,6 +363,50 @@ def inject_code_in_method(
     if not insert_points:
         return {"success": False,
                 "error": f"Could not find insertion point for position '{position}'"}
+
+    live_registers = _live_registers_before_insertion(method_ir, insert_points)
+    smali_code, register_map, needed_locals = _remap_injected_v_registers(smali_code, cur_locals, live_registers)
+
+    max_v = _highest_v_register(smali_code)
+    needed_locals = max(needed_locals, max_v + 1 if max_v >= 0 else cur_locals)
+    if needed_locals > cur_locals:
+        _ensure_registers(lines, start, end, header, needed_locals - cur_locals)
+        cur_locals = needed_locals
+
+    # Recalculate end after possible register bump.
+    for i in range(start, len(lines)):
+        if lines[i].strip() == ".end method":
+            end = i
+            break
+
+    p0_as_v = cur_locals
+    p0_needs_alias = p0_as_v > 15
+    iput_iget_p0 = bool(re.search(
+        r'\b(iput|iget|iput-object|iget-object|iput-boolean|iget-boolean|'
+        r'iput-wide|iget-wide|iput-short|iget-short|iput-byte|iget-byte|'
+        r'iput-char|iget-char)\b.*\bp0\b', smali_code
+    ))
+
+    if p0_needs_alias and iput_iget_p0:
+        alias_reg = _pick_safe_low_register(live_registers, set(_extract_v_registers(smali_code)))
+        if alias_reg is None:
+            return {"success": False, "error": "Could not allocate a safe low register alias for p0"}
+
+        new_lines = []
+        for raw_line in smali_code.strip().splitlines():
+            s = raw_line.strip()
+            if re.match(r'(iput|iget)', s) and 'p0' in s:
+                new_lines.append(re.sub(r'\bp0\b', alias_reg, s))
+            else:
+                new_lines.append(s)
+
+        smali_code = f"move-object/from16 {alias_reg}, p0\n" + "\n".join(new_lines)
+
+    # --- build injection lines -------------------------------------------
+    inject_lines = ["    # === APK-AGI INJECTED CODE ==="]
+    for raw in smali_code.strip().splitlines():
+        inject_lines.append(f"    {raw.strip()}" if raw.strip() else "")
+    inject_lines.append("    # === END INJECTED CODE ===")
 
     # --- insert ----------------------------------------------------------
     applied_lines: list[int] = []
@@ -603,12 +657,14 @@ def find_startup_entry(manifest_path: str | Path,
     ns = {"android": "http://schemas.android.com/apk/res/android"}
     tree = ET.parse(str(manifest))  # noqa: S314
     root = tree.getroot()
+    manifest_package = str(root.get("package") or "").strip()
 
     # 1. Check for Application class
     app_elem = root.find("application")
     app_class = ""
     if app_elem is not None:
         app_class = app_elem.get(f"{{{ns['android']}}}name", "")
+    app_class = _resolve_manifest_component_name(app_class, manifest_package)
 
     if app_class:
         smali_rel = app_class.replace(".", "/") + ".smali"
@@ -643,6 +699,7 @@ def find_launcher_activity_entry(manifest_path: str | Path,
     ns = {"android": "http://schemas.android.com/apk/res/android"}
     tree = ET.parse(str(manifest))  # noqa: S314
     root = tree.getroot()
+    manifest_package = str(root.get("package") or "").strip()
 
     for activity in root.iter("activity"):
         for intent in activity.iter("intent-filter"):
@@ -655,6 +712,7 @@ def find_launcher_activity_entry(manifest_path: str | Path,
             if "MAIN" not in a_name or "LAUNCHER" not in c_name:
                 continue
             act_class = activity.get(f"{{{ns['android']}}}name", "")
+            act_class = _resolve_manifest_component_name(act_class, manifest_package)
             if not act_class:
                 continue
             smali_rel = act_class.replace(".", "/") + ".smali"
@@ -670,6 +728,18 @@ def find_launcher_activity_entry(manifest_path: str | Path,
                 }
 
     return {"success": False, "error": "No launcher Activity found"}
+
+
+def _resolve_manifest_component_name(component_name: str, manifest_package: str) -> str:
+    component_name = str(component_name or "").strip()
+    manifest_package = str(manifest_package or "").strip()
+    if not component_name:
+        return ""
+    if component_name.startswith("."):
+        return f"{manifest_package}{component_name}" if manifest_package else component_name.lstrip(".")
+    if "." not in component_name and manifest_package:
+        return f"{manifest_package}.{component_name}"
+    return component_name
 
 
 def _find_smali_file(apk_dir: Path, rel_path: str) -> Path | None:
