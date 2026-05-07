@@ -170,6 +170,7 @@ def find_enforcement_surfaces(
     graph=None,
     extra_keywords: str = "",
     max_results: int = 25,
+    progress_callback=None,
 ) -> dict[str, Any]:
     """Find likely enforcement methods using architecture/state/revalidation context.
 
@@ -178,13 +179,29 @@ def find_enforcement_surfaces(
     The ranking is architecture-first so it still works when business strings and
     method/class names are obfuscated.
     """
+    def _emit_progress(pct: float, detail: str) -> None:
+        if progress_callback is not None:
+            progress_callback(pct, detail)
+
     focus_terms = _focus_terms(feature, extra_keywords)
-    architecture_context = _build_architecture_context(index, focus_terms)
+    if focus_terms:
+        _emit_progress(22, f"Preparing enforcement surface analysis for {len(focus_terms)} focus terms")
+    else:
+        _emit_progress(22, "Preparing enforcement surface analysis without keyword bias")
+    architecture_context = _build_architecture_context(
+        index,
+        focus_terms,
+        progress_callback=lambda pct, detail: _emit_progress(24 + (pct * 0.34), detail),
+    )
 
     candidates: list[dict[str, Any]] = []
     role_counts: Counter[str] = Counter()
+    total_methods = len(index.methods)
+    scan_interval = max(1, total_methods // 18) if total_methods > 0 else 1
 
-    for method in index.methods.values():
+    _emit_progress(60, f"Scanning {total_methods} methods for enforcement candidates")
+
+    for method_idx, method in enumerate(index.methods.values(), start=1):
         class_name = method.full_signature.split("->", 1)[0] if "->" in method.full_signature else ""
         cls = index.get_class(class_name)
         file_path = cls.file_path if cls else ""
@@ -194,11 +211,6 @@ def find_enforcement_surfaces(
         field_count = sum(1 for instr in method.instructions if instr.is_field_access)
         field_write_count = _field_write_count(method)
         api_categories = _classify_api_calls(method.api_calls)
-
-        graph_sig = _graph_method_signature(method.full_signature)
-        direct_callers = _direct_callers(graph, graph_sig) if graph is not None else []
-        direct_callees = _direct_callees(graph, graph_sig) if graph is not None else []
-        graph_role_contexts = _graph_role_contexts(direct_callers, direct_callees, architecture_context)
         structure = _method_architecture_profile(
             method,
             class_name,
@@ -208,6 +220,16 @@ def find_enforcement_surfaces(
             api_categories,
             architecture_context,
         )
+        if not _has_prefilter_signal(method, structure, branch_count, field_count, field_write_count, api_categories):
+            if method_idx == total_methods or method_idx % scan_interval == 0:
+                scan_pct = 60 + (method_idx / max(total_methods, 1)) * 34
+                _emit_progress(scan_pct, f"Method scan: {method_idx}/{total_methods} methods | {len(candidates)} candidates")
+            continue
+
+        graph_sig = _graph_method_signature(method.full_signature)
+        direct_callers = _direct_callers(graph, graph_sig) if graph is not None else []
+        direct_callees = _direct_callees(graph, graph_sig) if graph is not None else []
+        graph_role_contexts = _graph_role_contexts(direct_callers, direct_callees, architecture_context)
         focus_hits = _focus_hits(
             [
                 class_name,
@@ -231,6 +253,9 @@ def find_enforcement_surfaces(
             direct_callers,
             direct_callees,
         ):
+            if method_idx == total_methods or method_idx % scan_interval == 0:
+                scan_pct = 60 + (method_idx / max(total_methods, 1)) * 34
+                _emit_progress(scan_pct, f"Method scan: {method_idx}/{total_methods} methods | {len(candidates)} candidates")
             continue
 
         surface_role = _surface_role(method, branch_count, field_write_count, api_categories, structure, graph_role_contexts)
@@ -251,6 +276,9 @@ def find_enforcement_surfaces(
         )
 
         if score < 24:
+            if method_idx == total_methods or method_idx % scan_interval == 0:
+                scan_pct = 60 + (method_idx / max(total_methods, 1)) * 34
+                _emit_progress(scan_pct, f"Method scan: {method_idx}/{total_methods} methods | {len(candidates)} candidates")
             continue
 
         role_counts[surface_role] += 1
@@ -282,8 +310,14 @@ def find_enforcement_surfaces(
             "third_party_path": third_party_path,
         })
 
+        if method_idx == total_methods or method_idx % scan_interval == 0:
+            scan_pct = 60 + (method_idx / max(total_methods, 1)) * 34
+            _emit_progress(scan_pct, f"Method scan: {method_idx}/{total_methods} methods | {len(candidates)} candidates")
+
+    _emit_progress(96, f"Ranking {len(candidates)} enforcement candidates")
     candidates.sort(key=lambda item: (-item["score"], item["method"]))
     top = candidates[:max_results]
+    _emit_progress(100, f"Enforcement surface ranking complete: {len(candidates)} candidates, {len(top)} returned")
     return {
         "success": True,
         "feature": feature,
@@ -300,6 +334,7 @@ def find_enforcement_surfaces(
             "boundary first, then inspect downstream accessors with semantic_method_slice before rebuilding."
         ),
     }
+
 
 
 def _match_class(index: "SmaliIndex", class_name: str) -> "SmaliClass | None":
@@ -554,8 +589,8 @@ def _focus_hits(values: list[str], focus_terms: set[str]) -> list[str]:
     return sorted(hits)
 
 
-def _build_architecture_context(index: "SmaliIndex", focus_terms: set[str]) -> dict[str, Any]:
-    return get_cached_architecture_context(index, focus_terms=focus_terms)
+def _build_architecture_context(index: "SmaliIndex", focus_terms: set[str], progress_callback=None) -> dict[str, Any]:
+    return get_cached_architecture_context(index, focus_terms=focus_terms, progress_callback=progress_callback)
 
 
 def _method_architecture_profile(
@@ -665,6 +700,31 @@ def _is_structural_enforcement_candidate(
     if field_write_count > 0 and (structure["entry_point_owner"] or structure["state_model_owner"] or direct_callees):
         return True
     if structure["dynamic_boundary_match"] and (branch_count > 0 or field_write_count > 0):
+        return True
+    return False
+
+
+def _has_prefilter_signal(
+    method: "SmaliMethod",
+    structure: dict[str, Any],
+    branch_count: int,
+    field_count: int,
+    field_write_count: int,
+    api_categories: list[str],
+) -> bool:
+    if structure["owner_roles"]:
+        return True
+    if structure["state_field_hits"] or structure["writer_chain_match"] or structure["reader_chain_match"]:
+        return True
+    if structure["guard_cluster_match"] or structure["revalidation_loop_owner"]:
+        return True
+    if structure["network_state_boundary"] or structure["state_store_boundary"] or structure["dynamic_boundary_match"]:
+        return True
+    if method.return_type in {"Z", "I"} and (branch_count > 0 or field_count > 0):
+        return True
+    if field_write_count > 0:
+        return True
+    if api_categories:
         return True
     return False
 

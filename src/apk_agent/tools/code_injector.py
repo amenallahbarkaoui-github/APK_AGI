@@ -624,17 +624,6 @@ def override_constructor_fields(
         "details": details,
     }
 
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-    return {
-        "success": True,
-        "file": str(path),
-        "constructors_found": len(constructors),
-        "constructors_patched": patched,
-        "fields_overridden": list(field_overrides.keys()),
-        "details": details,
-    }
-
 
 # ---------------------------------------------------------------------------
 # 3. find_startup_entry  (returns info, does NOT inject)

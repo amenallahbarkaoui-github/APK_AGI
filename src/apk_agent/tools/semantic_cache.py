@@ -165,7 +165,7 @@ def get_cached_guard_surface_profile(index, *, focus_hint: str = "", max_cluster
     return cache[key]
 
 
-def get_cached_architecture_context(index, *, focus_terms: set[str] | None = None) -> dict[str, Any]:
+def get_cached_architecture_context(index, *, focus_terms: set[str] | None = None, progress_callback=None) -> dict[str, Any]:
     if index is None:
         return {
             "role_classes": {role: set() for role in _ARCHITECTURE_ROLES},
@@ -183,16 +183,45 @@ def get_cached_architecture_context(index, *, focus_terms: set[str] | None = Non
             "summary": {},
         }
 
+    def _emit_progress(pct: float, detail: str) -> None:
+        if progress_callback is not None:
+            progress_callback(pct, detail)
+
     normalized_focus_terms = tuple(sorted(term for term in (focus_terms or set()) if term))
     key = (_index_signature(index), normalized_focus_terms)
     cache = _slot_cache("architecture_context_cache")
     if key in cache:
+        summary = cache[key].get("summary", {}) if isinstance(cache[key], dict) else {}
+        _emit_progress(100, f"Using cached architecture context: {summary.get('recovered_state_fields', 0)} state fields, {summary.get('guard_methods', 0)} guard methods")
         return cache[key]
 
     focus_hint = ",".join(normalized_focus_terms)
+    if normalized_focus_terms:
+        _emit_progress(4, f"Recovering semantic architecture layers for {len(normalized_focus_terms)} focus terms")
+    else:
+        _emit_progress(4, "Recovering semantic architecture layers")
     architecture = get_cached_semantic_architecture(index, focus_hint=focus_hint, max_per_role=20)
-    hidden_state = get_cached_hidden_state_model(index, focus_hint=focus_hint, max_candidates=50)
+    architecture_layers = architecture.get("architecture_layers", {}) if isinstance(architecture, dict) else {}
+    ranked_role_hits = sum(len(items) for items in architecture_layers.values() if isinstance(items, list))
+    _emit_progress(28, f"Semantic architecture ready: {ranked_role_hits} ranked role hits")
+
+    _emit_progress(30, "Recovering hidden-state model")
+    if progress_callback is not None:
+        hidden_state = get_cached_hidden_state_model(
+            index,
+            focus_hint=focus_hint,
+            max_candidates=50,
+            progress_callback=lambda pct, detail: _emit_progress(30 + (pct * 0.42), detail),
+        )
+    else:
+        hidden_state = get_cached_hidden_state_model(index, focus_hint=focus_hint, max_candidates=50)
+    hidden_summary = hidden_state.get("summary", {}) if isinstance(hidden_state, dict) else {}
+    _emit_progress(74, f"Hidden-state recovery ready: {hidden_summary.get('field_candidates', 0)} field candidates")
+
+    _emit_progress(76, "Profiling guard and revalidation surfaces")
     guard_surface = get_cached_guard_surface_profile(index, focus_hint=focus_hint, max_clusters=50)
+    guard_summary = guard_surface.get("summary", {}) if isinstance(guard_surface, dict) else {}
+    _emit_progress(92, f"Merging architecture context: {guard_summary.get('guard_clusters', 0)} guard clusters, {guard_summary.get('revalidation_loops', 0)} revalidation loops")
 
     role_classes: dict[str, set[str]] = {role: set() for role in _ARCHITECTURE_ROLES}
     role_scores: dict[str, dict[str, float]] = {}
@@ -254,4 +283,5 @@ def get_cached_architecture_context(index, *, focus_terms: set[str] | None = Non
         },
     }
     cache[key] = context
+    _emit_progress(100, f"Architecture context ready: {len(state_fields)} state fields, {len(guard_methods)} guard methods, {len(revalidation_classes)} revalidation classes")
     return context

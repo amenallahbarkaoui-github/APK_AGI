@@ -27,7 +27,7 @@ import json
 import re
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from apk_agent.tools.code_injector import find_startup_entry, inject_code_in_method
 from apk_agent.tools.dex_engine import normalize_smali_root_name, plan_dex_injection
@@ -140,7 +140,23 @@ def _overlay_mode_uses_in_app_attach(mode: str) -> bool:
 
 
 def _overlay_mode_requires_foreground_service(mode: str, *, requested: bool = False) -> bool:
-    return bool(requested or _normalize_overlay_mode_name(mode) == "system_overlay")
+    return bool(requested)
+
+
+def _spec_uses_system_overlay(spec: Mapping[str, Any], overlay_mode: str | None = None) -> bool:
+    normalized_mode = _normalize_overlay_mode_name(overlay_mode or spec.get("overlay_mode") or _DEFAULT_RUNTIME_MENU_OVERLAY_MODE)
+    if _overlay_mode_uses_system_overlay(normalized_mode):
+        return True
+    return any(
+        bool(spec.get(key, False))
+        for key in (
+            "auto_start_overlay",
+            "overlay_fallback_on_attach_failure",
+            "add_overlay_permission_button",
+            "add_overlay_settings_button",
+            "add_restart_overlay_button",
+        )
+    )
 
 
 def _slugify(value: str, *, fallback: str) -> str:
@@ -642,7 +658,11 @@ def _normalize_menu_runtime_settings(spec: dict[str, Any], overlay_mode: str) ->
         raw_settings.get("helper_section_title", spec.get("helper_section_title", _MENU_HELPER_SECTION_TITLE))
         or _MENU_HELPER_SECTION_TITLE
     ).strip() or _MENU_HELPER_SECTION_TITLE
-    overlay_helper_default = include_helper_actions and _overlay_mode_uses_system_overlay(overlay_mode)
+    overlay_helper_default = include_helper_actions and (
+        _overlay_mode_uses_system_overlay(overlay_mode)
+        or overlay_fallback_on_attach_failure
+        or auto_start_overlay
+    )
     add_reset_position_button = bool(
         raw_settings.get(
             "add_reset_position_button",
@@ -1189,7 +1209,7 @@ def build_runtime_menu_spec_from_hook_plan(
         "add_reset_position_button": True,
         "auto_start_overlay": _overlay_mode_uses_system_overlay(overlay_mode) and not _overlay_mode_uses_in_app_attach(overlay_mode),
     }
-    if _overlay_mode_uses_system_overlay(overlay_mode) or _overlay_mode_uses_in_app_attach(overlay_mode):
+    if _overlay_mode_uses_system_overlay(overlay_mode):
         menu_settings.update({
             "request_overlay_permission_on_fallback": True,
             "add_overlay_permission_button": True,
@@ -1230,9 +1250,16 @@ def _effective_overlay_mode(requested_mode: str) -> str:
     return _normalize_overlay_mode_name(requested_mode)
 
 
-def _runtime_menu_requirements(requested_mode: str, require_foreground_service: bool = False) -> dict[str, Any]:
+def _runtime_menu_requirements(
+    requested_mode: str,
+    require_foreground_service: bool = False,
+    *,
+    uses_system_overlay: bool | None = None,
+) -> dict[str, Any]:
     """Describe the real platform/runtime requirements implied by the requested mode."""
     requested_mode = _normalize_overlay_mode_name(requested_mode)
+    if uses_system_overlay is None:
+        uses_system_overlay = _overlay_mode_uses_system_overlay(requested_mode)
     require_foreground_service = _overlay_mode_requires_foreground_service(
         requested_mode,
         requested=require_foreground_service,
@@ -1241,7 +1268,7 @@ def _runtime_menu_requirements(requested_mode: str, require_foreground_service: 
     android_apis: list[str] = []
     warnings: list[str] = []
 
-    if _overlay_mode_uses_system_overlay(requested_mode):
+    if uses_system_overlay:
         permissions.append("android.permission.SYSTEM_ALERT_WINDOW")
         android_apis.extend([
             "android.view.WindowManager",
@@ -1252,7 +1279,7 @@ def _runtime_menu_requirements(requested_mode: str, require_foreground_service: 
         warnings.extend(_TIER_B_WARNINGS)
         if requested_mode == "overlay_primary":
             warnings.append(
-                "overlay_primary runs the overlay as the primary runtime surface, so startup/service stability and notification behavior must be treated as first-class runtime concerns."
+                "overlay_primary stays attach-first by default; enabling overlay fallback adds Tier B permission and service concerns on top of the in-app path."
             )
 
     if require_foreground_service:
@@ -1270,6 +1297,42 @@ def _runtime_menu_requirements(requested_mode: str, require_foreground_service: 
         "permissions": permissions,
         "android_apis": android_apis,
         "warnings": warnings,
+    }
+
+
+def _runtime_menu_requirements_for_spec(spec: Mapping[str, Any], requested_mode: str, require_foreground_service: bool = False) -> dict[str, Any]:
+    uses_system_overlay = _spec_uses_system_overlay(spec, requested_mode)
+    requirements = _runtime_menu_requirements(
+        requested_mode,
+        require_foreground_service=require_foreground_service,
+        uses_system_overlay=uses_system_overlay,
+    )
+    if uses_system_overlay:
+        return requirements
+    return {
+        "permissions": [
+            permission
+            for permission in requirements["permissions"]
+            if permission != "android.permission.SYSTEM_ALERT_WINDOW" and permission != "android.permission.FOREGROUND_SERVICE"
+        ],
+        "android_apis": [
+            api
+            for api in requirements["android_apis"]
+            if api not in {
+                "android.view.WindowManager",
+                "android.view.WindowManager$LayoutParams.TYPE_APPLICATION_OVERLAY",
+                "android.provider.Settings.canDrawOverlays",
+                "android.settings.action.MANAGE_OVERLAY_PERMISSION",
+                "android.app.Service",
+                "android.app.Notification",
+                "android.app.NotificationChannel",
+            }
+        ],
+        "warnings": [
+            warning
+            for warning in requirements["warnings"]
+            if "overlay" not in warning.lower() and "notification" not in warning.lower() and "foreground-service" not in warning.lower()
+        ],
     }
 
 
@@ -3952,7 +4015,8 @@ def inject_runtime_menu_scaffold(
         requested=require_foreground_service,
     )
     normalized_spec["require_foreground_service"] = effective_foreground_service
-    requirements = _runtime_menu_requirements(
+    requirements = _runtime_menu_requirements_for_spec(
+        normalized_spec,
         requested_mode,
         require_foreground_service=effective_foreground_service,
     )
@@ -3987,7 +4051,7 @@ def inject_runtime_menu_scaffold(
             helper_files["MenuToggleCheckedChangeListener.smali"] = _generate_toggle_listener_smali()
         if has_slider:
             helper_files["MenuSliderChangeListener.smali"] = _generate_slider_listener_smali()
-        if _overlay_mode_uses_system_overlay(requested_mode):
+        if _spec_uses_system_overlay(normalized_spec, requested_mode):
             helper_files["OverlayMenuService.smali"] = _generate_overlay_service_smali(normalized_spec)
             helper_files["OverlayMenuDragTouchListener.smali"] = _generate_overlay_drag_listener_smali()
     helper_files.update(custom_helper_files)
@@ -4011,7 +4075,8 @@ def inject_runtime_menu_scaffold(
             resolved_target_smali_root = startup_entry_root
 
     manifest_auto_configured = False
-    manifest_followup_required = _overlay_mode_uses_system_overlay(requested_mode) and not auto_configure_manifest
+    overlay_enabled = _spec_uses_system_overlay(normalized_spec, requested_mode)
+    manifest_followup_required = overlay_enabled and not auto_configure_manifest
     manifest_result: dict[str, Any] = {
         "success": True,
         "requested_overlay_mode": requested_mode,
@@ -4045,12 +4110,12 @@ def inject_runtime_menu_scaffold(
             "helper_files": sorted(helper_files),
             "injection_plan": injection_plan,
             "tier_b_requirements": requirements,
-            "manifest_auto_configure_default": _overlay_mode_uses_system_overlay(requested_mode),
+            "manifest_auto_configure_default": overlay_enabled,
             "manifest_followup_required": manifest_followup_required,
             "recommended_next_tool": "configure_runtime_menu_manifest" if manifest_followup_required else "generate_runtime_validation_plan",
             "recommended_next_args": {
                 "overlay_mode": requested_mode,
-                "add_overlay_permission": _overlay_mode_uses_system_overlay(requested_mode),
+                "add_overlay_permission": overlay_enabled,
                 "require_foreground_service": effective_foreground_service,
             } if manifest_followup_required else {"task": "runtime menu scaffold and controls"},
             "notes": [
@@ -4127,7 +4192,7 @@ def inject_runtime_menu_scaffold(
                     shutil.copy2(backup_path, file_name)
                 errors.append(f"Syntax validation failed for {file_name}; restored from backup")
 
-        if _overlay_mode_uses_system_overlay(requested_mode) and auto_configure_manifest and not errors:
+        if overlay_enabled and auto_configure_manifest and not errors:
             manifest_result = configure_runtime_menu_manifest(
                 apktool_dir,
                 overlay_mode=requested_mode,

@@ -34,7 +34,7 @@ from apk_agent.agent.execution_context import (
     set_active_execution_context,
     set_runtime_slot,
 )
-from apk_agent.progress import progress_manager, set_current_task
+from apk_agent.progress import progress_manager, report_progress, set_current_task
 
 # We use a module-level config holder that gets set at graph construction time.
 _config = CONFIG_PROXY
@@ -61,6 +61,7 @@ _CACHEABLE_TOOLS = frozenset({
     "analyze_manifest_deep", "scan_cloud_secrets", "smali_index_stats",
     "map_semantic_architecture", "recover_hidden_state_model",
     "profile_guard_and_revalidation_surface",
+    "find_enforcement_surfaces",
     "summarize_app_knowledge",
     "summarize_behavior_graph",
     "query_behavior_graph",
@@ -1541,6 +1542,7 @@ _TOOL_TIMEOUT_OVERRIDES: dict[str, int | None] = {
     "recover_hidden_state_model": None,
     "find_dynamic_checks": None,
     "verify_bypass_completeness": None,
+    "find_enforcement_surfaces": 7200,
 }
 
 
@@ -12445,8 +12447,9 @@ def find_enforcement_surfaces(feature: str = "", extra_keywords: str = "", max_r
             graph=graph,
             extra_keywords=extra_keywords,
             max_results=max_results,
+            progress_callback=report_progress,
         )
-        return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
+        return json.dumps(result, ensure_ascii=False, indent=2)
 
     return _safe_call(_run, "find_enforcement_surfaces", _cache_hint=f"{feature}:{extra_keywords}:{max_results}")
 
@@ -13059,10 +13062,11 @@ def plan_runtime_menu_workflow(
                 return class_descriptor
         return class_name
 
+    overlay_requires_manifest = overlay_mode == "system_overlay"
+    overlay_requires_foreground_service = False
+    default_menu_target_root = "auto"
+
     def _chain_for_strategy(strategy_name: str, spec_json: str, override_rules_json: str, class_descriptor: str) -> list[dict[str, Any]]:
-        overlay_requires_manifest = overlay_mode in {"system_overlay", "overlay_primary"}
-        overlay_requires_foreground_service = overlay_mode == "overlay_primary"
-        default_menu_target_root = "auto"
         menu_chain = [
             _step(
                 1,
@@ -13261,9 +13265,9 @@ def plan_runtime_menu_workflow(
                     "spec_json": spec_json,
                     "overlay_mode": overlay_mode,
                     "reapply_on_resume": True,
-                    "auto_configure_manifest": overlay_mode in {"system_overlay", "overlay_primary"},
-                    "require_foreground_service": overlay_mode == "overlay_primary",
-                    "target_smali_root": "auto",
+                    "auto_configure_manifest": overlay_requires_manifest,
+                    "require_foreground_service": overlay_requires_foreground_service,
+                    "target_smali_root": default_menu_target_root,
                 }
             return "draft_runtime_menu_from_hooks", {
                 "focus_hint": focus_hint,
@@ -13308,7 +13312,7 @@ def plan_runtime_menu_workflow(
 
         pack = _ensure_behavior_graph_pack(auto_build=False, focus_hint=focus_hint or class_name)
         if pack is None:
-            return json.dumps({
+            return _materialize_tool_output("plan_runtime_menu_workflow", json.dumps({
                 "success": True,
                 "workflow_mode": "step_by_step_runtime_menu",
                 "behavior_graph_ready": False,
@@ -13329,7 +13333,7 @@ def plan_runtime_menu_workflow(
                     "This planning helper intentionally avoids triggering a full behavior-graph build on its own.",
                     "After build_behavior_graph succeeds, rerun this helper to get a resolved spec_json and binding hints.",
                 ],
-            }, ensure_ascii=False, indent=2)[:30000]
+            }, ensure_ascii=False, indent=2))
 
         hook_plan = _plan_runtime_hooks(
             pack,
@@ -13481,7 +13485,7 @@ def plan_runtime_menu_workflow(
                 "Run configure_runtime_menu_manifest only when the final mode actually needs overlay/service permissions.",
             ],
         }
-        return json.dumps(result, ensure_ascii=False, indent=2)[:30000]
+        return _materialize_tool_output("plan_runtime_menu_workflow", json.dumps(result, ensure_ascii=False, indent=2))
 
     return _safe_call(
         _run,
@@ -13496,7 +13500,7 @@ def inject_runtime_menu_scaffold(
         overlay_mode: str = "overlay_primary",
         reapply_on_resume: bool = True,
     auto_configure_manifest: bool = True,
-    require_foreground_service: bool = True,
+    require_foreground_service: bool = False,
     target_smali_root: str = "",
         dry_run: bool = False,
 ) -> str:
@@ -13573,13 +13577,13 @@ def inject_runtime_menu_scaffold(
             requiring app-specific helper smali.
         - `kind="dispatcher"` binds buttons/toggles/sliders directly to static runtime
             hook methods.
-        - `overlay_mode="overlay_primary"` is the default service-first profile: it starts the
-            overlay service immediately, expects overlay permission, and requests foreground-service
-            support for a persistent floating controller tied to the app runtime.
+        - `overlay_mode="overlay_primary"` is the default attach-first profile: it delivers the
+            menu inside the app view hierarchy without requiring overlay permission by default.
+        - `overlay_mode="system_overlay"` is the explicit Tier B overlay path when you truly need
+            a WindowManager-backed controller and are willing to accept overlay permission/runtime friction.
         - Supported overlay modes are `overlay_primary` and `system_overlay`.
-        - `auto_configure_manifest=true` now applies the needed overlay/service manifest wiring
-            automatically for overlay-based modes; set it to false only when you intentionally want
-            a separate explicit `configure_runtime_menu_manifest(...)` step.
+        - `auto_configure_manifest=true` applies overlay/service manifest wiring only when the
+            chosen mode or runtime settings actually enable an overlay-backed path.
         - Persistent actions and control states are re-applied on later resumes/attaches until the
             generated reset button is pressed.
         """
@@ -13616,7 +13620,7 @@ def inject_runtime_menu_scaffold(
                                 "errors": result.get("errors", [])[:5],
                                 "tool": "inject_runtime_menu_scaffold",
                         })
-                return json.dumps(result, ensure_ascii=False, indent=2)[:30000]
+                return _materialize_tool_output("inject_runtime_menu_scaffold", json.dumps(result, ensure_ascii=False, indent=2))
 
         return _safe_call(_run, "inject_runtime_menu_scaffold")
 
@@ -13745,8 +13749,8 @@ def draft_runtime_menu_from_hooks(
                 "spec_json": draft.get("spec_json", ""),
                 "overlay_mode": overlay_mode,
                 "reapply_on_resume": True,
-                "auto_configure_manifest": overlay_mode in {"system_overlay", "overlay_primary"},
-                "require_foreground_service": overlay_mode == "overlay_primary",
+                "auto_configure_manifest": overlay_mode == "system_overlay",
+                "require_foreground_service": overlay_mode == "system_overlay",
                 "target_smali_root": "auto",
             }
         elif draft["recommended_next_strategy"] in {
@@ -13771,7 +13775,7 @@ def draft_runtime_menu_from_hooks(
                 "class_descriptor": plan.get("class_name", class_name) or "<choose dynamic/native boundary class>",
             }
         draft["output_path"] = str(_behavior_graph_path())
-        return json.dumps(draft, ensure_ascii=False, indent=2)[:30000]
+        return _materialize_tool_output("draft_runtime_menu_from_hooks", json.dumps(draft, ensure_ascii=False, indent=2))
 
     return _safe_call(
         _run,
