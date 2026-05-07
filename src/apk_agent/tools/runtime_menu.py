@@ -132,15 +132,15 @@ def _normalize_overlay_mode_name(raw_mode: Any) -> str:
 
 
 def _overlay_mode_uses_system_overlay(mode: str) -> bool:
-    return _normalize_overlay_mode_name(mode) in _SUPPORTED_OVERLAY_MODES
+    return _normalize_overlay_mode_name(mode) == "system_overlay"
 
 
 def _overlay_mode_uses_in_app_attach(mode: str) -> bool:
-    return False
+    return _normalize_overlay_mode_name(mode) == "overlay_primary"
 
 
 def _overlay_mode_requires_foreground_service(mode: str, *, requested: bool = False) -> bool:
-    return bool(requested or _normalize_overlay_mode_name(mode) == "overlay_primary")
+    return bool(requested or _normalize_overlay_mode_name(mode) == "system_overlay")
 
 
 def _slugify(value: str, *, fallback: str) -> str:
@@ -610,7 +610,7 @@ def _normalize_menu_runtime_settings(spec: dict[str, Any], overlay_mode: str) ->
     if attach_root_strategy not in {"auto", "content_first", "decor_first"}:
         raise ValueError("attach_root_strategy must be one of ['auto', 'content_first', 'decor_first']")
 
-    overlay_fallback_default = False
+    overlay_fallback_default = _overlay_mode_uses_system_overlay(overlay_mode)
     overlay_permission_default = _overlay_mode_uses_system_overlay(overlay_mode)
 
     attach_delay_ms = max(0, min(int(attach_delay_source or 0), 5000))
@@ -630,7 +630,7 @@ def _normalize_menu_runtime_settings(spec: dict[str, Any], overlay_mode: str) ->
             spec.get("request_overlay_permission_on_fallback", overlay_permission_default),
         )
     )
-    overlay_autostart_default = _overlay_mode_uses_system_overlay(overlay_mode)
+    overlay_autostart_default = _overlay_mode_uses_system_overlay(overlay_mode) and not _overlay_mode_uses_in_app_attach(overlay_mode)
     auto_start_overlay = bool(
         raw_settings.get(
             "auto_start_overlay",
@@ -1187,9 +1187,9 @@ def build_runtime_menu_spec_from_hook_plan(
     menu_settings: dict[str, Any] = {
         "include_helper_actions": True,
         "add_reset_position_button": True,
-        "auto_start_overlay": _overlay_mode_uses_system_overlay(overlay_mode),
+        "auto_start_overlay": _overlay_mode_uses_system_overlay(overlay_mode) and not _overlay_mode_uses_in_app_attach(overlay_mode),
     }
-    if _overlay_mode_uses_system_overlay(overlay_mode):
+    if _overlay_mode_uses_system_overlay(overlay_mode) or _overlay_mode_uses_in_app_attach(overlay_mode):
         menu_settings.update({
             "request_overlay_permission_on_fallback": True,
             "add_overlay_permission_button": True,
