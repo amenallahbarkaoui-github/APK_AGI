@@ -95,7 +95,7 @@ def _trim_guard_surface_profile(result: dict[str, Any], max_clusters: int) -> di
     return trimmed
 
 
-def get_cached_semantic_architecture(index, *, focus_hint: str = "", max_per_role: int = 12) -> dict[str, Any]:
+def get_cached_semantic_architecture(index, *, focus_hint: str = "", max_per_role: int = 12, progress_callback=None) -> dict[str, Any]:
     if index is None:
         return {"success": False, "error": "SmaliIndex is required"}
 
@@ -103,14 +103,30 @@ def get_cached_semantic_architecture(index, *, focus_hint: str = "", max_per_rol
     normalized_focus_hint = str(focus_hint or "")
     key = (index_signature, normalized_focus_hint, int(max_per_role))
     cache = _slot_cache("semantic_architecture_cache")
-    if key not in cache:
-        cached_result = _best_cached_result(cache, index_signature, normalized_focus_hint, int(max_per_role))
-        if cached_result is not None:
-            cache[key] = _trim_semantic_architecture(cached_result, int(max_per_role))
-    if key not in cache:
-        from apk_agent.tools.semantic_architecture import map_semantic_architecture
+    if key in cache:
+        if progress_callback is not None:
+            architecture_layers = cache[key].get("architecture_layers", {}) if isinstance(cache[key], dict) else {}
+            ranked_role_hits = sum(len(items) for items in architecture_layers.values() if isinstance(items, list))
+            progress_callback(100, f"Using cached semantic architecture: {ranked_role_hits} ranked role hits")
+        return cache[key]
 
-        cache[key] = map_semantic_architecture(index, focus_hint=normalized_focus_hint, max_per_role=max_per_role)
+    cached_result = _best_cached_result(cache, index_signature, normalized_focus_hint, int(max_per_role))
+    if cached_result is not None:
+        cache[key] = _trim_semantic_architecture(cached_result, int(max_per_role))
+        if progress_callback is not None:
+            architecture_layers = cache[key].get("architecture_layers", {}) if isinstance(cache[key], dict) else {}
+            ranked_role_hits = sum(len(items) for items in architecture_layers.values() if isinstance(items, list))
+            progress_callback(100, f"Using cached semantic architecture: {ranked_role_hits} ranked role hits")
+        return cache[key]
+
+    from apk_agent.tools.semantic_architecture import map_semantic_architecture
+
+    cache[key] = map_semantic_architecture(
+        index,
+        focus_hint=normalized_focus_hint,
+        max_per_role=max_per_role,
+        progress_callback=progress_callback,
+    )
     return cache[key]
 
 

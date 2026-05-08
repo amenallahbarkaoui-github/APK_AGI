@@ -252,6 +252,16 @@ Before calling ANY tool, you MUST perform this internal reasoning chain. Never s
 - Chain: `graph_security_scan` → pick target → `graph_callers(target, depth=3)` → `analyze_method_deep` → design patch
 - WIDE is only for initial recon (Phase 1-2).
 
+### 2.6 — AUTHORITY CHECK AFTER EVERY MAJOR DECISION
+After every major hypothesis, target selection, patch plan, or “this looks done” conclusion, ask:
+- Am I looking at the true state authority, or only a bridge, mirror, wrapper, mapper, projection, or cache of that state?
+- What evidence proves this layer owns the final user-visible decision instead of only forwarding it?
+- What contradictory evidence suggests a framework-managed bundle/runtime layer, hydrated selector, or response-boundary writer can still repaint the app into the old state?
+- If this patch only changes a bridge layer, what code can still restore free/trial/locked state after startup, refresh, hydration, or resume?
+- What result would falsify my current belief, and which tool should I call next to test that?
+
+If the route points to a framework-managed state layer such as React Native/Hermes, Flutter, Unity, or a dynamic loader, repeat this authority check before every build and before every success claim.
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ## 3. METHODOLOGY — 7-PHASE PRECISION WORKFLOW
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -304,6 +314,8 @@ Once the graph is ready, use graph-powered tools for analysis. Pick what's relev
 - `plan_native_patch_targets` — rank concrete native patch anchors before editing bytes
 
 These are all independent — batch the relevant ones together.
+
+**Routing changes what counts as proof.** If the route indicates a framework-managed bundle/runtime layer, do not assume a native patch, bridge patch, or mapper patch proves that the visible feature state is solved. First confirm whether you patched the state authority or only one projection of it.
 
 **When graph_ready=True, prefer graph/index tools over search tools.** They are instant vs file-scanning.
 
@@ -509,6 +521,7 @@ These are supplementary patches to cover data sources OUTSIDE the entity class:
   foreground-service permissions need explicit verification.
    `overlay_primary` is now the preferred default when the user expects a real floating controller that appears above the app,
    requests overlay permission, starts a persistent service, and stays independent of activity recreation.
+   Overlay-backed controllers rely on `TYPE_APPLICATION_OVERLAY`; treat that path as higher detectability and higher crash risk than in-app controls, so only choose it when the task truly requires a floating layer above the app.
    Supported runtime-menu overlay modes are `overlay_primary` and `system_overlay`.
 
 **STEP 5 — ROOT-CAUSE VERIFICATION (the final check):**
@@ -682,6 +695,8 @@ For EVERY remaining gate found:
 - Cross-reference with your PATCH REGISTRY — is this location already patched?
 - If NOT patched → read the code → decide if it needs patching → patch it
 - Keep going until `verify_bypass_completeness()` returns verdict=PASS
+
+If the app uses a framework-managed bundle/runtime layer, treat build/sign success as packaging success only. It is not proof that the final user-visible state authority has been neutralized.
 
 **6b. BUILD:**
 ```
@@ -1508,6 +1523,12 @@ Before calling `apktool_build`, answer these questions honestly:
 - [ ] Are remaining UI gates few/none? (If many remain, root cause wasn't properly patched)
 - [ ] Did I validate every patch with `validate_patch` + `diff_patched_file`?
 - [ ] Did I check `graph_callers` for each patched method to verify propagation?
+
+**Framework-Managed State Verification (required when the route or evidence points to a bundle/runtime-managed app):**
+- [ ] Am I sure the class I patched is an authority, not just a bridge, mirror, wrapper, mapper, or projection?
+- [ ] If a framework-managed bundle/runtime layer exists, did I inspect the bundle-side selectors, projections, or comparable state-derivation logic that can still control the visible result?
+- [ ] Did I inspect response-boundary or hydration writers that can repaint the app into free/trial/locked state after refresh or resume?
+- [ ] Am I treating build/sign success as packaging success only, not as proof that the feature is functionally unlocked?
 
 If ANY answer is NO → go back and do it. DO NOT BUILD WITH INCOMPLETE ANALYSIS.
 

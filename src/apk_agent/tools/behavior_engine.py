@@ -45,10 +45,15 @@ def build_behavior_graph(
     max_security: int = 40,
     max_hooks: int = 20,
     max_symbol_hints: int = 20,
+    progress_callback=None,
 ) -> dict[str, Any]:
     """Build a unified control/data/state/security behavior graph pack."""
     if index is None:
         return {"success": False, "error": "SmaliIndex is required"}
+
+    def _emit_progress(pct: float, detail: str) -> None:
+        if progress_callback is not None:
+            progress_callback(pct, detail)
 
     from apk_agent.tools.app_knowledge import build_app_knowledge_pack
     from apk_agent.tools.semantic_cache import (
@@ -62,16 +67,33 @@ def build_behavior_graph(
 
     # Warm the widest semantic views first so narrower downstream consumers
     # (app knowledge, enforcement context, query helpers) reuse the same pass.
-    get_cached_semantic_architecture(index, focus_hint=focus_hint, max_per_role=20)
-    get_cached_hidden_state_model(index, focus_hint=focus_hint, max_candidates=50)
+    _emit_progress(4, "Preparing behavior graph inputs")
+    _emit_progress(8, "Recovering semantic architecture layers")
+    get_cached_semantic_architecture(
+        index,
+        focus_hint=focus_hint,
+        max_per_role=20,
+        progress_callback=lambda pct, detail: _emit_progress(8 + (pct * 0.18), detail),
+    )
+    _emit_progress(28, "Recovering hidden-state model")
+    get_cached_hidden_state_model(
+        index,
+        focus_hint=focus_hint,
+        max_candidates=50,
+        progress_callback=lambda pct, detail: _emit_progress(28 + (pct * 0.18), detail),
+    )
+    _emit_progress(48, "Profiling guard and revalidation surfaces")
     get_cached_guard_surface_profile(index, focus_hint=focus_hint, max_clusters=50)
+    _emit_progress(58, "Guard surface profile ready")
 
+    _emit_progress(60, "Building application knowledge pack")
     app_pack = build_app_knowledge_pack(
         index,
         focus_hint=focus_hint,
         package_name=package_name,
         app_label=app_label,
     )
+    _emit_progress(72, f"Application knowledge ready: {len(app_pack.get('records', []))} records")
     if not app_pack.get("success", False):
         warnings.append(str(app_pack.get("error", "app knowledge build failed")))
         app_pack = {
@@ -99,16 +121,19 @@ def build_behavior_graph(
             "summary": {},
         }
 
+    _emit_progress(74, "Recovering enforcement surfaces")
     enforcement = find_enforcement_surfaces(
         index,
         feature=focus_hint,
         graph=graph,
         max_results=max_surfaces,
+        progress_callback=lambda pct, detail: _emit_progress(74 + (pct * 0.18), detail),
     )
     if not enforcement.get("success", False):
         warnings.append(str(enforcement.get("error", "enforcement surface recovery failed")))
         enforcement = {"surfaces": [], "summary": {}, "role_summary": {}, "total_candidates": 0}
 
+    _emit_progress(94, "Assembling behavior graph records")
     feature_controls = _build_feature_controls(
         enforcement.get("surfaces", []),
         hidden_state.get("candidate_state_fields", []),
@@ -146,6 +171,7 @@ def build_behavior_graph(
     )
 
     built_at = time.time()
+    _emit_progress(98, "Computing behavior graph summary")
     pack = {
         "success": True,
         "pack_version": PACK_VERSION,
@@ -189,6 +215,10 @@ def build_behavior_graph(
         ),
         "warnings": warnings + list(app_pack.get("warnings", [])),
     }
+    _emit_progress(
+        100,
+        f"Behavior graph complete: {len(records[:400])} records, {len(feature_controls)} controls, {len(enforcement.get('surfaces', []))} enforcement surfaces",
+    )
     return pack
 
 

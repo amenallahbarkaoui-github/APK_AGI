@@ -12522,12 +12522,18 @@ def map_semantic_architecture(focus_hint: str = "", max_per_role: int = 12) -> s
     guards, dynamic/native boundaries, and billing flow.
     """
     from apk_agent.tools.semantic_cache import get_cached_semantic_architecture as _map
+    from apk_agent.progress import report_progress
 
     def _run():
         idx = _ensure_smali_index()
         if idx is None:
             return json.dumps({"success": False, "error": "No SmaliIndex. Run build_smali_index first."})
-        result = _map(idx, focus_hint=focus_hint, max_per_role=max_per_role)
+        result = _map(
+            idx,
+            focus_hint=focus_hint,
+            max_per_role=max_per_role,
+            progress_callback=report_progress,
+        )
         return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
 
     return _safe_call(_run, "map_semantic_architecture", _cache_hint=f"{focus_hint}:{max_per_role}")
@@ -12704,6 +12710,7 @@ def build_behavior_graph(
         save_behavior_graph,
         summarize_behavior_graph,
     )
+    from apk_agent.progress import report_progress
 
     def _run():
         idx = _ensure_smali_index()
@@ -12720,6 +12727,7 @@ def build_behavior_graph(
             max_surfaces=max_surfaces,
             max_controls=max_controls,
             max_transitions=max_transitions,
+            progress_callback=report_progress,
         )
         pack_path = _behavior_graph_path()
         save_result = save_behavior_graph(pack, pack_path)

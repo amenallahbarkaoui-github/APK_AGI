@@ -177,7 +177,7 @@ def _looks_like_state_model(smali_class, blob: str) -> tuple[int, list[str]]:
     return score, evidence
 
 
-def map_semantic_architecture(index, *, focus_hint: str = "", max_per_role: int = 12) -> dict[str, Any]:
+def map_semantic_architecture(index, *, focus_hint: str = "", max_per_role: int = 12, progress_callback=None) -> dict[str, Any]:
     """Infer the application's semantic architecture from SmaliIndex.
 
     Args:
@@ -188,6 +188,10 @@ def map_semantic_architecture(index, *, focus_hint: str = "", max_per_role: int 
     if index is None:
         return {"success": False, "error": "SmaliIndex is required"}
 
+    def _emit_progress(pct: float, detail: str) -> None:
+        if progress_callback is not None:
+            progress_callback(pct, detail)
+
     focus_terms = [term.strip().lower() for term in focus_hint.split(",") if term.strip()]
     role_scores: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     role_evidence: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
@@ -196,9 +200,18 @@ def map_semantic_architecture(index, *, focus_hint: str = "", max_per_role: int 
 
     candidate_state_models: set[str] = set()
 
-    for smali_class in index.classes.values():
-        if _is_third_party_path(smali_class.file_path):
-            continue
+    classes_to_scan = [
+        smali_class
+        for smali_class in index.classes.values()
+        if not _is_third_party_path(smali_class.file_path)
+    ]
+    total_classes = len(classes_to_scan)
+    scan_interval = max(1, total_classes // 12) if total_classes > 0 else 1
+    link_interval = max(1, total_classes // 10) if total_classes > 0 else 1
+
+    _emit_progress(4, f"Scanning {total_classes} classes for semantic architecture roles")
+
+    for class_idx, smali_class in enumerate(classes_to_scan, start=1):
 
         blob = _class_blob(smali_class)
         cls_name = smali_class.name
@@ -245,9 +258,16 @@ def map_semantic_architecture(index, *, focus_hint: str = "", max_per_role: int 
             ):
                 _push_role(role_scores, role_evidence, cls_name, role, 2, f"focus hint match: {focus_hint}")
 
-    for smali_class in index.classes.values():
-        if _is_third_party_path(smali_class.file_path):
-            continue
+        if class_idx == total_classes or class_idx % scan_interval == 0:
+            scan_pct = 4 + (class_idx / max(total_classes, 1)) * 54
+            _emit_progress(
+                scan_pct,
+                f"Architecture scan: {class_idx}/{total_classes} classes | {len(role_scores)} scored classes",
+            )
+
+    _emit_progress(60, f"Linking state and entry boundaries across {total_classes} classes")
+
+    for class_idx, smali_class in enumerate(classes_to_scan, start=1):
 
         class_role_map = role_scores.get(smali_class.name, {})
         if not class_role_map:
@@ -277,8 +297,17 @@ def map_semantic_architecture(index, *, focus_hint: str = "", max_per_role: int 
                 if any(term in api_call.lower() for term in _STORE_HINTS):
                     _push_role(role_scores, role_evidence, smali_class.name, "state_stores", 2, f"store API call: {api_call}")
 
+        if class_idx == total_classes or class_idx % link_interval == 0:
+            link_pct = 60 + (class_idx / max(total_classes, 1)) * 28
+            _emit_progress(
+                link_pct,
+                f"Boundary linking: {class_idx}/{total_classes} classes | {len(state_edges)} state edges, {len(entry_edges)} entry edges",
+            )
+
     architecture_layers: dict[str, list[dict[str, Any]]] = {}
     role_overlap: list[dict[str, Any]] = []
+
+    _emit_progress(90, "Ranking architecture layers")
 
     for role in (
         "entry_points",
@@ -331,6 +360,7 @@ def map_semantic_architecture(index, *, focus_hint: str = "", max_per_role: int 
     high_value_components.sort(key=lambda item: (-item["score_total"], item["class"]))
 
     recommendations: list[str] = []
+    _emit_progress(96, "Computing architecture overlaps and next targets")
     if architecture_layers["billing_flow"]:
         recommendations.append("Start from billing_flow classes, then trace into state_models and ui_gate_controllers.")
     if architecture_layers["security_guards"]:
@@ -340,10 +370,10 @@ def map_semantic_architecture(index, *, focus_hint: str = "", max_per_role: int 
     if architecture_layers["dynamic_native_boundaries"]:
         recommendations.append("Expect static patches to be incomplete unless dynamic/native boundaries are mapped and guarded.")
 
-    return {
+    result = {
         "success": True,
         "focus_hint": focus_hint,
-        "total_classes_analyzed": sum(1 for c in index.classes.values() if not _is_third_party_path(c.file_path)),
+        "total_classes_analyzed": total_classes,
         "architecture_layers": architecture_layers,
         "high_value_components": high_value_components[:20],
         "role_overlaps": role_overlap[:20],
@@ -351,3 +381,8 @@ def map_semantic_architecture(index, *, focus_hint: str = "", max_per_role: int 
         "entry_to_state_paths": entry_edges[:30],
         "recommended_next_targets": recommendations,
     }
+    _emit_progress(
+        100,
+        f"Semantic architecture complete: {len(high_value_components)} high-value components across {total_classes} classes",
+    )
+    return result

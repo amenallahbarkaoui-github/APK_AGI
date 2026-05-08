@@ -58,6 +58,7 @@ def run_patch_validation_pipeline(
         next_actions.append("No patched files were detected from patch journal/backups; confirm a patch actually ran.")
 
     plan_consistency = _evaluate_plan_consistency(
+        apktool_dir=apktool_dir,
         patch_journal=patch_journal,
         task_plan=list(task_plan or []),
         source_of_truth_pack=source_of_truth_pack,
@@ -167,6 +168,7 @@ def generate_runtime_validation_plan(
 
 def _evaluate_plan_consistency(
     *,
+    apktool_dir: Path,
     patch_journal: list[dict[str, Any]],
     task_plan: list[dict[str, Any]],
     source_of_truth_pack: dict[str, Any] | None = None,
@@ -205,6 +207,14 @@ def _evaluate_plan_consistency(
         missing_followups.append(
             "Gate-oriented patches were recorded without any response/state-boundary or runtime override companion patch; this is an evidence-backed durability warning, not a hard block."
         )
+
+    framework_state_risk = _detect_framework_state_authority_gap(
+        apktool_dir=apktool_dir,
+        successful_entries=successful_entries,
+        companion_seen=companion_seen,
+    )
+    if framework_state_risk is not None:
+        missing_followups.append(framework_state_risk["warning"])
 
     for entry in successful_entries:
         advisory = entry.get("source_of_truth_soft_prior")
@@ -283,6 +293,8 @@ def _evaluate_plan_consistency(
         next_actions.append("Close the remaining task-plan gaps before treating the patch set as complete.")
     if missing_followups:
         next_actions.append("Review response/state-boundary or runtime override followups before build if runtime revalidation can overwrite the patched state; this is guidance, not a forced gate.")
+    if framework_state_risk is not None:
+        next_actions.append(framework_state_risk["next_action"])
     if soft_prior_warnings or lifecycle_risks:
         next_actions.append("Inspect source-of-truth overwrite/lifecycle advisories before build; consider upstream interception when a patch looks temporary, but keep final patch choice with the agent.")
     if unsafe_overlaps:
@@ -304,11 +316,160 @@ def _evaluate_plan_consistency(
             "successful_patch_entries": len(successful_entries),
             "gate_like_seen": gate_like_seen,
             "companion_seen": companion_seen,
+            "framework_bundle_state_evidence": framework_state_risk is not None and framework_state_risk["bundle_state_evidence"],
+            "framework_bridge_or_mirror_patch_seen": framework_state_risk is not None and framework_state_risk["bridge_or_mirror_patch_seen"],
+            "framework_state_followup_seen": framework_state_risk is not None and framework_state_risk["state_followup_seen"],
             "source_of_truth_available": isinstance(source_of_truth_pack, dict),
             "soft_prior_warning_count": len(soft_prior_warnings),
             "lifecycle_risk_count": len(lifecycle_risks),
         },
     }
+
+
+def _detect_framework_state_authority_gap(
+    *,
+    apktool_dir: Path,
+    successful_entries: list[dict[str, Any]],
+    companion_seen: bool,
+) -> dict[str, Any] | None:
+    framework_profile = _detect_framework_state_profile(apktool_dir)
+    bundle_state_evidence = framework_profile["managed_state_evidence"]
+    bridge_or_mirror_patch_seen = _has_bridge_or_mirror_patch(successful_entries, framework_profile)
+    state_followup_seen = companion_seen or _has_framework_state_followup(successful_entries, framework_profile)
+
+    if not bundle_state_evidence or not bridge_or_mirror_patch_seen or state_followup_seen:
+        return None
+
+    surfaces = ", ".join(framework_profile["surface_labels"])
+
+    return {
+        "bundle_state_evidence": bundle_state_evidence,
+        "bridge_or_mirror_patch_seen": bridge_or_mirror_patch_seen,
+        "state_followup_seen": state_followup_seen,
+        "warning": (
+            "Framework-managed state evidence was found"
+            + (f" ({surfaces})" if surfaces else "")
+            + ", but the recorded patches still look focused on bridge/mirror layers without any bundle-side, native-runtime, or state-boundary followup; the final premium decision may still be owned by a hydrated selector, projection, native authority, or response-boundary writer rather than the patched bridge."
+        ),
+        "next_action": (
+            "Before build, ask whether the patched class is the state authority or only a bridge/mirror. If a framework-managed runtime layer exists, inspect bundle-side selectors, native payload authorities, projections, and response-boundary writers instead of treating packaging success as proof of functional unlock."
+        ),
+        "surface_labels": framework_profile["surface_labels"],
+    }
+
+
+def _detect_framework_state_profile(apktool_dir: Path) -> dict[str, Any]:
+    assets_dir = apktool_dir / "assets"
+    lib_dir = apktool_dir / "lib"
+    asset_files = list(assets_dir.rglob("*")) if assets_dir.is_dir() else []
+    lib_files = list(lib_dir.rglob("*.so")) if lib_dir.is_dir() else []
+
+    react_native = any(path.name in {"index.android.bundle", "index.bundle"} for path in asset_files if path.is_file())
+    if not react_native:
+        react_native = any(path.suffix.lower() in {".bundle", ".jsbundle", ".hbc"} for path in asset_files if path.is_file())
+
+    flutter = (assets_dir / "flutter_assets").exists() or any(
+        path.name in {"libflutter.so", "libapp.so"} for path in lib_files
+    )
+    unity = (assets_dir / "bin" / "Data").exists() or any(
+        path.name == "global-metadata.dat" for path in asset_files if path.is_file()
+    ) or any(path.name == "libil2cpp.so" for path in lib_files)
+
+    surface_labels: list[str] = []
+    if react_native:
+        surface_labels.append("bundle assets")
+    if flutter:
+        surface_labels.append("flutter runtime/native payloads")
+    if unity:
+        surface_labels.append("unity il2cpp/native metadata")
+
+    return {
+        "react_native": react_native,
+        "flutter": flutter,
+        "unity": unity,
+        "managed_state_evidence": bool(surface_labels),
+        "surface_labels": surface_labels,
+    }
+
+
+def _has_bridge_or_mirror_patch(
+    successful_entries: list[dict[str, Any]],
+    framework_profile: dict[str, Any],
+) -> bool:
+    bridge_terms = (
+        "bridge",
+        "mapper",
+        "module",
+        "wrapper",
+        "adapter",
+        "projection",
+        "mirror",
+        "hydrat",
+        "selector",
+        "channel",
+        "plugin",
+    )
+    state_terms = (
+        "premium",
+        "pro",
+        "trial",
+        "subscription",
+        "purchase",
+        "billing",
+        "entitlement",
+        "offer",
+        "paywall",
+        "unlock",
+    )
+    framework_terms = ["native"]
+    if framework_profile.get("react_native"):
+        framework_terms.extend(("react", "bundle", "js", "hermes"))
+    if framework_profile.get("flutter"):
+        framework_terms.extend(("flutter", "dart", "methodchannel", "channel", "libapp", "libflutter"))
+    if framework_profile.get("unity"):
+        framework_terms.extend(("unity", "il2cpp", "metadata", "player"))
+
+    for entry in successful_entries:
+        blob = " ".join(
+            str(entry.get(key, "") or "")
+            for key in ("tool", "target_file", "description", "target_class", "class_name")
+        ).lower()
+        has_bridge_term = any(term in blob for term in bridge_terms)
+        has_state_term = any(term in blob for term in state_terms)
+        has_framework_term = any(term in blob for term in framework_terms)
+        if has_bridge_term and (has_state_term or has_framework_term):
+            return True
+    return False
+
+
+def _has_framework_state_followup(
+    successful_entries: list[dict[str, Any]],
+    framework_profile: dict[str, Any],
+) -> bool:
+    framework_file_markers: set[str] = set()
+    framework_blob_terms = {"selector", "hydrat", "offer", "trial label", "state writer"}
+    if framework_profile.get("react_native"):
+        framework_file_markers.update({".bundle", ".jsbundle", ".hbc"})
+        framework_blob_terms.update({"bundle", "projection", "hermes"})
+    if framework_profile.get("flutter"):
+        framework_file_markers.update({"libapp.so", "libflutter.so"})
+        framework_blob_terms.update({"libapp", "libflutter", "dart aot", "native payload", "ffi writer"})
+    if framework_profile.get("unity"):
+        framework_file_markers.update({"libil2cpp.so", "global-metadata.dat"})
+        framework_blob_terms.update({"libil2cpp", "global-metadata", "native payload", "playerloop"})
+
+    for entry in successful_entries:
+        tool = str(entry.get("tool", "") or "").strip().lower()
+        target_file = str(entry.get("target_file", "") or "").strip().lower()
+        description = str(entry.get("description", "") or "").strip().lower()
+        blob = " ".join((tool, target_file, description))
+        if tool in {"patch_api_response_flow", "inject_runtime_override_layer"}:
+            return True
+        if any(marker in target_file for marker in framework_file_markers):
+            return True
+        if any(term in blob for term in framework_blob_terms):
+            return True
+    return False
 
 
 def _collect_patched_files(apktool_dir: Path, backup_dir: Path, patch_journal: list[dict[str, Any]]) -> list[Path]:

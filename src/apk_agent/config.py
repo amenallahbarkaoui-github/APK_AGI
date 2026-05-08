@@ -8,8 +8,49 @@ import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import load_dotenv
+
+
+def normalize_api_base_url(url: str) -> tuple[str, list[str]]:
+    """Normalize common OpenAI-compatible base URL mistakes.
+
+    Users often paste the full `.../chat/completions` endpoint into
+    `API_BASE_URL`, but the OpenAI client expects the base path only and
+    appends `/chat/completions` itself.
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return "", []
+
+    parsed = urlsplit(raw)
+    if not parsed.scheme or not parsed.netloc:
+        return raw, []
+
+    warnings: list[str] = []
+    normalized_path = parsed.path.rstrip("/")
+
+    stripped_suffix = ""
+    for suffix in ("/chat/completions", "/responses"):
+        if normalized_path.endswith(suffix):
+            normalized_path = normalized_path[: -len(suffix)]
+            stripped_suffix = suffix
+            break
+
+    normalized = urlunsplit((parsed.scheme, parsed.netloc, normalized_path, "", ""))
+
+    if stripped_suffix:
+        warnings.append(
+            "API_BASE_URL included the full "
+            f"{stripped_suffix.lstrip('/')} endpoint; using base URL {normalized} instead."
+        )
+    elif parsed.query or parsed.fragment:
+        warnings.append(
+            "API_BASE_URL should not include query parameters or fragments; ignoring them."
+        )
+
+    return normalized, warnings
 
 
 @dataclass
@@ -158,6 +199,11 @@ class AppConfig:
     def validate(self) -> list[str]:
         """Validate config; returns list of warnings (empty == all OK)."""
         warnings: list[str] = []
+
+        normalized_api_base_url, base_url_warnings = normalize_api_base_url(self.api_base_url)
+        if normalized_api_base_url != self.api_base_url:
+            self.api_base_url = normalized_api_base_url
+        warnings.extend(base_url_warnings)
 
         if not self.api_key:
             warnings.append("API_KEY not set — LLM calls will fail.")

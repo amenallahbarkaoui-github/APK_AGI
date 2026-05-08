@@ -14,6 +14,8 @@ if TYPE_CHECKING:
 import httpx
 from langchain_openai import ChatOpenAI
 
+from apk_agent.config import normalize_api_base_url
+
 # ---------------------------------------------------------------------------
 # Reasoning / thinking content capture
 # ---------------------------------------------------------------------------
@@ -274,6 +276,13 @@ def get_llm(
             "Set the model explicitly."
         )
 
+    api_base_url, _ = normalize_api_base_url(config.api_base_url)
+    if not api_base_url:
+        raise ValueError(
+            "API_BASE_URL not set in .env. "
+            "Set the provider base URL explicitly."
+        )
+
     model_supports_thinking = _model_supports_thinking(config.model_name)
     thinking_enabled = model_supports_thinking if enable_thinking is None else bool(enable_thinking and model_supports_thinking)
 
@@ -286,7 +295,7 @@ def get_llm(
     llm_kwargs: dict[str, Any] = {
         "model": config.model_name,
         "api_key": config.api_key,
-        "base_url": config.api_base_url,
+        "base_url": api_base_url,
         "temperature": 1.0 if model_supports_thinking else temperature,
         "max_tokens": max_tokens,
         "http_client": http_client,

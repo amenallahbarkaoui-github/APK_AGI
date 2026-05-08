@@ -47,6 +47,8 @@ desktop.ini
 workspace/
 ptoject test/
 ApkPatcher-main/
+/log.txt
+.github/instructions/*.instructions.md
 *.apk
 *.xapk
 *.keystore

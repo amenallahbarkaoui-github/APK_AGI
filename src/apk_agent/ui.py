@@ -145,6 +145,7 @@ class TokenTracker:
         self._running_tools: int = 0
         self._tool_progress_pct: float = 0.0
         self._tool_progress_detail: str = ""
+        self._tool_progress_by_name: dict[str, dict[str, Any]] = {}
         self._tools_completed_this_turn: int = 0
         self._last_tool_completed: str = ""
         self._completed_tool_names: list[str] = []
@@ -164,6 +165,7 @@ class TokenTracker:
             self._running_tools = 0
             self._tool_progress_pct = 0.0
             self._tool_progress_detail = ""
+            self._tool_progress_by_name = {}
             self._tools_completed_this_turn = 0
             self._last_tool_completed = ""
             self._completed_tool_names = []
@@ -188,6 +190,7 @@ class TokenTracker:
                 return
             if normalized not in self._active_tool_names:
                 self._active_tool_names.append(normalized)
+            self._tool_progress_by_name.setdefault(normalized, {"pct": 0.0, "detail": ""})
             label = normalized if len(self._active_tool_names) == 1 else f"{len(self._active_tool_names)} tools running"
             if self._active_tool != label:
                 self._active_tool_start = time.time()
@@ -199,16 +202,37 @@ class TokenTracker:
             self._agent_phase = ""
             self._agent_phase_start = 0.0
 
-    def sync_running_tools(self, names: list[str]) -> None:
+    def sync_running_tools(self, names: list[Any]) -> None:
         with self._lock:
-            active_names = [str(name) for name in names if str(name).strip()]
+            active_names: list[str] = []
+            progress_by_name: dict[str, dict[str, Any]] = {}
+            for item in names:
+                if hasattr(item, "name"):
+                    name = str(getattr(item, "name", "") or "").strip()
+                    pct = float(getattr(item, "progress_pct", 0.0) or 0.0)
+                    metadata = getattr(item, "metadata", {}) or {}
+                    detail = str(metadata.get("detail", "") or "")
+                else:
+                    name = str(item).strip()
+                    existing = self._tool_progress_by_name.get(name, {})
+                    pct = float(existing.get("pct", 0.0) or 0.0)
+                    detail = str(existing.get("detail", "") or "")
+
+                if not name:
+                    continue
+
+                active_names.append(name)
+                progress_by_name[name] = {"pct": pct, "detail": detail}
+
             self._active_tool_names = active_names
+            self._tool_progress_by_name = progress_by_name
             self._running_tools = len(active_names)
             if not active_names:
                 self._active_tool = ""
                 self._active_tool_start = 0.0
                 self._tool_progress_pct = 0.0
                 self._tool_progress_detail = ""
+                self._tool_progress_by_name = {}
                 return
 
             label = active_names[0] if len(active_names) == 1 else f"{len(active_names)} tools running"
@@ -221,11 +245,20 @@ class TokenTracker:
             self._agent_phase = ""
             self._agent_phase_start = 0.0
 
-    def update_tool_progress(self, pct: float, detail: str = "") -> None:
+    def update_tool_progress(self, pct: float, detail: str = "", tool_name: str = "") -> None:
         with self._lock:
             self._tool_progress_pct = pct
             if detail:
                 self._tool_progress_detail = detail
+            normalized_name = str(tool_name or "").strip()
+            if normalized_name:
+                tool_state = self._tool_progress_by_name.setdefault(
+                    normalized_name,
+                    {"pct": 0.0, "detail": ""},
+                )
+                tool_state["pct"] = pct
+                if detail:
+                    tool_state["detail"] = detail
 
     def clear_active_tool(self, completed_name: str = "") -> None:
         with self._lock:
@@ -237,6 +270,7 @@ class TokenTracker:
                 if completed_label not in self._completed_tool_names:
                     self._completed_tool_names.append(completed_label)
                     self._completed_tool_names = self._completed_tool_names[-6:]
+                self._tool_progress_by_name.pop(completed_label, None)
             elif self._active_tool and not self._active_tool.endswith("tools running"):
                 self._last_tool_completed = self._active_tool
                 self._tools_completed_this_turn += 1
@@ -365,6 +399,7 @@ class LiveStatusBar:
         spinner = self._spinner_frames[self._frame_idx]
 
         parts: list[str] = []
+        extra_lines: list[str] = []
 
         # ── Active tool with spinner + progress ──
         if tt._active_tool_names:
@@ -389,6 +424,28 @@ class LiveStatusBar:
                     detail = detail[:37] + "..."
                 tool_str += f" [dim]│ {detail}[/dim]"
             parts.append(tool_str)
+
+            if len(tt._active_tool_names) > 1:
+                for name in tt._active_tool_names[:3]:
+                    state = tt._tool_progress_by_name.get(name, {})
+                    pct = float(state.get("pct", 0.0) or 0.0)
+                    detail = str(state.get("detail", "") or "")
+                    detail_line = f"[dim]  ↳[/dim] [cyan]{name}[/cyan]"
+                    if pct > 0:
+                        bar_width = 10
+                        filled = int(pct / 100 * bar_width)
+                        bar = "━" * filled + "[dim]━[/dim]" * (bar_width - filled)
+                        detail_line += f" [{bar}] {pct:.0f}%"
+                    if detail:
+                        if len(detail) > 60:
+                            detail = detail[:57] + "..."
+                        detail_line += f" [dim]│ {detail}[/dim]"
+                    extra_lines.append(detail_line)
+
+                if len(tt._active_tool_names) > 3:
+                    extra_lines.append(
+                        f"[dim]  ↳ +{len(tt._active_tool_names) - 3} more active tools[/dim]"
+                    )
         elif tt._agent_phase:
             parts.append(
                 f"{spinner} [bold blue]{tt._agent_phase}[/bold blue] {tt.agent_phase_elapsed:.1f}s"
@@ -443,6 +500,8 @@ class LiveStatusBar:
 
         separator = " │ "
         line = separator.join(parts)
+        if extra_lines:
+            line = "\n".join([line, *extra_lines])
         return Text.from_markup(f"[dim]───[/dim] {line} [dim]───[/dim]")
 
     @property
@@ -462,21 +521,21 @@ def _live_progress_listener(event: str, task) -> None:
     """
     from apk_agent.progress import progress_manager
 
-    active_names = [t.name for t in progress_manager.get_active_tasks()]
+    active_tasks = progress_manager.get_active_tasks()
 
     if event == "start":
-        token_tracker.sync_running_tools(active_names or [task.name])
+        token_tracker.sync_running_tools(active_tasks or [task.name])
         live_bar.update()
     elif event == "update":
-        token_tracker.sync_running_tools(active_names or [task.name])
+        token_tracker.sync_running_tools(active_tasks or [task])
         pct = task.progress_pct
         detail = task.metadata.get("detail", "")
-        token_tracker.update_tool_progress(pct, detail)
+        token_tracker.update_tool_progress(pct, detail, task.name)
         live_bar.update()
     elif event == "complete":
         token_tracker.clear_active_tool(task.name)
-        token_tracker.sync_running_tools(active_names)
-        if not active_names:
+        token_tracker.sync_running_tools(active_tasks)
+        if not active_tasks:
             token_tracker.set_agent_phase("finalizing tool batch")
         live_bar.update()
 
