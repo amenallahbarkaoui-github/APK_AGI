@@ -59,10 +59,15 @@ test_*.py
 
 # Logs
 *.log
+*.log.txt
 logs/
+
+# Graphify outputs
+graphify-out/
 
 # Tool binaries (downloaded via scripts/setup_tools.py)
 *.jar
 *.exe
 tools/bin/dex2jar/lib/
 tools/bin/jadx/lib/
+docs/
