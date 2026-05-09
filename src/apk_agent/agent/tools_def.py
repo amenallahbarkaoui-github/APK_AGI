@@ -62,6 +62,7 @@ _CACHEABLE_TOOLS = frozenset({
     "map_semantic_architecture", "recover_hidden_state_model",
     "profile_guard_and_revalidation_surface",
     "find_enforcement_surfaces",
+    "verify_bypass_completeness",
     "summarize_app_knowledge",
     "summarize_behavior_graph",
     "query_behavior_graph",
@@ -6901,163 +6902,317 @@ def verify_bypass_completeness() -> str:
     Returns: JSON — remaining_gates (array), remaining_prefs_checks, remaining_ui_gates,
     behavioral_remaining (obfuscated gates), patch_coverage_pct, verdict (PASS/FAIL).
     """
+    import hashlib
+    import re
+
+    from apk_agent.tools.smali_ir import load_index as load_smali_index
+
+    apk_dir = _project.apktool_dir
+    smali_dirs = [d for d in apk_dir.iterdir() if d.is_dir() and d.name.startswith("smali")]
+    if not smali_dirs:
+        return json.dumps({"success": False, "error": "No smali directories."})
+
+    named_gate_names = {
+        "ispremium",
+        "ispro",
+        "isvip",
+        "ispaid",
+        "istrial",
+        "isexpired",
+        "isfree",
+        "issubscribed",
+        "hassubscription",
+        "checklicense",
+        "validatelicense",
+        "islicensed",
+        "canaccess",
+        "isunlocked",
+        "isactivated",
+    }
+    prefs_marker_terms = (
+        "is_premium",
+        "is_pro",
+        "premium",
+        "vip",
+        "paid",
+        "license_status",
+        "subscription_type",
+        "plan_type",
+        "user_type",
+        "account_type",
+    )
+    ui_marker_terms = (
+        "upgrade",
+        "paywall",
+        "subscribe",
+        "go_pro",
+        "buy_premium",
+        "premium_required",
+        "locked_feature",
+        "trial_expired",
+    )
+    quick_text_markers = tuple(sorted(named_gate_names | set(prefs_marker_terms) | set(ui_marker_terms)))
+
+    premium_method_pat = re.compile(
+        r"\.method\s+.*(?:isPremium|isPro|isVip|isPaid|isTrial|isExpired|isFree|"
+        r"isSubscribed|hasSubscription|checkLicense|validateLicense|isLicensed|"
+        r"canAccess|isUnlocked|isActivated)",
+        re.IGNORECASE,
+    )
+    prefs_premium_pat = re.compile(
+        r'const-string\s+\w+,\s*"(?:is_premium|is_pro|premium|vip|paid|'
+        r'license_status|subscription_type|plan_type|user_type|account_type)"',
+        re.IGNORECASE,
+    )
+    ui_gate_pat = re.compile(
+        r"(?:upgrade|paywall|subscribe|go_pro|buy_premium|"
+        r"premium_required|locked_feature|trial_expired)",
+        re.IGNORECASE,
+    )
+    patched_return_pat = re.compile(
+        r"\.locals\s+\d+\s*\n\s*(?:#[^\n]*\n\s*)?const(?:/4|/16)?\s+v0",
+    )
+    boolean_return_pat = re.compile(r'\)([ZI])\s*$')
+    behavioral_gate_patterns = [
+        re.compile(r'invoke-.*(?:Calendar|Date|TimeUnit|before\(|after\(|compareTo\()', re.I),
+        re.compile(r'iget-boolean|sget-boolean'),
+        re.compile(r'const-string.*invoke-.*equals\(', re.DOTALL),
+    ]
+
+    def _normalize_rel_path(raw: str) -> str:
+        value = str(raw or "").strip().replace("\\", "/")
+        if not value:
+            return ""
+        path_obj = Path(value)
+        if path_obj.is_absolute():
+            try:
+                value = str(path_obj.resolve().relative_to(apk_dir.resolve())).replace("\\", "/")
+            except Exception:
+                value = str(path_obj).replace("\\", "/")
+        return value.lstrip("./").strip("/")
+
+    def _path_aliases(rel: str) -> set[str]:
+        normalized = _normalize_rel_path(rel)
+        if not normalized:
+            return set()
+        aliases = {normalized}
+        parts = normalized.split("/")
+        if parts and parts[0].startswith("smali") and len(parts) > 1:
+            aliases.add("/".join(parts[1:]))
+        return aliases
+
+    def _is_library_smali(rel: str) -> bool:
+        rel_fwd = rel.replace("\\", "/")
+        parts = rel_fwd.split("/")
+        if len(parts) <= 1:
+            return False
+        top = parts[1] if parts[0].startswith("smali") else parts[0]
+        if top in ("android", "androidx", "com", "kotlin", "kotlinx", "org", "io", "java", "javax", "dalvik", "sun"):
+            if top == "com" and len(parts) > 2:
+                sub = parts[2] if parts[0].startswith("smali") else parts[1]
+                return sub in ("google", "facebook", "squareup", "adjust", "android", "crashlytics", "firebase")
+            return top != "com"
+        return False
+
+    smali_files: dict[str, Path] = {}
+    alias_to_rel: dict[str, str] = {}
+    cache_digest = hashlib.sha1()
+    latest_smali_mtime_ns = 0
+
+    for smali_dir in smali_dirs:
+        for smali_file in smali_dir.rglob("*.smali"):
+            try:
+                stat = smali_file.stat()
+            except OSError:
+                continue
+            rel = str(smali_file.relative_to(apk_dir)).replace("\\", "/")
+            smali_files[rel] = smali_file
+            for alias in _path_aliases(rel):
+                alias_to_rel.setdefault(alias, rel)
+            latest_smali_mtime_ns = max(latest_smali_mtime_ns, stat.st_mtime_ns)
+            cache_digest.update(rel.encode("utf-8", errors="ignore"))
+            cache_digest.update(f":{stat.st_size}:{stat.st_mtime_ns};".encode("utf-8"))
+
+    if not smali_files:
+        return json.dumps({"success": False, "error": "No smali files found."})
+
+    behavioral_target_paths: set[str] = set()
+    for entry in list(_patch_journal):
+        target_file = _normalize_rel_path(entry.get("target_file", ""))
+        if not target_file or not target_file.endswith(".smali"):
+            continue
+        cache_digest.update(f"patch:{target_file};".encode("utf-8", errors="ignore"))
+        for alias in _path_aliases(target_file):
+            rel = alias_to_rel.get(alias)
+            if rel:
+                behavioral_target_paths.add(rel)
+
+    usable_index = None
+    candidate_source = "text_prefilter"
+    runtime_index = get_runtime_slot("smali_index")
+    runtime_built_at_ns = int(float(getattr(runtime_index, "built_at", 0.0) or 0.0) * 1_000_000_000)
+    if runtime_index is not None and runtime_built_at_ns >= latest_smali_mtime_ns:
+        usable_index = runtime_index
+        candidate_source = "smali_index_runtime"
+        cache_digest.update(f"runtime-index:{runtime_built_at_ns};".encode("utf-8"))
+    else:
+        index_path = _project_outputs_dir() / "smali_index.pickle"
+        try:
+            if index_path.is_file():
+                index_stat = index_path.stat()
+                if index_stat.st_mtime_ns >= latest_smali_mtime_ns:
+                    loaded_index = load_smali_index(index_path)
+                    if loaded_index is not None:
+                        usable_index = loaded_index
+                        candidate_source = "smali_index_disk"
+                        cache_digest.update(f"disk-index:{index_stat.st_mtime_ns};".encode("utf-8"))
+        except OSError:
+            pass
+
+    indexed_candidate_paths: set[str] = set(behavioral_target_paths)
+    if usable_index is not None:
+        for cls in usable_index.classes.values():
+            rel = alias_to_rel.get(_normalize_rel_path(getattr(cls, "file_path", "")))
+            if not rel:
+                continue
+            if rel in behavioral_target_paths:
+                indexed_candidate_paths.add(rel)
+                continue
+            if any(str(method.name or "").strip().lower() in named_gate_names for method in cls.methods):
+                indexed_candidate_paths.add(rel)
+
+        for literal, usages in getattr(usable_index, "string_index", {}).items():
+            literal_lower = str(literal or "").lower()
+            if not any(term in literal_lower for term in (*prefs_marker_terms, *ui_marker_terms)):
+                continue
+            for file_path, _line in usages:
+                rel = alias_to_rel.get(_normalize_rel_path(file_path))
+                if rel:
+                    indexed_candidate_paths.add(rel)
+
+    cache_digest.update(f"mode:{candidate_source};targets:{len(behavioral_target_paths)};files:{len(smali_files)}".encode("utf-8"))
+    cache_hint = cache_digest.hexdigest()
+
     def _run():
-        import re
-
-        apk_dir = _project.apktool_dir
-        smali_dirs = [d for d in apk_dir.iterdir() if d.is_dir() and d.name.startswith("smali")]
-        if not smali_dirs:
-            return json.dumps({"success": False, "error": "No smali directories."})
-
-        premium_method_pat = re.compile(
-            r"\.method\s+.*(?:isPremium|isPro|isVip|isPaid|isTrial|isExpired|isFree|"
-            r"isSubscribed|hasSubscription|checkLicense|validateLicense|isLicensed|"
-            r"canAccess|isUnlocked|isActivated)",
-            re.IGNORECASE,
-        )
-        prefs_premium_pat = re.compile(
-            r'const-string\s+\w+,\s*"(?:is_premium|is_pro|premium|vip|paid|'
-            r'license_status|subscription_type|plan_type|user_type|account_type)"',
-            re.IGNORECASE,
-        )
-        ui_gate_pat = re.compile(
-            r"(?:upgrade|paywall|subscribe|go_pro|buy_premium|"
-            r"premium_required|locked_feature|trial_expired)",
-            re.IGNORECASE,
-        )
-
-        # Behavioral gate patterns (for obfuscated code detection)
-        _BEHAVIORAL_GATE = [
-            re.compile(r'invoke-.*(?:Calendar|Date|TimeUnit|before\(|after\(|compareTo\()', re.I),
-            re.compile(r'iget-boolean|sget-boolean'),
-            re.compile(r'const-string.*invoke-.*equals\(', re.DOTALL),
-        ]
-
         remaining_gates: list[dict] = []
         remaining_prefs: list[dict] = []
         remaining_ui: list[dict] = []
         behavioral_remaining: list[dict] = []
         patched_methods: set[str] = set()
 
-        # Collect files that were patched (from patch journal) to check their
-        # entity classes for remaining obfuscated gates
-        patched_files: set[str] = set()
-        for entry in _patch_journal:
-            tf = entry.get("target_file", "")
-            if tf:
-                patched_files.add(tf)
+        total_smali_files = len(smali_files)
+        if usable_index is not None:
+            files_to_scan = [(rel, smali_files[rel]) for rel in sorted(indexed_candidate_paths) if rel in smali_files]
+            report_progress(8, f"Using {candidate_source} candidates: {len(files_to_scan)}/{total_smali_files} files")
+        else:
+            files_to_scan = sorted(smali_files.items())
+            report_progress(8, f"No fresh SmaliIndex; scanning {total_smali_files} files with fast text prefilter")
 
-        for sd in smali_dirs:
-            for sf in sd.rglob("*.smali"):
-                try:
-                    content = sf.read_text(encoding="utf-8", errors="replace")
-                except Exception:
-                    continue
-                lines = content.splitlines()
-                rel = str(sf.relative_to(apk_dir))
-                current_method = ""
-                method_start = 0
+        detailed_scans = 0
+        prefilter_skipped_files = 0
+        progress_step = max(1, len(files_to_scan) // 20) if files_to_scan else 1
+        report_progress(5, f"Preparing bypass verification across {total_smali_files} smali files")
 
-                # Skip library code
-                rel_fwd = rel.replace("\\", "/")
-                parts = rel_fwd.split("/")
-                if len(parts) > 1:
-                    top = parts[1] if parts[0].startswith("smali") else parts[0]
-                    if top in ("android", "androidx", "com", "kotlin", "kotlinx",
-                               "org", "io", "java", "javax", "dalvik", "sun"):
-                        # Check more specifically for com/
-                        if top == "com" and len(parts) > 2:
-                            sub = parts[2] if parts[0].startswith("smali") else parts[1]
-                            if sub in ("google", "facebook", "squareup", "adjust",
-                                       "android", "crashlytics", "firebase"):
-                                continue
-                        elif top != "com":
-                            continue
+        for index, (rel, sf) in enumerate(files_to_scan, start=1):
+            if index == 1 or index == len(files_to_scan) or index % progress_step == 0:
+                pct = 15 + int((index / max(len(files_to_scan), 1)) * 80)
+                report_progress(min(pct, 95), f"Verifying bypass completeness: {index}/{len(files_to_scan)} files")
 
-                for i, line in enumerate(lines):
-                    s = line.strip()
+            if _is_library_smali(rel):
+                prefilter_skipped_files += 1
+                continue
 
-                    if s.startswith(".method"):
-                        current_method = s
-                        method_start = i
-                    elif s.startswith(".end method"):
-                        # Check if this premium method was ALREADY patched
-                        if premium_method_pat.search(current_method):
+            try:
+                content = sf.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+
+            content_lower = content.lower()
+            behavioral_target = rel in behavioral_target_paths
+            if usable_index is None and not behavioral_target and not any(marker in content_lower for marker in quick_text_markers):
+                prefilter_skipped_files += 1
+                continue
+
+            detailed_scans += 1
+            lines = content.splitlines()
+            current_method = ""
+            method_start = 0
+
+            for i, line in enumerate(lines):
+                s = line.strip()
+
+                if s.startswith(".method"):
+                    current_method = s
+                    method_start = i
+                elif s.startswith(".end method"):
+                    if premium_method_pat.search(current_method):
+                        method_body = "\n".join(lines[method_start:i])
+                        is_patched = bool(patched_return_pat.search(method_body))
+                        if not is_patched:
+                            remaining_gates.append({
+                                "file": rel,
+                                "line": method_start + 1,
+                                "method": current_method[:80],
+                                "status": "NOT_PATCHED",
+                            })
+                        else:
+                            patched_methods.add(f"{rel}:{current_method[:60]}")
+                    elif behavioral_target:
+                        ret_match = boolean_return_pat.search(current_method)
+                        if ret_match:
                             method_body = "\n".join(lines[method_start:i])
-                            # A patched method typically has const/4 + return as first instructions
-                            is_patched = bool(re.search(
-                                r"\.locals\s+\d+\s*\n\s*(?:#[^\n]*\n\s*)?const(?:/4|/16)?\s+v0",
-                                method_body,
-                            ))
-                            if not is_patched:
-                                remaining_gates.append({
+                            is_patched = bool(patched_return_pat.search(method_body))
+                            if not is_patched and any(pat.search(method_body) for pat in behavioral_gate_patterns):
+                                behavioral_remaining.append({
                                     "file": rel,
                                     "line": method_start + 1,
                                     "method": current_method[:80],
-                                    "status": "NOT_PATCHED",
+                                    "return_type": "boolean" if ret_match.group(1) == "Z" else "int",
+                                    "status": "BEHAVIORAL_GATE_NOT_PATCHED",
+                                    "hint": "Obfuscated method with gate behavior in a known entity class",
                                 })
-                            else:
-                                patched_methods.add(f"{rel}:{current_method[:60]}")
 
-                        # Behavioral check for OBFUSCATED gate methods in entity classes
-                        # (files that we've already patched — these are likely entity classes
-                        # with remaining unpatched methods)
-                        elif rel in patched_files or any(pf in rel for pf in patched_files):
-                            # Check if this Z/I-returning method has gate behavior
-                            ret_match = re.search(r'\)([ZI])\s*$', current_method)
-                            if ret_match:
-                                method_body = "\n".join(lines[method_start:i])
-                                is_patched = bool(re.search(
-                                    r"\.locals\s+\d+\s*\n\s*(?:#[^\n]*\n\s*)?const(?:/4|/16)?\s+v0",
-                                    method_body,
-                                ))
-                                if not is_patched:
-                                    has_gate_behavior = any(
-                                        pat.search(method_body) for pat in _BEHAVIORAL_GATE
-                                    )
-                                    if has_gate_behavior:
-                                        behavioral_remaining.append({
-                                            "file": rel,
-                                            "line": method_start + 1,
-                                            "method": current_method[:80],
-                                            "return_type": "boolean" if ret_match.group(1) == "Z" else "int",
-                                            "status": "BEHAVIORAL_GATE_NOT_PATCHED",
-                                            "hint": "Obfuscated method with gate behavior in a known entity class",
-                                        })
+                    current_method = ""
+                    continue
 
-                        current_method = ""
-                        continue
-
-                    # SharedPreferences premium reads
-                    if prefs_premium_pat.search(s):
-                        # Check if there's a const override right after
-                        lookahead = "\n".join(lines[i:i + 5])
-                        if "move-result" in lookahead and "const" not in "\n".join(lines[i + 1:i + 3]):
-                            remaining_prefs.append({
-                                "file": rel, "line": i + 1,
-                                "method": current_method[:60],
-                                "instruction": s[:100],
-                            })
-
-                    # UI gate strings
-                    if s.startswith("const-string") and ui_gate_pat.search(s):
-                        remaining_ui.append({
-                            "file": rel, "line": i + 1,
+                if prefs_premium_pat.search(s):
+                    lookahead = "\n".join(lines[i:i + 5])
+                    if "move-result" in lookahead and "const" not in "\n".join(lines[i + 1:i + 3]):
+                        remaining_prefs.append({
+                            "file": rel,
+                            "line": i + 1,
                             "method": current_method[:60],
                             "instruction": s[:100],
                         })
 
+                if s.startswith("const-string") and ui_gate_pat.search(s):
+                    remaining_ui.append({
+                        "file": rel,
+                        "line": i + 1,
+                        "method": current_method[:60],
+                        "instruction": s[:100],
+                    })
+
         total_gates = len(remaining_gates) + len(patched_methods)
         patched_count = len(patched_methods)
         coverage = (patched_count / total_gates * 100) if total_gates > 0 else 100.0
-        # Include behavioral gates in verdict — if entity classes have unpatched gates, FAIL
-        verdict = "PASS" if not remaining_gates and not remaining_prefs and not behavioral_remaining else "FAIL"
+        verdict = "PASS" if not remaining_gates and not remaining_prefs and not remaining_ui and not behavioral_remaining else "FAIL"
+        report_progress(
+            99,
+            f"Bypass verification finished: {detailed_scans} detailed scans, {prefilter_skipped_files} files skipped before deep parsing",
+        )
 
         return json.dumps({
             "success": True,
             "verdict": verdict,
             "patch_coverage_pct": round(coverage, 1),
             "patched_methods": patched_count,
+            "candidate_source": candidate_source,
+            "total_smali_files": total_smali_files,
+            "candidate_files": len(files_to_scan),
+            "scanned_smali_files": detailed_scans,
+            "prefilter_skipped_files": prefilter_skipped_files,
+            "behavioral_target_files": len(behavioral_target_paths),
             "remaining_gates": remaining_gates[:20],
             "behavioral_remaining": behavioral_remaining[:15],
             "remaining_prefs_checks": remaining_prefs[:15],
@@ -7067,11 +7222,12 @@ def verify_bypass_completeness() -> str:
                 + ("ALL named gates patched. " if not remaining_gates else f"{len(remaining_gates)} named methods still need patching. ")
                 + (f"⚠️ {len(behavioral_remaining)} OBFUSCATED gate methods detected in entity classes — patch these too! " if behavioral_remaining else "")
                 + (f"{len(remaining_prefs)} prefs reads still need patching. " if remaining_prefs else "")
+                + (f"{len(remaining_ui)} UI gate strings still need patching. " if remaining_ui else "")
                 + ("Verdict: " + verdict)
             ),
         }, ensure_ascii=False, indent=2)[:15000]
 
-    return _safe_call(_run, "verify_bypass_completeness")
+    return _safe_call(_run, "verify_bypass_completeness", _cache_hint=cache_hint)
 
 
 # ---------------------------------------------------------------------------
