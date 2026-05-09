@@ -12,6 +12,22 @@ from collections import Counter
 from typing import Any
 
 from apk_agent.tools.advanced_search import _is_third_party_path
+from apk_agent.tools.semantic_core import (
+    CAPABILITY_KINDS,
+    SEMANTIC_SCHEMA_VERSION,
+    canonicalize_artifact,
+    empty_artifact,
+    get_rule_manifest,
+    make_edge,
+    make_evidence,
+    make_inference,
+    make_node,
+    normalize_field_source,
+    normalize_method_source,
+    stable_identity,
+    summarize_cycles,
+    validate_artifact,
+)
 
 
 _NETWORK_HINTS = ("lokhttp3/", "lretrofit2/", "httpurlconnection", "requestbody", "responsebody", "apollo", "ktor")
@@ -23,6 +39,13 @@ _TIME_HINTS = ("time", "timestamp", "expire", "expiry", "renew", "valid", "until
 _STATE_HINTS = ("active", "enabled", "premium", "paid", "trial", "locked", "subscribed", "plan", "tier", "role", "pro", "vip")
 _POSITIVE_VALUE_HINTS = ("premium", "pro", "vip", "svip", "paid", "gold", "diamond", "elite", "lifetime", "active", "valid", "subscribed", "owned", "unlock")
 _NEGATIVE_VALUE_HINTS = ("free", "trial", "basic", "lite", "demo", "guest", "locked", "expired", "inactive", "invalid", "none")
+_CRYPTO_HINTS = ("cipher", "secretkey", "messagedigest", "signature", "decrypt", "encrypt")
+_STRONG_BILLING_HINTS = ("billingclient", "purchase", "subscription", "license", "entitlement", "revenuecat", "qonversion")
+_AUTHORITATIVE_TAG_TO_BOUNDARY = (
+    ("network", "network_boundary"),
+    ("serialization", "serialization_boundary"),
+    ("persistence", "persistence_boundary"),
+)
 
 
 def _method_blob(smali_method) -> str:
@@ -361,6 +384,527 @@ def _resolve_exact_value_candidates(
     return None, candidates[:5], "literal_candidates_conflict", False
 
 
+def _sorted_classes(index) -> list[Any]:
+    return sorted(index.classes.values(), key=lambda item: (item.name, item.file_path))
+
+
+def _sorted_methods(index) -> list[Any]:
+    return sorted(index.methods.values(), key=lambda item: item.full_signature)
+
+
+def _field_source_ref(field_candidate: dict[str, Any]) -> str:
+    return normalize_field_source(
+        str(field_candidate.get("class", "")),
+        str(field_candidate.get("field", "")),
+        str(field_candidate.get("type", "")),
+    )
+
+
+def _origin_kind_for_field(field_candidate: dict[str, Any]) -> str | None:
+    writer_tags = set(field_candidate.get("writer_tags", []))
+    for tag, boundary_kind in _AUTHORITATIVE_TAG_TO_BOUNDARY:
+        if tag in writer_tags:
+            return boundary_kind
+    return None
+
+
+def _is_gate_like_method(smali_method) -> bool:
+    if smali_method is None:
+        return False
+    if smali_method.return_type == "Z":
+        return True
+    if any(instr.is_branch for instr in smali_method.instructions):
+        return True
+    return any("equals" in api_call.lower() for api_call in smali_method.api_calls[:12])
+
+
+def _field_is_ui_projection(index, field_candidate: dict[str, Any]) -> bool:
+    reader_tags = set(field_candidate.get("reader_tags", []))
+    if "ui" not in reader_tags:
+        return False
+    for sample in field_candidate.get("reader_samples", [])[:8]:
+        method = index.get_method(str(sample.get("method", "")))
+        if _is_gate_like_method(method) and "ui" not in set(sample.get("tags", [])):
+            return False
+    return True
+
+
+def _has_strong_billing_signal(index, field_candidate: dict[str, Any]) -> bool:
+    blobs: list[str] = [
+        str(field_candidate.get("class", "")).lower(),
+        str(field_candidate.get("field", "")).lower(),
+    ]
+    for sample in field_candidate.get("writer_samples", [])[:8] + field_candidate.get("reader_samples", [])[:8]:
+        method = index.get_method(str(sample.get("method", "")))
+        if method is not None:
+            blobs.append(_method_blob(method))
+    merged = " ".join(blob for blob in blobs if blob)
+    return any(hint in merged for hint in _STRONG_BILLING_HINTS)
+
+
+def _capability_kind_for_field(index, field_candidate: dict[str, Any]) -> tuple[str | None, list[str]]:
+    reader_tags = set(field_candidate.get("reader_tags", []))
+    writer_tags = set(field_candidate.get("writer_tags", []))
+    combined = reader_tags | writer_tags
+    gate_methods: list[str] = []
+    crypto_methods: list[str] = []
+
+    for sample in field_candidate.get("reader_samples", [])[:8]:
+        method_sig = str(sample.get("method", ""))
+        method = index.get_method(method_sig)
+        if _is_gate_like_method(method):
+            gate_methods.append(method_sig)
+        if method is not None and any(hint in _method_blob(method) for hint in _CRYPTO_HINTS):
+            crypto_methods.append(method_sig)
+
+    if "billing" in combined and _has_strong_billing_signal(index, field_candidate):
+        return "billing_capability", sorted(set(gate_methods or [sample.get("method", "") for sample in field_candidate.get("reader_samples", [])[:2]]))
+    if crypto_methods:
+        return "crypto_capability", sorted(set(crypto_methods))
+    if gate_methods:
+        return "access_capability", sorted(set(gate_methods))
+    if "network" in combined or "serialization" in combined:
+        methods = [str(sample.get("method", "")) for sample in field_candidate.get("writer_samples", [])[:2] if sample.get("method")]
+        return "transport_capability", sorted(set(methods))
+    if "ui" in combined:
+        methods = [str(sample.get("method", "")) for sample in field_candidate.get("reader_samples", [])[:2] if sample.get("method")]
+        return "presentation_capability", sorted(set(methods))
+    return None, []
+
+
+def _append_inference(
+    inferences: list[dict[str, Any]],
+    *,
+    rule_id: str,
+    inference_class: str,
+    derived_from: list[str],
+    evidence_refs: list[str],
+    output_refs: list[str],
+) -> None:
+    inferences.append(make_inference(
+        inference_id=stable_identity("inference", rule_id, sorted(output_refs), sorted(derived_from), sorted(evidence_refs)),
+        rule_id=rule_id,
+        inference_class=inference_class,
+        derived_from=sorted(derived_from),
+        evidence_refs=sorted(evidence_refs),
+        output_refs=sorted(output_refs),
+    ))
+
+
+def _build_semantic_core_artifact(
+    index,
+    *,
+    focus_hint: str,
+    candidate_models: list[dict[str, Any]],
+    field_candidates: list[dict[str, Any]],
+    compatibility_fields: list[dict[str, Any]],
+    method_relations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    artifact = empty_artifact()
+    artifact["rule_manifest"] = get_rule_manifest()
+
+    evidence: list[dict[str, Any]] = []
+    nodes: list[dict[str, Any]] = []
+    edges: list[dict[str, Any]] = []
+    inferences: list[dict[str, Any]] = []
+    field_context: dict[str, dict[str, Any]] = {}
+    field_ref_by_key: dict[tuple[str, str], str] = {}
+    relation_evidence: dict[tuple[str, str, tuple[str, ...], tuple[str, ...]], str] = {}
+
+    sorted_fields = sorted(
+        field_candidates,
+        key=lambda item: (str(item.get("class", "")), str(item.get("field", "")), str(item.get("type", ""))),
+    )
+
+    for field_candidate in sorted_fields:
+        source_ref = _field_source_ref(field_candidate)
+        field_node_id = stable_identity("node", "field", source_ref)
+        base_evidence_id = stable_identity("evidence", "field_observed", source_ref)
+        field_evidence = {
+            "field": base_evidence_id,
+            "writer": [],
+            "reader": [],
+            "writer_by_method": {},
+            "reader_by_method": {},
+        }
+        evidence.append(make_evidence(
+            evidence_id=base_evidence_id,
+            evidence_kind="field_observed",
+            source_ref=source_ref,
+            payload_ref="field_observed",
+        ))
+
+        for sample in sorted(
+            field_candidate.get("writer_samples", []),
+            key=lambda item: (str(item.get("method", "")), int(item.get("line", 0) or 0), str(item.get("opcode", ""))),
+        ):
+            evidence_id = stable_identity(
+                "evidence",
+                "writer_sample",
+                source_ref,
+                str(sample.get("method", "")),
+                int(sample.get("line", 0) or 0),
+                str(sample.get("opcode", "")),
+            )
+            evidence.append(make_evidence(
+                evidence_id=evidence_id,
+                evidence_kind="writer_sample",
+                source_ref=source_ref,
+                payload_ref=f"{sample.get('method', '')}:{sample.get('line', 0)}:{sample.get('opcode', '')}",
+                tags=sorted(sample.get("tags", [])),
+            ))
+            field_evidence["writer"].append(evidence_id)
+            field_evidence["writer_by_method"].setdefault(str(sample.get("method", "")), []).append(evidence_id)
+
+        for sample in sorted(
+            field_candidate.get("reader_samples", []),
+            key=lambda item: (str(item.get("method", "")), int(item.get("line", 0) or 0), str(item.get("opcode", ""))),
+        ):
+            evidence_id = stable_identity(
+                "evidence",
+                "reader_sample",
+                source_ref,
+                str(sample.get("method", "")),
+                int(sample.get("line", 0) or 0),
+                str(sample.get("opcode", "")),
+            )
+            evidence.append(make_evidence(
+                evidence_id=evidence_id,
+                evidence_kind="reader_sample",
+                source_ref=source_ref,
+                payload_ref=f"{sample.get('method', '')}:{sample.get('line', 0)}:{sample.get('opcode', '')}",
+                tags=sorted(sample.get("tags", [])),
+            ))
+            field_evidence["reader"].append(evidence_id)
+            field_evidence["reader_by_method"].setdefault(str(sample.get("method", "")), []).append(evidence_id)
+
+        field_context[source_ref] = {
+            "candidate": field_candidate,
+            "node_id": field_node_id,
+            "evidence": field_evidence,
+        }
+        field_ref_by_key[(str(field_candidate.get("class", "")), str(field_candidate.get("field", "")))] = source_ref
+
+    for relation in sorted(
+        method_relations,
+        key=lambda item: (
+            str(item.get("class", "")),
+            str(item.get("method", "")),
+            tuple(item.get("reads", [])),
+            tuple(item.get("writes", [])),
+        ),
+    ):
+        reads = tuple(str(item) for item in relation.get("reads", []))
+        writes = tuple(str(item) for item in relation.get("writes", []))
+        method_ref = normalize_method_source(str(relation.get("method", "")))
+        evidence_id = stable_identity("evidence", "method_flow", str(relation.get("class", "")), method_ref, reads, writes)
+        evidence.append(make_evidence(
+            evidence_id=evidence_id,
+            evidence_kind="method_flow",
+            source_ref=method_ref,
+            payload_ref=f"reads={','.join(reads)}|writes={','.join(writes)}",
+            tags=sorted(relation.get("tags", [])),
+            has_branch=bool(relation.get("has_branch", False)),
+            returns_boolean=bool(relation.get("returns_boolean", False)),
+        ))
+        relation_evidence[(str(relation.get("class", "")), method_ref, reads, writes)] = evidence_id
+
+    derive_inputs: dict[str, dict[str, Any]] = {}
+    for relation in sorted(
+        method_relations,
+        key=lambda item: (
+            str(item.get("class", "")),
+            str(item.get("method", "")),
+            tuple(item.get("reads", [])),
+            tuple(item.get("writes", [])),
+        ),
+    ):
+        relation_key = (
+            str(relation.get("class", "")),
+            normalize_method_source(str(relation.get("method", ""))),
+            tuple(str(item) for item in relation.get("reads", [])),
+            tuple(str(item) for item in relation.get("writes", [])),
+        )
+        relation_evidence_id = relation_evidence.get(relation_key)
+        if not relation_evidence_id:
+            continue
+        read_refs = [field_ref_by_key[(str(relation.get("class", "")), field_name)] for field_name in relation.get("reads", []) if (str(relation.get("class", "")), field_name) in field_ref_by_key]
+        write_refs = [field_ref_by_key[(str(relation.get("class", "")), field_name)] for field_name in relation.get("writes", []) if (str(relation.get("class", "")), field_name) in field_ref_by_key]
+        for read_ref in read_refs:
+            for write_ref in write_refs:
+                if read_ref == write_ref:
+                    continue
+                source_node_id = field_context[read_ref]["node_id"]
+                target_node_id = field_context[write_ref]["node_id"]
+                edge_id = stable_identity("edge", "derive", source_node_id, target_node_id)
+                entry = derive_inputs.setdefault(edge_id, {
+                    "source": source_node_id,
+                    "target": target_node_id,
+                    "derived_from": {source_node_id},
+                    "evidence_refs": set(),
+                    "layer": "state_relations",
+                })
+                entry["evidence_refs"].add(relation_evidence_id)
+
+    incoming_derive_nodes: dict[str, list[str]] = {}
+    incoming_derive_evidence: dict[str, list[str]] = {}
+    for edge_id, entry in sorted(derive_inputs.items(), key=lambda item: item[0]):
+        edge = make_edge(
+            edge_id=edge_id,
+            kind="derive",
+            source=str(entry["source"]),
+            target=str(entry["target"]),
+            boundary_kind=None,
+            inference_class="deterministic_inference",
+            rule_id="field_write_depends_on_upstream_read",
+            derived_from=sorted(entry["derived_from"]),
+            evidence_refs=sorted(entry["evidence_refs"]),
+            layer=str(entry["layer"]),
+        )
+        edges.append(edge)
+        incoming_derive_nodes.setdefault(str(entry["target"]), []).extend(sorted(entry["derived_from"]))
+        incoming_derive_evidence.setdefault(str(entry["target"]), []).extend(sorted(entry["evidence_refs"]))
+        _append_inference(
+            inferences,
+            rule_id="field_write_depends_on_upstream_read",
+            inference_class="deterministic_inference",
+            derived_from=sorted(entry["derived_from"]),
+            evidence_refs=sorted(entry["evidence_refs"]),
+            output_refs=[edge_id],
+        )
+
+    for source_ref, context in sorted(field_context.items(), key=lambda item: item[0]):
+        field_candidate = context["candidate"]
+        field_node_id = context["node_id"]
+        field_evidence = context["evidence"]
+        origin_kind = _origin_kind_for_field(field_candidate)
+        combined_tags = sorted(set(field_candidate.get("reader_tags", [])) | set(field_candidate.get("writer_tags", [])))
+        if origin_kind is not None:
+            state_class = "canonical_state"
+            rule_id = "canonical_state_authoritative_origin"
+            evidence_refs = field_evidence["writer"] or [field_evidence["field"]]
+            derived_from = [field_evidence["field"]]
+        elif field_node_id in incoming_derive_nodes:
+            state_class = "derived_state"
+            rule_id = "derived_state_requires_upstream"
+            evidence_refs = sorted(set(incoming_derive_evidence.get(field_node_id, []))) or [field_evidence["field"]]
+            derived_from = sorted(set(incoming_derive_nodes.get(field_node_id, [])))
+        elif _field_is_ui_projection(index, field_candidate):
+            state_class = "presentation_state"
+            rule_id = "presentation_state_ui_projection"
+            evidence_refs = field_evidence["reader"] or [field_evidence["field"]]
+            derived_from = [field_evidence["field"]]
+        else:
+            state_class = "ephemeral_state"
+            rule_id = "ephemeral_state_runtime_fallback"
+            evidence_refs = field_evidence["writer"] or field_evidence["reader"] or [field_evidence["field"]]
+            derived_from = [field_evidence["field"]]
+
+        node = make_node(
+            node_id=field_node_id,
+            kind="field",
+            state_class=state_class,
+            label=source_ref,
+            source_ref=source_ref,
+            inference_class="deterministic_inference",
+            rule_id=rule_id,
+            derived_from=derived_from,
+            evidence_refs=evidence_refs,
+            origin_kind=origin_kind,
+            tags=combined_tags,
+            layer="state_relations",
+        )
+        nodes.append(node)
+        _append_inference(
+            inferences,
+            rule_id=rule_id,
+            inference_class="deterministic_inference",
+            derived_from=derived_from,
+            evidence_refs=evidence_refs,
+            output_refs=[field_node_id],
+        )
+
+    field_nodes_by_ref = {node["source_ref"]: node for node in nodes if node.get("kind") == "field"}
+    for source_ref, field_node in sorted(field_nodes_by_ref.items(), key=lambda item: item[0]):
+        origin_kind = field_node.get("origin_kind")
+        if not origin_kind:
+            continue
+        context = field_context[source_ref]
+        boundary_source_ref = f"{source_ref}|{origin_kind}"
+        boundary_node_id = stable_identity("node", "boundary", boundary_source_ref)
+        boundary_evidence_refs = context["evidence"]["writer"] or [context["evidence"]["field"]]
+        boundary_node = make_node(
+            node_id=boundary_node_id,
+            kind="boundary",
+            state_class="boundary_source",
+            label=origin_kind,
+            source_ref=boundary_source_ref,
+            inference_class="deterministic_inference",
+            rule_id="canonical_state_authoritative_origin",
+            derived_from=[context["evidence"]["field"]],
+            evidence_refs=boundary_evidence_refs,
+            boundary_kind=origin_kind,
+            layer="boundary_relations",
+        )
+        nodes.append(boundary_node)
+        _append_inference(
+            inferences,
+            rule_id="canonical_state_authoritative_origin",
+            inference_class="deterministic_inference",
+            derived_from=[context["evidence"]["field"]],
+            evidence_refs=boundary_evidence_refs,
+            output_refs=[boundary_node_id],
+        )
+
+        boundary_edge_id = stable_identity("edge", origin_kind, boundary_node_id, field_node["id"])
+        boundary_edge_kind = "deserialize" if origin_kind in {"network_boundary", "serialization_boundary"} else "write"
+        boundary_edge = make_edge(
+            edge_id=boundary_edge_id,
+            kind=boundary_edge_kind,
+            source=boundary_node_id,
+            target=field_node["id"],
+            boundary_kind=origin_kind,
+            inference_class="deterministic_inference",
+            rule_id="canonical_state_authoritative_origin",
+            derived_from=[boundary_node_id],
+            evidence_refs=boundary_evidence_refs,
+            layer="boundary_relations",
+        )
+        edges.append(boundary_edge)
+        _append_inference(
+            inferences,
+            rule_id="canonical_state_authoritative_origin",
+            inference_class="deterministic_inference",
+            derived_from=[boundary_node_id],
+            evidence_refs=boundary_evidence_refs,
+            output_refs=[boundary_edge_id],
+        )
+
+    for field_node in sorted((node for node in nodes if node.get("kind") == "field"), key=lambda item: item["id"]):
+        if field_node.get("state_class") == "presentation_state":
+            contradiction_edge_id = stable_identity("edge", "projection_contradiction", field_node["id"])
+            contradiction_edge = make_edge(
+                edge_id=contradiction_edge_id,
+                kind="contradiction",
+                source=field_node["id"],
+                target=field_node["id"],
+                boundary_kind=None,
+                inference_class="deterministic_inference",
+                rule_id="projection_contradiction_ui_projection",
+                derived_from=[field_node["id"]],
+                evidence_refs=list(field_node.get("evidence_refs", [])),
+                contradiction_kind="projection_contradiction",
+                layer="contradiction_relations",
+            )
+            edges.append(contradiction_edge)
+            _append_inference(
+                inferences,
+                rule_id="projection_contradiction_ui_projection",
+                inference_class="deterministic_inference",
+                derived_from=[field_node["id"]],
+                evidence_refs=list(field_node.get("evidence_refs", [])),
+                output_refs=[contradiction_edge_id],
+            )
+
+    for source_ref, context in sorted(field_context.items(), key=lambda item: item[0]):
+        capability_kind, capability_methods = _capability_kind_for_field(index, context["candidate"])
+        if capability_kind not in CAPABILITY_KINDS:
+            continue
+        field_node_id = context["node_id"]
+        capability_source_ref = f"{source_ref}|capability:{capability_kind}"
+        capability_node_id = stable_identity("node", "capability", capability_source_ref)
+        capability_evidence_refs = []
+        for method_sig in capability_methods:
+            capability_evidence_refs.extend(context["evidence"]["reader_by_method"].get(method_sig, []))
+            capability_evidence_refs.extend(context["evidence"]["writer_by_method"].get(method_sig, []))
+        if not capability_evidence_refs:
+            capability_evidence_refs = context["evidence"]["reader"] or context["evidence"]["writer"] or [context["evidence"]["field"]]
+
+        capability_node = make_node(
+            node_id=capability_node_id,
+            kind="capability",
+            state_class="capability_target",
+            label=capability_kind,
+            source_ref=capability_source_ref,
+            inference_class="heuristic_hint",
+            rule_id="capability_link_from_gate_reader",
+            derived_from=[field_node_id],
+            evidence_refs=capability_evidence_refs,
+            capability_kind=capability_kind,
+            layer="capability_links",
+        )
+        nodes.append(capability_node)
+        _append_inference(
+            inferences,
+            rule_id="capability_link_from_gate_reader",
+            inference_class="heuristic_hint",
+            derived_from=[field_node_id],
+            evidence_refs=capability_evidence_refs,
+            output_refs=[capability_node_id],
+        )
+
+        capability_edge_id = stable_identity("edge", "capability_link", field_node_id, capability_node_id)
+        capability_edge = make_edge(
+            edge_id=capability_edge_id,
+            kind="capability_link",
+            source=field_node_id,
+            target=capability_node_id,
+            boundary_kind=None,
+            inference_class="heuristic_hint",
+            rule_id="capability_link_from_gate_reader",
+            derived_from=[field_node_id],
+            evidence_refs=capability_evidence_refs,
+            layer="capability_links",
+        )
+        edges.append(capability_edge)
+        _append_inference(
+            inferences,
+            rule_id="capability_link_from_gate_reader",
+            inference_class="heuristic_hint",
+            derived_from=[field_node_id],
+            evidence_refs=capability_evidence_refs,
+            output_refs=[capability_edge_id],
+        )
+
+    artifact["nodes"] = nodes
+    artifact["edges"] = edges
+    artifact["evidence"] = evidence
+    artifact["inferences"] = inferences
+    artifact["compatibility_views"] = {
+        "candidate_models": list(candidate_models),
+        "candidate_state_fields": list(compatibility_fields),
+    }
+    artifact["cycle_summary"] = summarize_cycles(nodes, edges)
+
+    state_class_counts = Counter(
+        node.get("state_class")
+        for node in nodes
+        if node.get("kind") == "field"
+    )
+    layer_counts = Counter(
+        edge.get("layer")
+        for edge in edges
+        if edge.get("layer")
+    )
+    artifact["summary"] = {
+        "focus_hint": focus_hint,
+        "node_count": len(nodes),
+        "edge_count": len(edges),
+        "evidence_count": len(evidence),
+        "inference_count": len(inferences),
+        "state_class_counts": dict(sorted(state_class_counts.items())),
+        "layer_counts": dict(sorted(layer_counts.items())),
+        "cycle_count": int(artifact["cycle_summary"].get("cycle_count", 0)),
+    }
+
+    artifact = canonicalize_artifact(artifact)
+    validation_errors = validate_artifact(artifact)
+    return {
+        "artifact": artifact,
+        "validation_errors": validation_errors,
+    }
+
+
 def recover_hidden_state_model(index, *, focus_hint: str = "", max_candidates: int = 30, progress_callback=None) -> dict[str, Any]:
     """Recover likely state models and high-value hidden fields.
 
@@ -376,6 +920,7 @@ def recover_hidden_state_model(index, *, focus_hint: str = "", max_candidates: i
     candidate_models: dict[str, dict[str, Any]] = {}
     total_classes = len(index.classes)
     candidate_scan_interval = max(1, total_classes // 12) if total_classes > 0 else 1
+    all_methods = _sorted_methods(index)
 
     def _emit_progress(pct: float, detail: str) -> None:
         if progress_callback is not None:
@@ -383,7 +928,7 @@ def recover_hidden_state_model(index, *, focus_hint: str = "", max_candidates: i
 
     _emit_progress(4, f"Scanning {total_classes} classes for candidate state models")
 
-    for class_idx, smali_class in enumerate(index.classes.values(), start=1):
+    for class_idx, smali_class in enumerate(_sorted_classes(index), start=1):
         if _is_third_party_path(smali_class.file_path):
             continue
         score, evidence = _candidate_class_score(smali_class)
@@ -410,6 +955,7 @@ def recover_hidden_state_model(index, *, focus_hint: str = "", max_candidates: i
     field_candidates: list[dict[str, Any]] = []
     writer_chains: list[dict[str, Any]] = []
     reader_chains: list[dict[str, Any]] = []
+    method_relations: list[dict[str, Any]] = []
     total_models = len(candidate_models)
 
     if total_models == 0:
@@ -418,13 +964,13 @@ def recover_hidden_state_model(index, *, focus_hint: str = "", max_candidates: i
     model_scan_interval = max(1, total_models // 10) if total_models > 0 else 1
     _emit_progress(30, f"Analyzing fields across {total_models} candidate models")
 
-    for model_idx, (class_name, model_info) in enumerate(candidate_models.items(), start=1):
+    for model_idx, (class_name, model_info) in enumerate(sorted(candidate_models.items(), key=lambda item: item[0]), start=1):
         smali_class = index.get_class(class_name)
         if smali_class is None:
             continue
 
         usage_map: dict[str, dict[str, Any]] = {}
-        for field in smali_class.fields:
+        for field in sorted(smali_class.fields, key=lambda item: item.name):
             usage_map[field.name] = {
                 "field_name": field.name,
                 "type": field.type,
@@ -436,16 +982,18 @@ def recover_hidden_state_model(index, *, focus_hint: str = "", max_candidates: i
                 "writer_tags": set(),
             }
 
-        target_fields = {f"{class_name}->{field.name}": field.name for field in smali_class.fields}
+        target_fields = {f"{class_name}->{field.name}": field.name for field in sorted(smali_class.fields, key=lambda item: item.name)}
         if not target_fields:
             continue
 
-        for method in index.methods.values():
+        for method in all_methods:
             owner_class = method.full_signature.split("->", 1)[0] if "->" in method.full_signature else ""
             owner_info = index.get_class(owner_class)
             if owner_info is not None and _is_third_party_path(owner_info.file_path):
                 continue
             method_tags = _method_context_tags(method)
+            method_reads: set[str] = set()
+            method_writes: set[str] = set()
 
             for instr in method.instructions:
                 field_name = target_fields.get(_normalize_field_ref(instr.target_field))
@@ -461,15 +1009,29 @@ def recover_hidden_state_model(index, *, focus_hint: str = "", max_candidates: i
                 if instr.opcode.startswith(("iput", "sput")):
                     usage_map[field_name]["write_count"] += 1
                     usage_map[field_name]["writer_tags"].update(method_tags)
+                    method_writes.add(field_name)
                     if len(usage_map[field_name]["writer_samples"]) < 8:
                         usage_map[field_name]["writer_samples"].append(entry)
                 else:
                     usage_map[field_name]["read_count"] += 1
                     usage_map[field_name]["reader_tags"].update(method_tags)
+                    method_reads.add(field_name)
                     if len(usage_map[field_name]["reader_samples"]) < 8:
                         usage_map[field_name]["reader_samples"].append(entry)
 
-        for field in smali_class.fields:
+            if method_reads or method_writes:
+                method_relations.append({
+                    "class": class_name,
+                    "method": method.full_signature,
+                    "file": owner_info.file_path if owner_info is not None else "",
+                    "tags": sorted(method_tags),
+                    "reads": sorted(method_reads),
+                    "writes": sorted(method_writes),
+                    "has_branch": any(instr.is_branch for instr in method.instructions),
+                    "returns_boolean": method.return_type == "Z",
+                })
+
+        for field in sorted(smali_class.fields, key=lambda item: item.name):
             usage = usage_map[field.name]
             semantic, suggested_value, confidence, evidence = _semantic_guess(field.type, usage, focus_terms)
             if usage["read_count"] == 0 and usage["write_count"] == 0:
@@ -550,6 +1112,30 @@ def recover_hidden_state_model(index, *, focus_hint: str = "", max_candidates: i
     reader_chains.sort(key=lambda item: (item["class"], item["field"], item["reader"]))
 
     top_semantics = Counter(item["semantic_guess"] for item in field_candidates)
+    ranked_models = sorted(candidate_models.values(), key=lambda item: (-item["score"], item["class"]))[:15]
+    compatibility_fields = field_candidates[:max_candidates]
+
+    semantic_core_result = _build_semantic_core_artifact(
+        index,
+        focus_hint=focus_hint,
+        candidate_models=ranked_models,
+        field_candidates=field_candidates,
+        compatibility_fields=compatibility_fields,
+        method_relations=method_relations,
+    )
+    validation_errors = semantic_core_result["validation_errors"]
+    if validation_errors:
+        return {
+            "success": False,
+            "error": "Semantic core invariant validation failed",
+            "validation_errors": validation_errors,
+            "focus_hint": focus_hint,
+            "candidate_models": ranked_models,
+            "candidate_state_fields": compatibility_fields,
+            "writer_chains": writer_chains[:40],
+            "reader_chains": reader_chains[:40],
+        }
+    artifact = semantic_core_result["artifact"]
 
     _emit_progress(
         100,
@@ -559,13 +1145,27 @@ def recover_hidden_state_model(index, *, focus_hint: str = "", max_candidates: i
     return {
         "success": True,
         "focus_hint": focus_hint,
-        "candidate_models": sorted(candidate_models.values(), key=lambda item: (-item["score"], item["class"]))[:15],
-        "candidate_state_fields": field_candidates[:max_candidates],
+        "semantic_schema_version": SEMANTIC_SCHEMA_VERSION,
+        "artifact_kind": artifact["artifact_kind"],
+        "nodes": artifact["nodes"],
+        "edges": artifact["edges"],
+        "evidence": artifact["evidence"],
+        "inferences": artifact["inferences"],
+        "compatibility_views": artifact["compatibility_views"],
+        "rule_manifest": artifact["rule_manifest"],
+        "cycle_summary": artifact["cycle_summary"],
+        "candidate_models": ranked_models,
+        "candidate_state_fields": compatibility_fields,
         "writer_chains": writer_chains[:40],
         "reader_chains": reader_chains[:40],
         "summary": {
             "model_count": len(candidate_models),
             "field_candidates": len(field_candidates),
             "top_semantics": dict(top_semantics.most_common(10)),
+            "semantic_node_count": len(artifact["nodes"]),
+            "semantic_edge_count": len(artifact["edges"]),
+            "semantic_evidence_count": len(artifact["evidence"]),
+            "semantic_inference_count": len(artifact["inferences"]),
+            "semantic_cycle_count": int(artifact["cycle_summary"].get("cycle_count", 0)),
         },
     }

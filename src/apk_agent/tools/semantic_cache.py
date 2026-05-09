@@ -7,9 +7,12 @@ operate on the same SmaliIndex during one session.
 from __future__ import annotations
 
 import copy
+import inspect
 from typing import Any
 
 from apk_agent.agent.execution_context import get_runtime_slot, set_runtime_slot
+from apk_agent.tools.semantic_core.identity import normalize_field_source
+from apk_agent.tools.semantic_core.schema import SEMANTIC_SCHEMA_VERSION
 
 
 _ARCHITECTURE_ROLES = (
@@ -84,7 +87,139 @@ def _trim_hidden_state_model(result: dict[str, Any], max_candidates: int) -> dic
     candidate_state_fields = trimmed.get("candidate_state_fields")
     if isinstance(candidate_state_fields, list):
         trimmed["candidate_state_fields"] = candidate_state_fields[:max_candidates]
+    compatibility_views = trimmed.get("compatibility_views")
+    if isinstance(compatibility_views, dict):
+        compatibility_fields = compatibility_views.get("candidate_state_fields")
+        if isinstance(compatibility_fields, list):
+            compatibility_views["candidate_state_fields"] = compatibility_fields[:max_candidates]
+
+    kept_field_refs = {
+        normalize_field_source(
+            item.get("class", ""),
+            item.get("field", ""),
+            item.get("type", ""),
+        )
+        for item in trimmed.get("candidate_state_fields", [])
+        if isinstance(item, dict)
+    }
+
+    kept_field_keys = {
+        (str(item.get("class", "")), str(item.get("field", "")))
+        for item in trimmed.get("candidate_state_fields", [])
+        if isinstance(item, dict)
+    }
+
+    for chain_key, method_key in (("writer_chains", "writer"), ("reader_chains", "reader")):
+        chain_items = trimmed.get(chain_key)
+        if isinstance(chain_items, list):
+            trimmed[chain_key] = [
+                item for item in chain_items
+                if (str(item.get("class", "")), str(item.get("field", ""))) in kept_field_keys and item.get(method_key)
+            ][:40]
+
+    nodes = trimmed.get("nodes")
+    edges = trimmed.get("edges")
+    evidence = trimmed.get("evidence")
+    inferences = trimmed.get("inferences")
+    if isinstance(nodes, list) and isinstance(edges, list) and isinstance(evidence, list) and isinstance(inferences, list):
+        field_node_ids = {
+            str(node.get("id", ""))
+            for node in nodes
+            if isinstance(node, dict) and node.get("kind") == "field" and str(node.get("source_ref", "")) in kept_field_refs
+        }
+        kept_node_ids = set(field_node_ids)
+        kept_edge_ids: set[str] = set()
+
+        changed = True
+        while changed:
+            changed = False
+            for edge in edges:
+                if not isinstance(edge, dict):
+                    continue
+                edge_id = str(edge.get("id", ""))
+                source = str(edge.get("source", ""))
+                target = str(edge.get("target", ""))
+                if not edge_id or not source or not target:
+                    continue
+                if source in kept_node_ids or target in kept_node_ids:
+                    if edge_id not in kept_edge_ids:
+                        kept_edge_ids.add(edge_id)
+                        changed = True
+                    if source not in kept_node_ids:
+                        kept_node_ids.add(source)
+                        changed = True
+                    if target not in kept_node_ids:
+                        kept_node_ids.add(target)
+                        changed = True
+
+        trimmed["nodes"] = [
+            node for node in nodes
+            if isinstance(node, dict) and str(node.get("id", "")) in kept_node_ids
+        ]
+        trimmed["edges"] = [
+            edge for edge in edges
+            if isinstance(edge, dict) and str(edge.get("id", "")) in kept_edge_ids
+        ]
+
+        kept_evidence_ids: set[str] = set()
+        for record in trimmed["nodes"] + trimmed["edges"]:
+            if not isinstance(record, dict):
+                continue
+            kept_evidence_ids.update(str(item) for item in record.get("evidence_refs", []) if item)
+
+        trimmed["inferences"] = [
+            inference for inference in inferences
+            if isinstance(inference, dict) and any(
+                str(ref) in kept_node_ids or str(ref) in kept_edge_ids
+                for ref in inference.get("output_refs", [])
+            )
+        ]
+        for inference in trimmed["inferences"]:
+            kept_evidence_ids.update(str(item) for item in inference.get("evidence_refs", []) if item)
+
+        trimmed["evidence"] = [
+            item for item in evidence
+            if isinstance(item, dict) and str(item.get("id", "")) in kept_evidence_ids
+        ]
+
+        cycle_summary = trimmed.get("cycle_summary")
+        if isinstance(cycle_summary, dict):
+            components = cycle_summary.get("components")
+            if isinstance(components, list):
+                cycle_summary["components"] = [
+                    component for component in components
+                    if isinstance(component, dict) and any(
+                        str(node_id) in kept_node_ids for node_id in component.get("node_ids", [])
+                    )
+                ]
+                cycle_summary["cycle_count"] = len(cycle_summary["components"])
     return trimmed
+
+
+def compact_hidden_state_model_for_transport(result: dict[str, Any], max_candidates: int) -> dict[str, Any]:
+    return _trim_hidden_state_model(result, max_candidates)
+
+
+def _supports_progress_callback(func: Any) -> bool:
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return True
+    parameters = signature.parameters.values()
+    return "progress_callback" in signature.parameters or any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters)
+
+
+def _invoke_with_optional_progress_callback(func: Any, *args: Any, progress_callback=None, **kwargs: Any) -> Any:
+    if progress_callback is None or not _supports_progress_callback(func):
+        return func(*args, **kwargs)
+    return func(*args, progress_callback=progress_callback, **kwargs)
+
+
+def _hidden_state_schema_matches(result: Any) -> bool:
+    if not isinstance(result, dict):
+        return True
+    version = str(result.get("semantic_schema_version", "") or "")
+    return not version or version == SEMANTIC_SCHEMA_VERSION
 
 
 def _trim_guard_surface_profile(result: dict[str, Any], max_clusters: int) -> dict[str, Any]:
@@ -121,7 +256,8 @@ def get_cached_semantic_architecture(index, *, focus_hint: str = "", max_per_rol
 
     from apk_agent.tools.semantic_architecture import map_semantic_architecture
 
-    cache[key] = map_semantic_architecture(
+    cache[key] = _invoke_with_optional_progress_callback(
+        map_semantic_architecture,
         index,
         focus_hint=normalized_focus_hint,
         max_per_role=max_per_role,
@@ -140,8 +276,10 @@ def get_cached_hidden_state_model(index, *, focus_hint: str = "", max_candidates
     cache = _slot_cache("hidden_state_model_cache")
     if key not in cache:
         cached_result = _best_cached_result(cache, index_signature, normalized_focus_hint, int(max_candidates))
-        if cached_result is not None:
+        if cached_result is not None and _hidden_state_schema_matches(cached_result):
             cache[key] = _trim_hidden_state_model(cached_result, int(max_candidates))
+    if key in cache and not _hidden_state_schema_matches(cache[key]):
+        cache.pop(key, None)
     if key in cache:
         if progress_callback is not None:
             summary = cache[key].get("summary", {}) if isinstance(cache[key], dict) else {}
@@ -153,7 +291,8 @@ def get_cached_hidden_state_model(index, *, focus_hint: str = "", max_candidates
     if key not in cache:
         from apk_agent.tools.state_model_recovery import recover_hidden_state_model
 
-        cache[key] = recover_hidden_state_model(
+        cache[key] = _invoke_with_optional_progress_callback(
+            recover_hidden_state_model,
             index,
             focus_hint=normalized_focus_hint,
             max_candidates=max_candidates,

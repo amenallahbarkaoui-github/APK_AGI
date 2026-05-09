@@ -146,6 +146,7 @@ class TokenTracker:
         self._tool_progress_pct: float = 0.0
         self._tool_progress_detail: str = ""
         self._tool_progress_by_name: dict[str, dict[str, Any]] = {}
+        self._tool_started_at_by_name: dict[str, float] = {}
         self._tools_completed_this_turn: int = 0
         self._last_tool_completed: str = ""
         self._completed_tool_names: list[str] = []
@@ -166,11 +167,27 @@ class TokenTracker:
             self._tool_progress_pct = 0.0
             self._tool_progress_detail = ""
             self._tool_progress_by_name = {}
+            self._tool_started_at_by_name = {}
             self._tools_completed_this_turn = 0
             self._last_tool_completed = ""
             self._completed_tool_names = []
             self._agent_phase = ""
             self._agent_phase_start = 0.0
+
+    def _recompute_active_tool_start_locked(self) -> None:
+        if not self._active_tool_names:
+            self._active_tool_start = 0.0
+            return
+
+        started_at_values = [
+            float(self._tool_started_at_by_name.get(name, 0.0) or 0.0)
+            for name in self._active_tool_names
+        ]
+        started_at_values = [value for value in started_at_values if value > 0.0]
+        if started_at_values:
+            self._active_tool_start = min(started_at_values)
+        elif not self._active_tool_start:
+            self._active_tool_start = time.time()
 
     def record_call(self, prompt_tokens: int = 0, completion_tokens: int = 0, cached_tokens: int = 0) -> None:
         with self._lock:
@@ -190,11 +207,11 @@ class TokenTracker:
                 return
             if normalized not in self._active_tool_names:
                 self._active_tool_names.append(normalized)
+            self._tool_started_at_by_name.setdefault(normalized, time.time())
             self._tool_progress_by_name.setdefault(normalized, {"pct": 0.0, "detail": ""})
             label = normalized if len(self._active_tool_names) == 1 else f"{len(self._active_tool_names)} tools running"
-            if self._active_tool != label:
-                self._active_tool_start = time.time()
             self._active_tool = label
+            self._recompute_active_tool_start_locked()
             if self._running_tools <= 0:
                 self._running_tools = len(self._active_tool_names) or 1
             self._tool_progress_pct = 0.0
@@ -206,26 +223,31 @@ class TokenTracker:
         with self._lock:
             active_names: list[str] = []
             progress_by_name: dict[str, dict[str, Any]] = {}
+            started_at_by_name: dict[str, float] = {}
             for item in names:
                 if hasattr(item, "name"):
                     name = str(getattr(item, "name", "") or "").strip()
                     pct = float(getattr(item, "progress_pct", 0.0) or 0.0)
                     metadata = getattr(item, "metadata", {}) or {}
                     detail = str(metadata.get("detail", "") or "")
+                    started_at = float(getattr(item, "started_at", 0.0) or 0.0)
                 else:
                     name = str(item).strip()
                     existing = self._tool_progress_by_name.get(name, {})
                     pct = float(existing.get("pct", 0.0) or 0.0)
                     detail = str(existing.get("detail", "") or "")
+                    started_at = float(self._tool_started_at_by_name.get(name, 0.0) or 0.0)
 
                 if not name:
                     continue
 
                 active_names.append(name)
                 progress_by_name[name] = {"pct": pct, "detail": detail}
+                started_at_by_name[name] = started_at
 
             self._active_tool_names = active_names
             self._tool_progress_by_name = progress_by_name
+            self._tool_started_at_by_name = started_at_by_name
             self._running_tools = len(active_names)
             if not active_names:
                 self._active_tool = ""
@@ -233,15 +255,15 @@ class TokenTracker:
                 self._tool_progress_pct = 0.0
                 self._tool_progress_detail = ""
                 self._tool_progress_by_name = {}
+                self._tool_started_at_by_name = {}
                 return
 
             label = active_names[0] if len(active_names) == 1 else f"{len(active_names)} tools running"
-            if self._active_tool != label:
-                self._active_tool_start = time.time()
-                if len(active_names) > 1:
-                    self._tool_progress_pct = 0.0
-                    self._tool_progress_detail = ""
+            if self._active_tool != label and len(active_names) > 1:
+                self._tool_progress_pct = 0.0
+                self._tool_progress_detail = ""
             self._active_tool = label
+            self._recompute_active_tool_start_locked()
             self._agent_phase = ""
             self._agent_phase_start = 0.0
 
@@ -271,16 +293,19 @@ class TokenTracker:
                     self._completed_tool_names.append(completed_label)
                     self._completed_tool_names = self._completed_tool_names[-6:]
                 self._tool_progress_by_name.pop(completed_label, None)
+                self._tool_started_at_by_name.pop(completed_label, None)
             elif self._active_tool and not self._active_tool.endswith("tools running"):
                 self._last_tool_completed = self._active_tool
                 self._tools_completed_this_turn += 1
+                self._tool_started_at_by_name.pop(self._active_tool, None)
             if self._running_tools > 0:
                 self._running_tools -= 1
             if self._active_tool_names:
                 self._active_tool = self._active_tool_names[0] if len(self._active_tool_names) == 1 else f"{len(self._active_tool_names)} tools running"
+                self._recompute_active_tool_start_locked()
             else:
                 self._active_tool = ""
-            self._active_tool_start = 0.0
+                self._active_tool_start = 0.0
             self._tool_progress_pct = 0.0
             self._tool_progress_detail = ""
 

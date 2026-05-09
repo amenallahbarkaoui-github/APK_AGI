@@ -1539,6 +1539,7 @@ _TOOL_TIMEOUT_OVERRIDES: dict[str, int | None] = {
     "run_taint_analysis": 1800,
     # These whole-project semantic and verification passes can legitimately run for a long time.
     # `None` disables the timeout completely.
+    "build_behavior_graph": None,
     "recover_hidden_state_model": None,
     "find_dynamic_checks": None,
     "verify_bypass_completeness": None,
@@ -12534,7 +12535,7 @@ def map_semantic_architecture(focus_hint: str = "", max_per_role: int = 12) -> s
             max_per_role=max_per_role,
             progress_callback=report_progress,
         )
-        return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
+        return json.dumps(result, ensure_ascii=False, indent=2)
 
     return _safe_call(_run, "map_semantic_architecture", _cache_hint=f"{focus_hint}:{max_per_role}")
 
@@ -12546,7 +12547,10 @@ def recover_hidden_state_model(focus_hint: str = "", max_candidates: int = 30) -
     Works on obfuscated APKs by inferring field meaning from read/write context,
     network and serialization boundaries, billing adjacency, and UI consumers.
     """
-    from apk_agent.tools.semantic_cache import get_cached_hidden_state_model as _recover
+    from apk_agent.tools.semantic_cache import (
+        compact_hidden_state_model_for_transport as _compact_hidden_state,
+        get_cached_hidden_state_model as _recover,
+    )
     from apk_agent.progress import report_progress
 
     def _run():
@@ -12566,7 +12570,8 @@ def recover_hidden_state_model(focus_hint: str = "", max_candidates: int = 30) -
             max_candidates=max_candidates,
             progress_callback=_mapped_progress,
         )
-        return json.dumps(result, ensure_ascii=False, indent=2)[:25000]
+        result = _compact_hidden_state(result, max_candidates=max_candidates)
+        return json.dumps(result, ensure_ascii=False, indent=2)
 
     return _safe_call(_run, "recover_hidden_state_model", _cache_hint=f"{focus_hint}:{max_candidates}")
 
