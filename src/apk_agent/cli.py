@@ -100,19 +100,57 @@ def _print_startup() -> None:
         from apk_agent.agent.tools_def import ALL_TOOLS
         tool_count = len(ALL_TOOLS)
     except Exception:
-        tool_count = 90
+        tool_count = 150
+
+    inner_width = 66
+
+    def _banner_row(text: str = "", *, markup: str | None = None, pad_left: int = 3) -> str:
+        visible = text[:inner_width]
+        padding = max(0, inner_width - len(visible))
+        content = markup if markup is not None else visible
+        return (
+            "[bold bright_cyan]║[/]"
+            f"{' ' * pad_left}{content}{' ' * padding}{' ' * (3 - pad_left)}"
+            "[bold bright_cyan]║[/]"
+        )
 
     console.print()
     console.print("[bold bright_cyan]╔══════════════════════════════════════════════════════════════════╗[/]")
-    console.print("[bold bright_cyan]║[/]                                                                  [bold bright_cyan]║[/]")
-    console.print("[bold bright_cyan]║[/]   [bold bright_white]█▀▀█ █▀▀█ █ █   █▀▀█ █▀▀▀ █▀▀▀ █▄  █ ▀▀█▀▀[/]                [bold bright_cyan]║[/]")
-    console.print("[bold bright_cyan]║[/]   [bold bright_white]█▄▄█ █▄▄█ █▀▄   █▄▄█ █ ▀█ █▀▀▀ █ █ █   █[/]                  [bold bright_cyan]║[/]")
-    console.print("[bold bright_cyan]║[/]   [bold bright_white]█  █ █    █ █   █  █ █▄▄█ █▄▄▄ █  ▀█   █[/]   [dim]v5.0[/]          [bold bright_cyan]║[/]")
-    console.print("[bold bright_cyan]║[/]                                                                  [bold bright_cyan]║[/]")
-    console.print(f"[bold bright_cyan]║[/]   [dim italic]AI-Powered Android APK Reverse Engineering & Patching[/]        [bold bright_cyan]║[/]")
-    console.print(f"[bold bright_cyan]║[/]   [bold green]{tool_count}[/] [dim]Tools[/] [dim]•[/] [bold yellow]Taint Analysis[/] [dim]•[/] [bold magenta]Auto-Bypass[/] [dim]•[/] [bold cyan]Code Graph[/]     [bold bright_cyan]║[/]")
-    console.print("[bold bright_cyan]║[/]   [dim]SmaliIndex IR • Deobfuscation • Deep Injection • Verification[/]   [bold bright_cyan]║[/]")
-    console.print("[bold bright_cyan]║[/]                                                                  [bold bright_cyan]║[/]")
+    console.print(_banner_row())
+    console.print(_banner_row(
+        "█▀▀█ █▀▀█ █ █   █▀▀█ █▀▀▀ █▀▀▀ █▄  █ ▀▀█▀▀",
+        markup="[bold bright_white]█▀▀█ █▀▀█ █ █   █▀▀█ █▀▀▀ █▀▀▀ █▄  █ ▀▀█▀▀[/]",
+    ))
+    console.print(_banner_row(
+        "█▄▄█ █▄▄█ █▀▄   █▄▄█ █ ▀█ █▀▀▀ █ █ █   █",
+        markup="[bold bright_white]█▄▄█ █▄▄█ █▀▄   █▄▄█ █ ▀█ █▀▀▀ █ █ █   █[/]",
+    ))
+    console.print(_banner_row(
+        "█  █ █    █ █   █  █ █▄▄█ █▄▄▄ █  ▀█   █   v5.0",
+        markup="[bold bright_white]█  █ █    █ █   █  █ █▄▄█ █▄▄▄ █  ▀█   █[/]   [dim]v5.0[/]",
+    ))
+    console.print(_banner_row())
+    console.print(_banner_row(
+        "AI-Powered Android APK Reverse Engineering & Patching",
+        markup="[dim italic]AI-Powered Android APK Reverse Engineering & Patching[/]",
+    ))
+    console.print(_banner_row(
+        f"{tool_count} Tools • Taint Analysis • Auto-Bypass • Code Graph",
+        markup=f"[bold green]{tool_count}[/] [dim]Tools •[/] [bold yellow]Taint Analysis[/] [dim]•[/] [bold magenta]Auto-Bypass[/] [dim]•[/] [bold cyan]Code Graph[/]",
+    ))
+    console.print(_banner_row(
+        "Reverse engineer • patch • validate • rebuild • ship",
+        markup="[bold bright_white]Reverse engineer[/] [dim]•[/] [bold bright_white]patch[/] [dim]•[/] [bold bright_white]validate[/] [dim]•[/] [bold bright_white]rebuild[/] [dim]•[/] [bold bright_white]ship[/]",
+    ))
+    console.print(_banner_row(
+        "Workflow: import APK/XAPK -> describe task -> monitor dashboard",
+        markup="[dim]Workflow:[/] import APK/XAPK [dim]->[/] describe task [dim]->[/] monitor /dashboard",
+    ))
+    console.print(_banner_row(
+        "Modes: /auto /human /orchestrator   Commands: /tools /status /help",
+        markup="[dim]Modes:[/] /auto /human /orchestrator   [dim]Commands:[/] /tools /status /help",
+    ))
+    console.print(_banner_row())
     console.print("[bold bright_cyan]╚══════════════════════════════════════════════════════════════════╝[/]")
     console.print()
 
