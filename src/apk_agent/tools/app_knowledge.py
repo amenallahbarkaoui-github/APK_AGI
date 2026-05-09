@@ -53,6 +53,8 @@ def build_app_knowledge_pack(
         warnings.append(str(guard_surface.get("error", "guard surface profiling failed")))
         guard_surface = {}
 
+    semantic_core = _build_semantic_core_view(hidden_state, max_state_fields=max_state_fields)
+
     entities = _build_entities(
         architecture.get("architecture_layers", {}),
         architecture.get("high_value_components", []),
@@ -75,6 +77,7 @@ def build_app_knowledge_pack(
         hidden_state.get("candidate_state_fields", []),
         control_points,
         workflows,
+        semantic_core,
     )
 
     built_at = time.time()
@@ -95,6 +98,7 @@ def build_app_knowledge_pack(
             "high_value_components": architecture.get("high_value_components", [])[:20],
             "entities": entities[:20],
             "state_fields": hidden_state.get("candidate_state_fields", [])[:max_state_fields],
+            "semantic_core": semantic_core,
             "guard_surfaces": guard_surface.get("guard_clusters", [])[:max_guard_clusters],
             "overwrite_points": guard_surface.get("overwrite_points", [])[:25],
             "revalidation_loops": guard_surface.get("revalidation_loops", [])[:20],
@@ -109,6 +113,7 @@ def build_app_knowledge_pack(
             guard_surface.get("guard_clusters", []),
             control_points,
             workflows,
+            semantic_core,
         ),
         "warnings": warnings,
     }
@@ -360,6 +365,7 @@ def _build_records(
     state_fields: list[dict[str, Any]],
     control_points: list[dict[str, Any]],
     workflows: list[dict[str, Any]],
+    semantic_core: dict[str, Any],
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
 
@@ -426,6 +432,39 @@ def _build_records(
             source="app_knowledge",
         ))
 
+    for item in semantic_core.get("capability_links", [])[:12]:
+        records.append(_record(
+            record_type="semantic_capability_link",
+            title=f"semantic capability: {item.get('capability_kind', '')}",
+            score=38.0,
+            class_name=item.get("class", ""),
+            field_name=item.get("field", ""),
+            file_path=item.get("file", ""),
+            evidence=[item.get("state_class", ""), item.get("rule_id", ""), item.get("source_ref", "")],
+            source="semantic_core",
+        ))
+
+    for item in semantic_core.get("contradictions", [])[:12]:
+        records.append(_record(
+            record_type="semantic_contradiction",
+            title=f"semantic contradiction: {item.get('contradiction_kind', '')}",
+            score=28.0,
+            class_name=item.get("class", ""),
+            field_name=item.get("field", ""),
+            file_path=item.get("file", ""),
+            evidence=[item.get("state_class", ""), item.get("rule_id", ""), item.get("source_ref", "")],
+            source="semantic_core",
+        ))
+
+    for component in semantic_core.get("cycle_components", [])[:8]:
+        records.append(_record(
+            record_type="semantic_cycle",
+            title=f"semantic cycle: {component.get('component_id', '')}",
+            score=24.0 + float(component.get("size", 0)),
+            evidence=[f"size={component.get('size', 0)}", *component.get("source_refs", [])[:4]],
+            source="semantic_core",
+        ))
+
     return records
 
 
@@ -436,6 +475,7 @@ def _build_summary(
     guard_clusters: list[dict[str, Any]],
     control_points: list[dict[str, Any]],
     workflows: list[dict[str, Any]],
+    semantic_core: dict[str, Any],
 ) -> dict[str, Any]:
     role_counts = {role: len(items) for role, items in architecture_layers.items()}
     control_types = Counter(item.get("type", "unknown") for item in control_points)
@@ -449,6 +489,121 @@ def _build_summary(
         "control_point_types": dict(control_types),
         "top_state_semantics": dict(top_state_semantics.most_common(8)),
         "workflow_count": len(workflows),
+        "semantic_schema_version": semantic_core.get("semantic_schema_version", ""),
+        "semantic_field_node_count": semantic_core.get("field_node_count", 0),
+        "semantic_capability_link_count": len(semantic_core.get("capability_links", [])),
+        "semantic_contradiction_count": len(semantic_core.get("contradictions", [])),
+        "semantic_cycle_count": semantic_core.get("cycle_count", 0),
+    }
+
+
+def _build_semantic_core_view(hidden_state: dict[str, Any], *, max_state_fields: int) -> dict[str, Any]:
+    if not isinstance(hidden_state, dict):
+        return {
+            "semantic_schema_version": "",
+            "artifact_kind": "",
+            "field_nodes": [],
+            "capability_links": [],
+            "contradictions": [],
+            "cycle_components": [],
+            "field_node_count": 0,
+            "cycle_count": 0,
+            "state_class_counts": {},
+            "edge_kind_counts": {},
+            "rule_count": 0,
+        }
+
+    nodes = hidden_state.get("nodes", []) if isinstance(hidden_state.get("nodes"), list) else []
+    edges = hidden_state.get("edges", []) if isinstance(hidden_state.get("edges"), list) else []
+    rule_manifest = hidden_state.get("rule_manifest", []) if isinstance(hidden_state.get("rule_manifest"), list) else []
+    cycle_summary = hidden_state.get("cycle_summary", {}) if isinstance(hidden_state.get("cycle_summary"), dict) else {}
+
+    node_by_id = {
+        str(node.get("id", "")): node
+        for node in nodes
+        if isinstance(node, dict) and node.get("id")
+    }
+
+    field_nodes = []
+    state_class_counts: Counter[str] = Counter()
+    for node in nodes:
+        if not isinstance(node, dict) or node.get("kind") != "field":
+            continue
+        state_class = str(node.get("state_class", "unknown"))
+        state_class_counts[state_class] += 1
+        source_ref = str(node.get("source_ref", ""))
+        class_name, _, field_part = source_ref.partition("->")
+        field_name = field_part.split(":", 1)[0] if field_part else ""
+        field_nodes.append({
+            "id": str(node.get("id", "")),
+            "class": class_name,
+            "field": field_name,
+            "source_ref": source_ref,
+            "state_class": state_class,
+            "rule_id": str(node.get("rule_id", "")),
+        })
+
+    capability_links = []
+    contradictions = []
+    edge_kind_counts: Counter[str] = Counter()
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        kind = str(edge.get("kind", "unknown"))
+        edge_kind_counts[kind] += 1
+        source_node = node_by_id.get(str(edge.get("source", "")), {})
+        source_ref = str(source_node.get("source_ref", ""))
+        class_name, _, field_part = source_ref.partition("->")
+        field_name = field_part.split(":", 1)[0] if field_part else ""
+        if kind == "capability_link":
+            target_node = node_by_id.get(str(edge.get("target", "")), {})
+            capability_links.append({
+                "class": class_name,
+                "field": field_name,
+                "file": "",
+                "source_ref": source_ref,
+                "state_class": str(source_node.get("state_class", "")),
+                "capability_kind": str(target_node.get("capability_kind", "")),
+                "rule_id": str(edge.get("rule_id", "")),
+            })
+        elif kind == "contradiction":
+            contradictions.append({
+                "class": class_name,
+                "field": field_name,
+                "file": "",
+                "source_ref": source_ref,
+                "state_class": str(source_node.get("state_class", "")),
+                "contradiction_kind": str(edge.get("contradiction_kind", "")),
+                "rule_id": str(edge.get("rule_id", "")),
+            })
+
+    cycle_components = []
+    for component in cycle_summary.get("components", [])[:8] if isinstance(cycle_summary.get("components"), list) else []:
+        if not isinstance(component, dict):
+            continue
+        source_refs = [
+            str(node_by_id.get(str(node_id), {}).get("source_ref", ""))
+            for node_id in component.get("node_ids", [])
+            if node_by_id.get(str(node_id), {}).get("source_ref")
+        ]
+        cycle_components.append({
+            "component_id": str(component.get("component_id", "")),
+            "size": int(component.get("size", len(component.get("node_ids", [])) or 0)),
+            "source_refs": source_refs,
+        })
+
+    return {
+        "semantic_schema_version": str(hidden_state.get("semantic_schema_version", "") or ""),
+        "artifact_kind": str(hidden_state.get("artifact_kind", "") or ""),
+        "field_nodes": field_nodes[:max_state_fields],
+        "capability_links": capability_links[:12],
+        "contradictions": contradictions[:12],
+        "cycle_components": cycle_components,
+        "field_node_count": len(field_nodes),
+        "cycle_count": int(cycle_summary.get("cycle_count", 0) or 0),
+        "state_class_counts": dict(state_class_counts),
+        "edge_kind_counts": dict(edge_kind_counts),
+        "rule_count": len(rule_manifest),
     }
 
 

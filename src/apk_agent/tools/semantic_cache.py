@@ -12,6 +12,7 @@ from typing import Any
 
 from apk_agent.agent.execution_context import get_runtime_slot, set_runtime_slot
 from apk_agent.tools.semantic_core.identity import normalize_field_source
+from apk_agent.tools.semantic_core.rules import get_rule_manifest
 from apk_agent.tools.semantic_core.schema import SEMANTIC_SCHEMA_VERSION
 
 
@@ -218,8 +219,27 @@ def _invoke_with_optional_progress_callback(func: Any, *args: Any, progress_call
 def _hidden_state_schema_matches(result: Any) -> bool:
     if not isinstance(result, dict):
         return True
+    has_semantic_core = any(key in result for key in ("nodes", "edges", "evidence", "inferences", "rule_manifest", "cycle_summary"))
     version = str(result.get("semantic_schema_version", "") or "")
-    return not version or version == SEMANTIC_SCHEMA_VERSION
+    if not has_semantic_core and not version:
+        return True
+    if version != SEMANTIC_SCHEMA_VERSION:
+        return False
+
+    manifest = result.get("rule_manifest")
+    if not isinstance(manifest, list):
+        return False
+    observed_rule_ids = tuple(
+        str(item.get("rule_id", ""))
+        for item in manifest
+        if isinstance(item, dict) and item.get("rule_id")
+    )
+    current_rule_ids = tuple(
+        str(item.get("rule_id", ""))
+        for item in get_rule_manifest()
+        if isinstance(item, dict) and item.get("rule_id")
+    )
+    return observed_rule_ids == current_rule_ids
 
 
 def _trim_guard_surface_profile(result: dict[str, Any], max_clusters: int) -> dict[str, Any]:

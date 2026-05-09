@@ -160,6 +160,7 @@ def build_behavior_graph(
         enforcement.get("surfaces", []),
         max_symbol_hints=max_symbol_hints,
     )
+    semantic_relations = _build_semantic_relations(hidden_state)
     records = _build_records(
         app_pack.get("records", []),
         feature_controls,
@@ -168,6 +169,7 @@ def build_behavior_graph(
         runtime_hooks,
         network_behavior,
         symbol_hints,
+        semantic_relations,
     )
 
     built_at = time.time()
@@ -187,6 +189,7 @@ def build_behavior_graph(
         "upstream": {
             "app_knowledge_summary": app_pack.get("summary", {}),
             "hidden_state_summary": hidden_state.get("summary", {}),
+            "hidden_state_semantic_core": _semantic_core_summary(hidden_state, semantic_relations),
             "guard_surface_summary": guard_surface.get("summary", {}),
             "enforcement_summary": {
                 "total_candidates": enforcement.get("total_candidates", 0),
@@ -201,6 +204,7 @@ def build_behavior_graph(
             "runtime_hooks": runtime_hooks,
             "network_behavior": network_behavior,
             "symbol_hints": symbol_hints,
+            "semantic_relations": semantic_relations,
             "enforcement_surfaces": enforcement.get("surfaces", []),
         },
         "records": records[:400],
@@ -211,6 +215,7 @@ def build_behavior_graph(
             runtime_hooks,
             network_behavior,
             symbol_hints,
+            semantic_relations,
             enforcement.get("surfaces", []),
         ),
         "warnings": warnings + list(app_pack.get("warnings", [])),
@@ -933,6 +938,7 @@ def _build_records(
     runtime_hooks: list[dict[str, Any]],
     network_behavior: dict[str, Any],
     symbol_hints: list[dict[str, Any]],
+    semantic_relations: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     records = [dict(record) for record in base_records[:180]]
 
@@ -1021,6 +1027,19 @@ def _build_records(
             source="behavior_engine",
         ))
 
+    for relation in semantic_relations[:40]:
+        records.append(_record(
+            record_type="semantic_relation",
+            title=f"semantic relation: {relation.get('relation_type', '')}",
+            score=float(relation.get("score", 0)),
+            class_name=relation.get("class", ""),
+            method_name=relation.get("method", ""),
+            field_name=relation.get("field", ""),
+            file_path=relation.get("file", ""),
+            evidence=relation.get("reasons", []),
+            source="semantic_core",
+        ))
+
     return records
 
 
@@ -1031,6 +1050,7 @@ def _build_summary(
     runtime_hooks: list[dict[str, Any]],
     network_behavior: dict[str, Any],
     symbol_hints: list[dict[str, Any]],
+    semantic_relations: list[dict[str, Any]],
     enforcement_surfaces: list[dict[str, Any]],
 ) -> dict[str, Any]:
     action_counts = Counter(item.get("action", "unknown") for item in feature_controls)
@@ -1038,6 +1058,7 @@ def _build_summary(
     transition_counts = Counter(item.get("transition_type", "unknown") for item in state_transitions)
     security_counts = Counter(item.get("surface_type", "unknown") for item in security_surfaces)
     hook_counts = Counter(item.get("strategy", "unknown") for item in runtime_hooks)
+    semantic_relation_counts = Counter(item.get("relation_type", "unknown") for item in semantic_relations)
     return {
         "feature_control_count": len(feature_controls),
         "state_transition_count": len(state_transitions),
@@ -1046,13 +1067,114 @@ def _build_summary(
         "network_path_count": len(network_behavior.get("paths", [])),
         "network_ingress_count": len(network_behavior.get("state_ingress_fields", [])),
         "symbol_hint_count": len(symbol_hints),
+        "semantic_relation_count": len(semantic_relations),
         "enforcement_surface_count": len(enforcement_surfaces),
         "control_actions": dict(action_counts),
         "control_origins": dict(origin_counts),
         "transition_types": dict(transition_counts.most_common(10)),
         "security_surface_types": dict(security_counts),
         "runtime_hook_strategies": dict(hook_counts),
+        "semantic_relation_types": dict(semantic_relation_counts),
         "network_client_categories": network_behavior.get("client_categories", {}),
+    }
+
+
+def _build_semantic_relations(hidden_state: dict[str, Any]) -> list[dict[str, Any]]:
+    if not isinstance(hidden_state, dict):
+        return []
+
+    nodes = hidden_state.get("nodes", []) if isinstance(hidden_state.get("nodes"), list) else []
+    edges = hidden_state.get("edges", []) if isinstance(hidden_state.get("edges"), list) else []
+    cycle_summary = hidden_state.get("cycle_summary", {}) if isinstance(hidden_state.get("cycle_summary"), dict) else {}
+    node_by_id = {
+        str(node.get("id", "")): node
+        for node in nodes
+        if isinstance(node, dict) and node.get("id")
+    }
+
+    relations: list[dict[str, Any]] = []
+    for edge in edges[:160]:
+        if not isinstance(edge, dict):
+            continue
+        source_node = node_by_id.get(str(edge.get("source", "")), {})
+        source_ref = str(source_node.get("source_ref", ""))
+        class_name, _, field_part = source_ref.partition("->")
+        field_name = field_part.split(":", 1)[0] if field_part else ""
+        kind = str(edge.get("kind", ""))
+        if kind == "capability_link":
+            target_node = node_by_id.get(str(edge.get("target", "")), {})
+            relations.append({
+                "relation_type": "capability_link",
+                "class": class_name,
+                "file": "",
+                "method": "",
+                "field": field_name,
+                "score": 32.0,
+                "reasons": [
+                    f"capability: {target_node.get('capability_kind', '')}",
+                    f"state_class: {source_node.get('state_class', '')}",
+                    f"rule: {edge.get('rule_id', '')}",
+                ],
+            })
+        elif kind == "contradiction":
+            relations.append({
+                "relation_type": "contradiction",
+                "class": class_name,
+                "file": "",
+                "method": "",
+                "field": field_name,
+                "score": 22.0,
+                "reasons": [
+                    f"kind: {edge.get('contradiction_kind', '')}",
+                    f"state_class: {source_node.get('state_class', '')}",
+                    f"rule: {edge.get('rule_id', '')}",
+                ],
+            })
+        elif kind == "derive":
+            relations.append({
+                "relation_type": "derive",
+                "class": class_name,
+                "file": "",
+                "method": "",
+                "field": field_name,
+                "score": 20.0,
+                "reasons": [
+                    f"from: {source_ref}",
+                    f"rule: {edge.get('rule_id', '')}",
+                ],
+            })
+
+    for component in cycle_summary.get("components", [])[:12] if isinstance(cycle_summary.get("components"), list) else []:
+        if not isinstance(component, dict):
+            continue
+        relations.append({
+            "relation_type": "cycle_summary",
+            "class": "",
+            "file": "",
+            "method": "",
+            "field": "",
+            "score": 18.0 + float(component.get("size", 0) or 0),
+            "reasons": [
+                f"component: {component.get('component_id', '')}",
+                f"size: {component.get('size', 0)}",
+            ],
+        })
+
+    relations.sort(key=lambda item: (-float(item.get("score", 0)), item.get("relation_type", ""), item.get("class", ""), item.get("field", "")))
+    return relations
+
+
+def _semantic_core_summary(hidden_state: dict[str, Any], semantic_relations: list[dict[str, Any]]) -> dict[str, Any]:
+    if not isinstance(hidden_state, dict):
+        return {}
+    return {
+        "semantic_schema_version": str(hidden_state.get("semantic_schema_version", "") or ""),
+        "artifact_kind": str(hidden_state.get("artifact_kind", "") or ""),
+        "rule_count": len(hidden_state.get("rule_manifest", []) if isinstance(hidden_state.get("rule_manifest"), list) else []),
+        "node_count": len(hidden_state.get("nodes", []) if isinstance(hidden_state.get("nodes"), list) else []),
+        "edge_count": len(hidden_state.get("edges", []) if isinstance(hidden_state.get("edges"), list) else []),
+        "cycle_count": int((hidden_state.get("cycle_summary", {}) if isinstance(hidden_state.get("cycle_summary"), dict) else {}).get("cycle_count", 0) or 0),
+        "semantic_relation_count": len(semantic_relations),
     }
 
 

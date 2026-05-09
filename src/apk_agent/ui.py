@@ -34,19 +34,56 @@ APK_THEME = Theme({
 console = Console(theme=APK_THEME)
 
 
+def _make_info_panel(title: str, lines: list[str], *, border_style: str = "cyan") -> Panel:
+    body = "\n".join(str(line) for line in lines if str(line).strip()) or "[dim]No data[/]"
+    return Panel(body, title=title, border_style=border_style, padding=(0, 1), expand=True)
+
+
 # ---------------------------------------------------------------------------
 # Welcome / Startup
 # ---------------------------------------------------------------------------
 
 def print_welcome(project_id: str | None = None, apk_name: str | None = None) -> None:
     """Print the welcome banner with project info."""
+    hero_lines = [
+        "[bold bright_white]Reverse engineer, patch, validate, and ship from one cockpit.[/]",
+        "[dim]SmaliIndex IR • graph reasoning • deep patching • runtime validation • Telegram delivery[/]",
+    ]
     if project_id and apk_name:
-        console.print(f"  [bold bright_cyan]📦[/] [bold]{apk_name}[/]  [dim]({project_id[:12]}…)[/]")
+        hero_lines.insert(0, f"[bold bright_cyan]📦 {apk_name}[/]  [dim]• project {project_id[:12]}…[/]")
+
+    quick_start = _make_info_panel(
+        "🚀 Quick Start",
+        [
+            "Send a concrete task in plain English.",
+            "Examples: full security audit, bypass premium, remove ads, validate patches.",
+            "Use /dashboard anytime for a high-level project cockpit.",
+        ],
+        border_style="bright_cyan",
+    )
+    mode_panel = _make_info_panel(
+        "🎛 Modes",
+        [
+            "normal chat — guided execution with full context",
+            "/orchestrator — parallel sub-agents for split work",
+            "/auto — one-shot, low-friction execution",
+            "/human — subtask-by-subtask control with clarification pauses",
+        ],
+        border_style="magenta",
+    )
+    command_panel = _make_info_panel(
+        "⌨ Command Deck",
+        [
+            "/dashboard  /findings  /patches  /tools",
+            "/status  /session  /tokens  /plan  /progress",
+            "/report  /logs  /context  /help",
+        ],
+        border_style="green",
+    )
+
     console.print()
-    console.print("[dim]Modes: normal chat │ /orchestrator (parallel) │ /auto (one-shot) │ /human (step-by-step)[/]")
-    console.print("[dim]Commands: /dashboard /findings /patches /tools /status /session /tokens /help[/]")
-    console.print("[dim]More: /progress /plan /report /logs /context[/]")
-    console.print("[dim]Type your task (e.g., 'full security audit', 'bypass premium', 'remove ads')[/]")
+    console.print(Panel("\n".join(hero_lines), title="[bold bright_cyan]APK Agent[/]", border_style="bright_cyan", padding=(1, 2)))
+    console.print(Columns([quick_start, mode_panel, command_panel], equal=True, expand=True))
     console.print()
 
 
@@ -626,14 +663,21 @@ def print_status(
     current_step: str = "",
 ) -> None:
     """Print project status."""
-    console.print(Panel(
-        f"Project: [bold]{project_id}[/]\n"
-        f"APK: [bold]{apk_name}[/]\n"
-        f"Status: [bold]{status}[/]\n"
-        + (f"Current: [bold]{current_step}[/]" if current_step else ""),
-        title="📊 Status",
-        border_style="blue",
-    ))
+    normalized_status = str(status or "unknown").strip().lower()
+    border_style = "green" if normalized_status in {"active", "running", "ready"} else "yellow" if normalized_status in {"idle", "paused"} else "red" if normalized_status in {"error", "failed"} else "blue"
+    status_icon = "🟢" if border_style == "green" else "🟡" if border_style == "yellow" else "🔴" if border_style == "red" else "🔵"
+
+    table = Table(show_header=False, border_style="dim", box=None, padding=(0, 1), expand=True)
+    table.add_column(style="bold cyan", width=12)
+    table.add_column()
+    table.add_row("Project", f"[bold]{project_id}[/]")
+    table.add_row("APK", f"[bold]{apk_name}[/]")
+    table.add_row("Status", f"{status_icon} [bold]{status}[/]")
+    if current_step:
+        table.add_row("Current", f"[bold]{current_step}[/]")
+
+    footer = "[dim]Use /dashboard for the full cockpit, /findings for risk review, and /patches for mutation history.[/]"
+    console.print(Panel(Group(table, Text.from_markup(footer)), title="📊 Session Status", border_style=border_style, padding=(0, 1)))
 
 
 def print_task_plan(plan: list[dict]) -> None:
@@ -803,59 +847,82 @@ def print_help() -> None:
     except Exception:
         tool_count = "90"
 
-    help_text = f"""
-[bold cyan]━━━ Project ━━━[/]
-    [cyan]/new <apk_path>[/]    — Create another project from an APK/XAPK file
-  [cyan]/list[/]               — List all projects
-    [dim]Open an existing project:[/] restart with [cyan]--project <id>[/]
+    header = Panel(
+        f"[bold bright_white]{tool_count} tools across analysis, patching, validation, packaging, and runtime follow-up.[/]\n"
+        "[dim]Use the cockpit commands below to move between project overview, patch execution, and delivery without losing session context.[/]",
+        title="📖 APK Agent Help",
+        border_style="bright_cyan",
+        padding=(1, 2),
+    )
 
-[bold cyan]━━━ Dashboard & Info ━━━[/]
-  [cyan]/dashboard[/]          — Full overview: findings, patches, context, progress
-  [cyan]/findings[/]           — List all findings with severity highlighting
-  [cyan]/patches[/]            — List all patches with status & coverage
-  [cyan]/tools[/]              — Show all {tool_count} tools grouped by category
-  [cyan]/status[/]             — Show current project status
-  [cyan]/session[/]            — Show session info (thread ID, messages, tokens)
-  [cyan]/tokens[/]             — Show current context & token usage
-  [cyan]/logs[/]               — Show recent tool logs
-  [cyan]/report[/]             — Show the generated report
-  [cyan]/progress[/]           — Show task progress summary
-  [cyan]/plan[/]               — Show the agent's current task plan
+    project_panel = _make_info_panel(
+        "📦 Project & Sessions",
+        [
+            "/new <apk_path> — create another project from an APK/XAPK file",
+            "/list — list all projects in the workspace",
+            "Existing project entry: restart with --project <id>",
+        ],
+        border_style="cyan",
+    )
+    cockpit_panel = _make_info_panel(
+        "🧭 Cockpit & Visibility",
+        [
+            "/dashboard — full overview: findings, patches, progress, context",
+            "/findings  /patches  /tools  /status  /session",
+            "/tokens  /logs  /report  /progress  /plan",
+        ],
+        border_style="green",
+    )
+    mode_panel = _make_info_panel(
+        "🎛 Execution Modes",
+        [
+            "/auto — one-shot execution with minimal interruption",
+            "/human — subtask-by-subtask control with clarification pauses",
+            "/orchestrator — parallel sub-agents for decomposed work",
+            "/normal — switch back to standard chat execution",
+        ],
+        border_style="magenta",
+    )
+    control_panel = _make_info_panel(
+        "⚙ Runtime Controls",
+        [
+            "/context — view or set context window (example: /context 1000000)",
+            "/compact — show compaction status",
+            "/reset — delete session history and start fresh",
+            "/stop  /quit — stop work or exit the CLI",
+        ],
+        border_style="yellow",
+    )
+    flags_panel = _make_info_panel(
+        "🧪 CLI Flags",
+        [
+            "--project / -p ID — start directly in an existing project",
+            "--model / -m MODEL — override the LLM model name",
+            "--context-window / -c N — set context window in tokens (0=auto)",
+            "--telegram / --no-telegram — start/skip the Telegram bridge",
+            "--auto  --verbose / -v",
+        ],
+        border_style="blue",
+    )
+    examples_panel = _make_info_panel(
+        "🔥 High-Value Prompts",
+        [
+            '"full security audit of this APK"',
+            '"bypass premium and validate every patch"',
+            '"find hardcoded API keys and secrets"',
+            '"run taint analysis to find data leaks"',
+            '"remove ads, rebuild, and sign"',
+        ],
+        border_style="bright_red",
+    )
 
-[bold cyan]━━━ Modes ━━━[/]
-  [cyan]/auto[/]               — Toggle auto mode (no confirmations, one-shot)
-  [cyan]/human[/]              — Toggle Human Thinking mode (you guide each step)
-  [cyan]/orchestrator[/]       — Switch to orchestrator mode (parallel sub-agents)
-  [cyan]/normal[/]             — Switch back to normal chat mode
-
-[bold cyan]━━━ Control ━━━[/]
-  [cyan]/context[/]            — View/set context window (e.g. /context 1000000)
-  [cyan]/compact[/]            — Show compaction status
-  [cyan]/reset[/]              — Delete session history (start fresh)
-  [cyan]/stop[/]               — Stop the current operation
-  [cyan]/quit[/]               — Exit APK Agent
-
-[bold cyan]━━━ CLI Flags ━━━[/]
-    [dim]--project / -p ID[/]         — Start directly in an existing project
-  [dim]--model / -m MODEL[/]         — Override LLM model name
-  [dim]--context-window / -c N[/]    — Set context window in tokens (0=auto)
-    [dim]--telegram / --no-telegram[/] — Start/skip the Telegram bridge
-  [dim]--auto[/]                      — Start in auto mode
-  [dim]--verbose / -v[/]             — Enable debug logging
-
-[bold]SOTA Analysis ({tool_count} tools):[/]
-  [dim]SmaliIndex IR · Code Graph · Taint Analysis · Auto-Bypass · Deobfuscation
-  Cross-Reference · Dynamic Checks · URL Extraction · Bypass Verification
-  Deep Injection · Batch Patching · UI Gate Mapping · Cloud Scanner[/]
-
-[bold]Example Tasks:[/]
-  • [dim]"full security audit of this APK"[/]
-  • [dim]"bypass premium — unlock all features"[/]
-  • [dim]"find hardcoded API keys and secrets"[/]
-  • [dim]"run taint analysis to find data leaks"[/]
-  • [dim]"remove all ads and tracking"[/]
-"""
-    console.print(Panel(help_text.strip(), title="📖 Help", border_style="bright_cyan", padding=(0, 1)))
+    console.print(header)
+    console.print(project_panel)
+    console.print(cockpit_panel)
+    console.print(mode_panel)
+    console.print(control_panel)
+    console.print(flags_panel)
+    console.print(examples_panel)
 
 
 _TOOL_CATEGORY_ORDER = [
@@ -1133,7 +1200,7 @@ def print_turn_summary() -> None:
         parts.append(f"Σ{total_k:.1f}k")
 
     separator = " │ "
-    console.print(f"[dim]╰── {separator.join(parts)} ──╯[/]")
+    console.print(Panel(f"[dim]{separator.join(parts)}[/]", title="Turn Summary", border_style="dim", padding=(0, 1), expand=False))
 
 
 # ---------------------------------------------------------------------------
@@ -1158,6 +1225,13 @@ def print_dashboard(state: dict | None = None) -> None:
     graph_ready = state.get("graph_ready", False)
     target_pkgs = state.get("target_packages") or []
     plan_snapshot = _plan_progress_snapshot(state)
+
+    kpi_panels = [
+        Panel(f"[bold cyan]{len(findings)}[/]\n[dim]Findings[/]", title="🔍 Risks", border_style="cyan", padding=(0, 1), expand=True),
+        Panel(f"[bold green]{len(patches)}[/]\n[dim]Patch runs[/]", title="🩹 Mutations", border_style="green", padding=(0, 1), expand=True),
+        Panel(f"[bold yellow]{len(patch_registry)}[/]\n[dim]Registry entries[/]", title="📚 Journal", border_style="yellow", padding=(0, 1), expand=True),
+        Panel(f"[bold magenta]{len(scratchpad)}[/]\n[dim]Scratchpad notes[/]", title="🧠 Memory", border_style="magenta", padding=(0, 1), expand=True),
+    ]
 
     # ── Findings summary panel ──
     severity_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
@@ -1270,9 +1344,31 @@ def print_dashboard(state: dict | None = None) -> None:
         padding=(0, 1),
     )
 
-    # Layout: 2x2 grid
+    highlights_lines = []
+    if findings:
+        top = findings[0]
+        highlights_lines.append(f"Top finding: {(top.get('severity') or 'INFO').upper()} • {top.get('title') or top.get('name') or 'Finding'}")
+    if patch_registry:
+        latest_patch = patch_registry[-1]
+        highlights_lines.append(f"Latest patch: {latest_patch.get('tool', 'patch')} → {latest_patch.get('status', 'unknown')}")
+    if target_pkgs:
+        highlights_lines.append(f"Target packages: {', '.join(target_pkgs[:4])}")
+    if plan_snapshot and plan_snapshot.get("active_path"):
+        highlights_lines.append(f"Active path: {' > '.join(plan_snapshot['active_path'][:4])}")
+    if not highlights_lines:
+        highlights_lines.append("No recent highlights yet — run analysis or patching to populate the cockpit.")
+
+    highlights_panel = Panel(
+        "\n".join(f"• {line}" for line in highlights_lines),
+        title="[bold]✨ Highlights[/]",
+        border_style="bright_cyan",
+        padding=(0, 1),
+    )
+
+    console.print(Columns(kpi_panels, equal=True, expand=True))
     console.print(Columns([findings_panel, patches_panel], equal=True, expand=True))
     console.print(Columns([progress_panel, context_panel], equal=True, expand=True))
+    console.print(highlights_panel)
 
 
 def print_findings_list(findings: list[dict]) -> None:
@@ -1396,14 +1492,29 @@ def print_tools_list() -> None:
     categories = _build_tool_categories([tool.name for tool in ALL_TOOLS])
 
     total = len(ALL_TOOLS)
-    console.print(f"\n[bold bright_cyan]🧰 APK Agent Tools — {total} total[/]\n")
+    console.print(Panel(
+        f"[bold bright_white]{total} tools[/] grouped by execution surface so you can reach the right capability faster.\n"
+        "[dim]Planning, architecture, patching, deep tracing, packaging, and evidence are all separated below.[/]",
+        title="🧰 Tool Catalog",
+        border_style="bright_cyan",
+        padding=(1, 2),
+    ))
 
+    tool_panels: list[Panel] = []
     for cat_name, tools in categories.items():
         if not tools:
             continue
         icon = _TOOL_CATEGORY_ICONS.get(cat_name, "📦")
-        tools_str = ", ".join(f"[cyan]{t}[/]" for t in tools)
-        console.print(f"  {icon} [bold]{cat_name}[/] [dim]({len(tools)})[/]")
-        console.print(f"     {tools_str}")
-        console.print()
+        body = "\n".join(f"• [cyan]{tool}[/]" for tool in tools)
+        tool_panels.append(
+            Panel(
+                body,
+                title=f"{icon} {cat_name} [dim]({len(tools)})[/]",
+                border_style="dim",
+                padding=(0, 1),
+                expand=True,
+            )
+        )
+
+    console.print(Columns(tool_panels, equal=True, expand=True))
 

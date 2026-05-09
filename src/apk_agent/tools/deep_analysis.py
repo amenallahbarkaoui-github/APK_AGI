@@ -37,6 +37,12 @@ _SMALI_DIRECTIVES = frozenset({
     ".catch", ".catchall", ".local", ".end local", ".restart local",
 })
 
+_SMALI_PAYLOAD_END_DIRECTIVES = {
+    ".packed-switch": ".end packed-switch",
+    ".sparse-switch": ".end sparse-switch",
+    ".array-data": ".end array-data",
+}
+
 _SMALI_OPCODES = frozenset({
     "nop", "move", "move/from16", "move/16", "move-wide", "move-wide/from16",
     "move-wide/16", "move-object", "move-object/from16", "move-object/16",
@@ -104,11 +110,17 @@ def validate_smali_syntax(file_path: Path) -> dict:
     method_name = ""
     method_start_line = 0
     has_registers = False
-    brace_depth = 0  # annotation nesting
+    annotation_stack: list[str] = []
+    payload_stack: list[str] = []
 
     for i, line in enumerate(lines, 1):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
+            continue
+
+        if payload_stack:
+            if stripped == payload_stack[-1]:
+                payload_stack.pop()
             continue
 
         # Track method blocks
@@ -132,19 +144,43 @@ def validate_smali_syntax(file_path: Path) -> dict:
             has_registers = True
             continue
 
-        # Track annotations
-        if stripped.startswith(".annotation ") or stripped.startswith(".subannotation "):
-            brace_depth += 1
+        for directive, end_directive in _SMALI_PAYLOAD_END_DIRECTIVES.items():
+            if stripped == directive or stripped.startswith(f"{directive} "):
+                payload_stack.append(end_directive)
+                break
+        else:
+            end_directive = ""
+        if end_directive:
             continue
-        if stripped in (".end annotation", ".end subannotation"):
-            brace_depth -= 1
-            if brace_depth < 0:
+
+        # Track annotations
+        if stripped.startswith(".annotation "):
+            annotation_stack.append(".annotation")
+            continue
+        if ".subannotation " in stripped:
+            annotation_stack.append(".subannotation")
+            continue
+        if stripped == ".end annotation":
+            if not annotation_stack:
                 errors.append({"line": i, "message": f"{stripped} without matching open"})
-                brace_depth = 0
+            elif annotation_stack[-1] != ".annotation":
+                errors.append({"line": i, "message": ".end annotation closed a .subannotation block"})
+                annotation_stack.pop()
+            else:
+                annotation_stack.pop()
+            continue
+        if stripped == ".end subannotation":
+            if not annotation_stack:
+                errors.append({"line": i, "message": f"{stripped} without matching open"})
+            elif annotation_stack[-1] != ".subannotation":
+                errors.append({"line": i, "message": ".end subannotation closed a .annotation block"})
+                annotation_stack.pop()
+            else:
+                annotation_stack.pop()
             continue
 
         # Inside methods: validate opcodes
-        if in_method and brace_depth == 0:
+        if in_method and not annotation_stack:
             # Skip labels (:label_name), .line, .param, .local, etc.
             if stripped.startswith(":") or stripped.startswith("."):
                 continue
@@ -165,8 +201,10 @@ def validate_smali_syntax(file_path: Path) -> dict:
     # Final checks
     if in_method:
         errors.append({"line": method_start_line, "message": f"Method '{method_name}' never closed with .end method"})
-    if brace_depth > 0:
-        warnings.append({"line": len(lines), "message": f"Unclosed annotation blocks: {brace_depth}"})
+    if annotation_stack:
+        warnings.append({"line": len(lines), "message": f"Unclosed annotation blocks: {len(annotation_stack)}"})
+    if payload_stack:
+        warnings.append({"line": len(lines), "message": f"Unclosed data payload blocks: {len(payload_stack)}"})
 
     return {
         "valid": len(errors) == 0,

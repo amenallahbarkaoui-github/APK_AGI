@@ -1132,45 +1132,183 @@ def human_review_router(state: AgentState) -> Literal["tools", "agent"]:
 # Human Thinking mode — step-by-step control
 # ---------------------------------------------------------------------------
 
-def human_step_node(state: AgentState) -> dict:
-    """Pause after each tool cycle so the user decides the next step.
+_HUMAN_CLARIFICATION_TERMS = (
+    "must provide",
+    "provide the full json",
+    "missing '",
+    'missing "',
+    "no search terms provided",
+    "no keywords provided",
+    "specify",
+    "choose ",
+    "<choose ",
+    "select ",
+    "confirm ",
+    "which ",
+)
 
-    Active only in Human Thinking mode.  Summarises what the last tool
-    batch produced, then calls ``interrupt()`` so the CLI / Telegram can
-    collect the user's next instruction.
-    """
-    from langchain_core.messages import ToolMessage as _TM
+_HUMAN_GENERIC_RECOVERY_TERMS = (
+    "timed out after",
+    "file not found",
+    "permission denied",
+    "invalid json input",
+    "check the file path",
+    "check file permissions",
+    "check the json format",
+    "more targeted approach",
+    "unexpected error occurred",
+    "try a different approach",
+)
 
-    # Summarise the last tool results (walk backwards to the preceding AI message)
-    tool_summaries: list[str] = []
+
+def _recent_tool_batch_messages(state: AgentState) -> list[ToolMessage]:
+    batch: list[ToolMessage] = []
     for msg in reversed(state["messages"]):
-        if isinstance(msg, _TM):
-            name = getattr(msg, "name", None) or "tool"
-            # Try to extract a short status from JSON content
-            brief = ""
-            try:
-                data = json.loads(msg.content) if isinstance(msg.content, str) else None
-                if isinstance(data, dict):
-                    if data.get("success") is True:
-                        brief = "✅"
-                    elif data.get("success") is False:
-                        brief = "❌"
-                    elif "error" in data:
-                        brief = "❌"
-                    else:
-                        brief = "✅"
-                else:
-                    brief = "✅"
-            except Exception:
-                brief = "✅"
-            tool_summaries.append(f"  {brief} {name}")
-        elif isinstance(msg, AIMessage):
-            break
+        if not batch and isinstance(msg, (HumanMessage, SystemMessage)):
+            continue
+        if isinstance(msg, ToolMessage):
+            batch.append(msg)
+            continue
+        break
+    batch.reverse()
+    return batch
 
-    summary_lines = ["🔄 Step completed."]
+
+def _parse_tool_message_payload(msg: ToolMessage) -> dict[str, Any] | None:
+    content = msg.content if isinstance(msg.content, str) else ""
+    try:
+        payload = json.loads(content)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _trim_human_pause_detail(text: str) -> str:
+    cleaned = str(text or "").strip()
+    if cleaned.upper().startswith("BLOCKED:"):
+        cleaned = cleaned.split(":", 1)[1].strip()
+    if len(cleaned) <= 220:
+        return cleaned
+    return cleaned[:217].rstrip() + "..."
+
+
+def _tool_payload_human_pause_reason(payload: dict[str, Any]) -> str | None:
+    if not isinstance(payload, dict) or payload.get("success") is True:
+        return None
+
+    error_text = str(payload.get("error") or "").strip()
+    recovery_hint = str(payload.get("recovery_hint") or "").strip()
+    combined = " ".join(part for part in (error_text, recovery_hint) if part).lower()
+    if not combined:
+        return None
+
+    if any(term in combined for term in _HUMAN_GENERIC_RECOVERY_TERMS):
+        return None
+
+    detail = _trim_human_pause_detail(error_text or recovery_hint or "User clarification is needed before continuing.")
+    if any(term in combined for term in _HUMAN_CLARIFICATION_TERMS):
+        return f"clarification:{detail}" if detail else "clarification"
+
+    if error_text.upper().startswith("BLOCKED:") or recovery_hint.upper().startswith("BLOCKED:"):
+        return f"blocked:{detail}" if detail else "blocked"
+
+    return None
+
+
+def _human_subtask_pause_reason(state: AgentState) -> str | None:
+    recent_tools = _recent_tool_batch_messages(state)
+    if not recent_tools:
+        return None
+
+    for msg in reversed(recent_tools):
+        tool_name = getattr(msg, "name", "") or ""
+        payload = _parse_tool_message_payload(msg) or {}
+        if not payload.get("success", False):
+            continue
+
+        if tool_name == "mark_task_done":
+            updated = payload.get("updated") if isinstance(payload.get("updated"), dict) else {}
+            task_title = str(updated.get("title") or updated.get("desc") or "").strip()
+            return f"completed:{task_title}" if task_title else "completed"
+
+        if tool_name == "record_plan_outcome":
+            updated = payload.get("updated") if isinstance(payload.get("updated"), dict) else {}
+            status = str(updated.get("status") or payload.get("status") or "").strip().lower()
+            if status in {"done", "completed"}:
+                task_title = str(updated.get("title") or updated.get("desc") or "").strip()
+                return f"completed:{task_title}" if task_title else "completed"
+            if status in {"blocked", "failed"}:
+                task_title = str(updated.get("title") or updated.get("desc") or "").strip()
+                return f"{status}:{task_title}" if task_title else status
+
+    for msg in reversed(recent_tools):
+        payload = _parse_tool_message_payload(msg)
+        if not isinstance(payload, dict):
+            continue
+        pause_reason = _tool_payload_human_pause_reason(payload)
+        if pause_reason:
+            return pause_reason
+
+    return None
+
+def human_step_node(state: AgentState) -> dict:
+    """Pause when a full subtask boundary is reached so the user can steer the next one.
+
+    Active only in Human Thinking mode. Summarises the completed/blocked/
+    clarification-needed
+    subtask and the last tool batch, then calls ``interrupt()`` so the
+    CLI / Telegram can collect the user's next instruction.
+    """
+    pause_reason = _human_subtask_pause_reason(state) or "completed"
+    recent_tools = _recent_tool_batch_messages(state)
+
+    tool_summaries: list[str] = []
+    for msg in recent_tools:
+        name = getattr(msg, "name", None) or "tool"
+        payload = _parse_tool_message_payload(msg)
+        if isinstance(payload, dict):
+            if payload.get("success") is True:
+                brief = "✅"
+            elif payload.get("success") is False or "error" in payload:
+                brief = "❌"
+            else:
+                brief = "✅"
+        else:
+            brief = "✅"
+        tool_summaries.append(f"  {brief} {name}")
+
+    execution_plan = state.get("execution_plan") or {}
+    active_task_path = execution_plan.get("active_task_path") or state.get("active_task_path") or []
+    active_task_id = int(execution_plan.get("active_task_id", state.get("active_task_id", 0)) or 0)
+
+    boundary_line = "🔄 Subtask boundary reached."
+    if pause_reason.startswith("completed:"):
+        boundary_line = f"✅ Subtask completed: {pause_reason.split(':', 1)[1]}"
+    elif pause_reason == "completed":
+        boundary_line = "✅ Subtask completed."
+    elif pause_reason.startswith("blocked:"):
+        boundary_line = f"⛔ Subtask blocked: {pause_reason.split(':', 1)[1]}"
+    elif pause_reason == "blocked":
+        boundary_line = "⛔ Subtask blocked."
+    elif pause_reason.startswith("clarification:"):
+        boundary_line = f"❓ Clarification needed: {pause_reason.split(':', 1)[1]}"
+    elif pause_reason == "clarification":
+        boundary_line = "❓ Clarification needed before continuing."
+    elif pause_reason.startswith("failed:"):
+        boundary_line = f"❌ Subtask failed: {pause_reason.split(':', 1)[1]}"
+    elif pause_reason == "failed":
+        boundary_line = "❌ Subtask failed."
+
+    summary_lines = [boundary_line]
+    if active_task_id > 0 or active_task_path:
+        active_path_text = " > ".join(str(part) for part in active_task_path if str(part).strip())
+        if active_path_text:
+            summary_lines.append(f"📍 Next active task: {active_path_text}")
+        elif active_task_id > 0:
+            summary_lines.append(f"📍 Next active task id: {active_task_id}")
     if tool_summaries:
         summary_lines.append("")
-        summary_lines.extend(reversed(tool_summaries))
+        summary_lines.extend(tool_summaries)
     summary_lines.append("\n💬 What should I do next?")
     prompt = "\n".join(summary_lines)
 
@@ -1181,9 +1319,9 @@ def human_step_node(state: AgentState) -> dict:
 
 
 def _tools_post_router(state: AgentState) -> Literal["agent", "human_step"]:
-    """After tools_post, decide whether to continue autonomously or pause for user."""
+    """After tools_post, pause only at subtask boundaries when human mode is enabled."""
     import apk_agent.agent.tools_def as _td
-    if getattr(_td, "_human_mode", False):
+    if getattr(_td, "_human_mode", False) and _human_subtask_pause_reason(state):
         return "human_step"
     return "agent"
 

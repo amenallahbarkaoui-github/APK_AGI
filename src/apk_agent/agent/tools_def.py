@@ -9110,7 +9110,7 @@ def smart_search(
 
 # Module-level mode flags kept for backwards compatibility.
 _auto_mode = False   # Set by CLI when /auto is active
-_human_mode = False  # Set by CLI/TG when /human is active (step-by-step)
+_human_mode = False  # Set by CLI/TG when /human is active (pause at subtask boundaries)
 
 
 def _ensure_graph():

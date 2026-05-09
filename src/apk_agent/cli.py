@@ -94,7 +94,7 @@ def _setup_logging(verbose: bool = False) -> None:
 # ---------------------------------------------------------------------------
 
 def _print_startup() -> None:
-    """Print the full-screen startup banner with gradient style."""
+    """Print the large ASCII startup banner."""
     # Get actual tool count
     try:
         from apk_agent.agent.tools_def import ALL_TOOLS
@@ -127,6 +127,8 @@ def _print_tools_status(config: AppConfig) -> None:
         "zipalign": config.get_tool_path("zipalign"),
         "apksigner": config.get_tool_path("apksigner"),
     }
+    from rich.columns import Columns
+    from rich.panel import Panel
     from rich.table import Table
     table = Table(
         show_header=False, show_edge=False, padding=(0, 1),
@@ -150,8 +152,7 @@ def _print_tools_status(config: AppConfig) -> None:
             cells.append("")
         table.add_row(*cells)
 
-    console.print("[bold dim]Tools:[/]")
-    console.print(table)
+    runtime_lines = []
 
     # Show model
     model_display = config.model_name.split("/")[-1] if "/" in config.model_name else config.model_name
@@ -161,12 +162,17 @@ def _print_tools_status(config: AppConfig) -> None:
     _compact_at = int(_ctx * 0.50)
     _ctx_display = f"{_ctx:,}" if _ctx >= 1000 else str(_ctx)
     _ctx_note = "" if config.context_window > 0 else "  [yellow]⚠ not set, using fallback — set via --context-window or CONTEXT_WINDOW[/]"
-    console.print(f"[dim]Model:[/] [bold]{model_display}[/]  │  [dim]Context:[/] {_ctx_display} tokens  [dim](compact at {_compact_at:,})[/]{_ctx_note}")
+    runtime_lines.append(f"Model: [bold]{model_display}[/]")
+    runtime_lines.append(f"Context: {_ctx_display} tokens [dim](compact at {_compact_at:,})[/]{_ctx_note}")
     if config.telegram_enabled:
         telegram_status = "[bold green]●[/] configured"
     else:
         telegram_status = "[dim]off[/]"
-    console.print(f"[dim]Telegram:[/] {telegram_status}")
+    runtime_lines.append(f"Telegram: {telegram_status}")
+    console.print(Columns([
+        Panel(table, title="🔧 Toolchain", border_style="dim", padding=(0, 1)),
+        Panel("\n".join(runtime_lines), title="🧪 Runtime", border_style="dim", padding=(0, 1)),
+    ], equal=True, expand=False))
     console.print()
 
 
@@ -725,8 +731,8 @@ def _chat_loop(
                 human_mode = True
                 session_meta.human_mode = True
                 print_success(
-                    "Human Thinking mode ON — you guide each step.\n"
-                    "The agent will execute one action at a time and ask you what to do next."
+                    "Human Thinking mode ON — you guide each subtask.\n"
+                    "The agent keeps working across as many internal steps as needed, then asks you after a subtask is completed, blocked, or needs clarification."
                 )
                 continue
             elif result == "human_off":

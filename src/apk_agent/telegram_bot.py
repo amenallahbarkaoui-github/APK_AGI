@@ -597,9 +597,9 @@ def _categorize_tools(tool_names: list[str]) -> dict[str, list[str]]:
 def _reply_keyboard() -> dict[str, Any]:
     return {
         "keyboard": [
-            [{"text": "/status"}, {"text": "/auto on"}, {"text": "/auto off"}],
-            [{"text": "/human on"}, {"text": "/human off"}, {"text": "/context"}],
-            [{"text": "/new"}, {"text": "/help"}],
+            [{"text": "/status"}, {"text": "/help"}, {"text": "/new"}],
+            [{"text": "/auto on"}, {"text": "/human on"}, {"text": "/context"}],
+            [{"text": "/auto off"}, {"text": "/human off"}],
         ],
         "resize_keyboard": True,
         "one_time_keyboard": False,
@@ -723,40 +723,12 @@ class TelegramBotService:
 
     def _build_status_text(self, state: TelegramChatState, headline: str, detail: str = "") -> str:
         lines: list[str] = []
-
-        # Header with phase icon
         phase_icon = _phase_icon(headline)
         lines.append(f"{phase_icon} {headline}")
 
-        # Project info
         if state.current_project_id:
             lines.append(f"📦 Project: {state.current_project_id[:12]}")
 
-        # Elapsed time
-        if state.task_start_time > 0 and state.busy:
-            elapsed = time.time() - state.task_start_time
-            lines.append(f"⏱ Elapsed: {_format_elapsed(elapsed)}")
-
-        # Progress bar (visual)
-        if state.tools_run > 0:
-            lines.append("")
-            lines.append(f"🔧 Tools: {state.tools_run} run" + (f" ({state.tools_failed} failed)" if state.tools_failed else ""))
-            if state.findings_count > 0:
-                lines.append(f"🔍 Findings: {state.findings_count}")
-            if state.patches_count > 0:
-                lines.append(f"🩹 Patches: {state.patches_count}")
-
-        # Token usage
-        total_tokens = state.prompt_tokens + state.completion_tokens
-        if total_tokens > 0:
-            lines.append(f"📊 Tokens: {total_tokens:,} (in:{state.prompt_tokens:,} out:{state.completion_tokens:,})"
-                         + (f" cached:{state.cached_tokens:,}" if state.cached_tokens else ""))
-
-        # Current tool
-        if state.last_tool_name and state.busy:
-            lines.append(f"\n⚙️ Current: {state.last_tool_name}")
-
-        # Mode badges
         mode_parts: list[str] = []
         if state.auto_mode:
             mode_parts.append("🤖 Auto")
@@ -768,23 +740,55 @@ class TelegramBotService:
             mode_parts.append("❓ Awaiting reply")
         else:
             mode_parts.append("💤 Idle")
-        lines.append("\n" + " │ ".join(mode_parts))
+        lines.append(" | ".join(mode_parts))
 
-        # Detail text
+        if state.task_start_time > 0 and state.busy:
+            elapsed = time.time() - state.task_start_time
+            lines.append(f"⏱ Elapsed: {_format_elapsed(elapsed)}")
+
+        if state.tools_run > 0:
+            lines.append("")
+            lines.append(f"🔧 Tools: {state.tools_run} run" + (f" ({state.tools_failed} failed)" if state.tools_failed else ""))
+            if state.findings_count > 0:
+                lines.append(f"🔍 Findings: {state.findings_count}")
+            if state.patches_count > 0:
+                lines.append(f"🩹 Patches: {state.patches_count}")
+
+        total_tokens = state.prompt_tokens + state.completion_tokens
+        if total_tokens > 0:
+            lines.append(f"📊 Tokens: {total_tokens:,} (in:{state.prompt_tokens:,} out:{state.completion_tokens:,})"
+                         + (f" cached:{state.cached_tokens:,}" if state.cached_tokens else ""))
+
+        if state.last_tool_name and state.busy:
+            lines.append(f"⚙️ Current: {state.last_tool_name}")
+
+        if state.last_artifact_path:
+            artifact_name = Path(state.last_artifact_path).name
+            lines.append(f"📦 Artifact: {artifact_name}")
+
         if detail:
             detail_lines = str(detail).strip().splitlines()
             if detail_lines:
                 lines.append("")
+                lines.append("📝 Detail:")
                 for raw_line in detail_lines[:4]:
                     raw_line = raw_line.strip()
                     if raw_line:
-                        lines.append(_shorten(raw_line, max_chars=240))
+                        lines.append(f"  • {_shorten(raw_line, max_chars=240)}")
 
-        # Recent activity log
         if state.status_recent_events:
             lines.append("\n📋 Recent:")
             for event in state.status_recent_events[-6:]:
                 lines.append(f"  • {event}")
+
+        if state.pending_interrupt:
+            lines.append("\n➡️ Next: reply with your next instruction to continue the same run.")
+        elif state.busy:
+            lines.append("\n➡️ Next: wait for completion or use /status to refresh the live card.")
+        elif not state.current_project_id:
+            lines.append("\n➡️ Next: send an APK/XAPK file to create or link a project.")
+        else:
+            lines.append("\n➡️ Next: send a task like 'full security audit', 'bypass premium', or 'remove ads and sign'.")
 
         text = "\n".join(lines)
         if len(text) > _STATUS_TEXT_LIMIT:
@@ -948,14 +952,16 @@ class TelegramBotService:
         if cmd == "/start":
             self._send_message(
                 chat_id,
-                "🔬 APK Agent — Android RE & Patching\n\n"
-                "📥 Send an APK or XAPK file to start\n"
-                "💬 Then describe your task\n\n"
+                "🔬 APK Agent\n\n"
+                "Import an APK/XAPK, run deep static analysis, patch it, validate the result, and deliver the final artifact from one chat.\n\n"
+                "What to do now:\n"
+                "1. Send an APK or XAPK file\n"
+                "2. Send a task in plain English\n\n"
                 "Examples:\n"
                 "• \"full security audit\"\n"
                 "• \"bypass premium and return signed apk\"\n"
                 "• \"remove ads and root detection\"\n\n"
-                "Commands: /help /status /auto /context /new",
+                "Quick controls: /status  /auto on  /human on  /help",
                 reply_markup=_reply_keyboard(),
             )
             self._set_status(
@@ -970,13 +976,22 @@ class TelegramBotService:
         if cmd == "/help":
             self._send_message(
                 chat_id,
-                "📖 APK Agent Commands\n\n"
-                "📊 /status — live progress & stats\n"
-                "🤖 /auto on|off — auto-approve mode\n"
-                "🧠 /human on|off — step-by-step mode (you guide each action)\n"
-                "📐 /context [N] — view/set context window\n"
-                "🔄 /new — reset & upload new APK\n\n"
-                "Just send an APK file, then describe your task!",
+                "📖 APK Agent Command Deck\n\n"
+                "Core controls:\n"
+                "• /status — live progress, metrics, and recent activity\n"
+                "• /auto on|off — one-shot execution mode\n"
+                "• /human on|off — subtask-by-subtask mode with clarification pauses\n"
+                "• /context [N] — view or change context window\n"
+                "• /new — reset and upload a different APK/XAPK\n\n"
+                "Typical workflow:\n"
+                "1. Upload APK/XAPK\n"
+                "2. Send a task\n"
+                "3. Use /status while the run is active\n"
+                "4. Switch /auto or /human depending on how tightly you want to steer\n\n"
+                "Task examples:\n"
+                "• \"full security audit\"\n"
+                "• \"bypass premium\"\n"
+                "• \"remove ads and sign\"",
             )
             return
 
@@ -1036,8 +1051,8 @@ class TelegramBotService:
                 if state.human_mode:
                     msg = (
                         "🧠 Human Thinking mode ON\n\n"
-                        "You guide each step. The agent executes one action, "
-                        "shows you the result, and waits for your next instruction."
+                        "You guide each subtask. The agent can work through many internal steps, "
+                        "then it stops when a subtask is completed, blocked, or needs clarification and waits for your next instruction."
                     )
                 else:
                     msg = "🧠 Human Thinking mode OFF — agent runs autonomously."
@@ -1203,14 +1218,15 @@ class TelegramBotService:
 
         self._send_message(
             chat_id,
-            f"✅ APK imported!\n\n"
+            f"✅ APK imported and ready\n\n"
             f"📦 {project.apk_name}\n"
             f"🆔 {project.id[:12]}\n"
             f"{'🔗 Linked to active project' if existing_project else '🆕 New project created'}\n\n"
-            "Now send your task. Examples:\n"
+            "Next step: send a concrete task.\n\n"
+            "High-value examples:\n"
             "• \"full security audit\"\n"
-            "• \"bypass premium\"\n"
-            "• \"remove ads and sign\"",
+            "• \"bypass premium and validate every patch\"\n"
+            "• \"remove ads, rebuild, and sign\"",
             reply_markup=_reply_keyboard(),
             dedupe_key=f"apk-ready:{project.id}",
         )
